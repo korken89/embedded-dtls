@@ -23,6 +23,7 @@ use crate::buffer::{AllocSliceHandle, DTlsBuffer};
 pub enum ClientExtensions<'a> {
     PskKeyExchangeModes(PskKeyExchangeModes),
     KeyShare(KeyShareEntry<'a>),
+    SupportedVersions(SupportedVersions),
     PreSharedKey(OfferedPsks<'a>),
     // ServerName { // Not sure we need this.
     //     server_name: &'a str,
@@ -32,9 +33,6 @@ pub enum ClientExtensions<'a> {
     // },
     // SupportedGroups {
     //     supported_groups: Vec<NamedGroup, 16>,
-    // },
-    // SupportedVersions {
-    //     versions: ProtocolVersions,
     // },
     // SignatureAlgorithms {
     //     supported_signature_algorithms: Vec<SignatureScheme, 16>,
@@ -59,6 +57,7 @@ impl<'a> ClientExtensions<'a> {
                 psk_exchange.encode(buf).map(|_| None)
             }
             ClientExtensions::KeyShare(key_share) => key_share.encode(buf).map(|_| None),
+            ClientExtensions::SupportedVersions(versions) => versions.encode(buf).map(|_| None),
             ClientExtensions::PreSharedKey(offered) => offered.encode(buf).map(|alloc| Some(alloc)),
         };
 
@@ -73,6 +72,7 @@ impl<'a> ClientExtensions<'a> {
         match self {
             ClientExtensions::PskKeyExchangeModes { .. } => ExtensionType::PskKeyExchangeModes,
             ClientExtensions::KeyShare(_) => ExtensionType::KeyShare,
+            ClientExtensions::SupportedVersions(_) => ExtensionType::SupportedVersions,
             ClientExtensions::PreSharedKey(_) => ExtensionType::PreSharedKey,
         }
     }
@@ -114,6 +114,21 @@ impl<'a> KeyShareEntry<'a> {
         buf.push_u16_be(self.group as u16)?;
         buf.push_u16_be(self.opaque.len() as u16)?;
         buf.extend_from_slice(self.opaque)
+    }
+}
+
+/// The supported_versions payload.
+#[derive(Clone, Debug, PartialOrd, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SupportedVersions {}
+
+impl SupportedVersions {
+    /// Encode a `supported_versions` extension. We only support DTLS 1.3.
+    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<(), ()> {
+        buf.push_u8(2)?;
+
+        // DTLS 1.3, RFC 9147, section 5.3
+        buf.push_u16_be(0xfefc)
     }
 }
 

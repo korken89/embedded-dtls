@@ -11,7 +11,9 @@ use heapless::Vec;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
-use self::extensions::{KeyShareEntry, NamedGroup, OfferedPsks, PskIdentity, PskKeyExchangeMode};
+use self::extensions::{
+    KeyShareEntry, NamedGroup, OfferedPsks, PskIdentity, PskKeyExchangeMode, SupportedVersions,
+};
 
 pub mod extensions;
 
@@ -239,6 +241,8 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
         // List of extensions.
         let content_start = buf.len();
         let extensions_length_allocation = buf.alloc_u16()?;
+
+        ClientExtensions::SupportedVersions(SupportedVersions {}).encode(buf)?;
 
         ClientExtensions::PskKeyExchangeModes(PskKeyExchangeModes {
             ke_modes: Vec::from_slice(&[PskKeyExchangeMode::PskDheKe]).unwrap(),
