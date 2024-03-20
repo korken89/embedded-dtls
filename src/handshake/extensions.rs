@@ -159,6 +159,10 @@ impl<'a> OfferedPsks<'a> {
             identity.encode(buf)?;
         }
 
+        // TODO: To this point is where we need to calculate the transcript hash for adding into
+        // the binders.
+        // PSK Binder is defined in RFC8446, section 4.2.11.2 page 58.
+
         // Allocate space for binders and return it for future use.
         let binders_len = (1 + self.hash_size) * self.identities.len();
         buf.alloc_slice(binders_len)

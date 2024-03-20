@@ -82,14 +82,9 @@ where
     where
         Rng: RngCore + CryptoRng,
     {
-        // let mut handshake = ClientHandshake::new();
-
-        // let crypto = handshake.perform(buf, &socket, rng).await?;
-
         let key_schedule = KeySchedule::new();
 
         let hello = ClientRecord::<'_, CipherSuite>::client_hello(config, rng);
-
         hello.encode::<Socket>(buf)?;
 
         Ok(DTlsClientConnection {

@@ -261,7 +261,6 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
             hash_size: <CipherSuite::Hash as OutputSizeUser>::output_size(),
         })
         .encode(buf)?
-        // TODO: better error?
         .ok_or(())?;
 
         // Fill in the length of extensions.
