@@ -3,6 +3,7 @@ use core::marker::PhantomData;
 use crate::{
     buffer::{AllocSliceHandle, AllocU16Handle, AllocU24Handle, DTlsBuffer},
     cipher_suites::TlsCipherSuite,
+    key_schedule::KeySchedule,
     record::LEGACY_DTLS_VERSION,
 };
 use digest::OutputSizeUser;
@@ -33,9 +34,14 @@ pub enum ClientHandshake<'a, CipherSuite> {
 }
 
 impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<Option<AllocSliceHandle>, ()> {
+    pub fn encode(
+        &self,
+        buf: &mut impl DTlsBuffer,
+        key_schedule: &mut KeySchedule<CipherSuite>,
+        transcript_hasher: &mut CipherSuite::Hash,
+    ) -> Result<(), ()> {
         // TODO: Encode client handshake.
-        let handshake_header_allocations = HandshakeHeader {
+        let header = HandshakeHeader {
             msg_type: self.handshake_type(),
         }
         .encode(buf)?;
@@ -56,20 +62,17 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
 
         let content_length = (content_start - buf.len()) as u32;
 
-        handshake_header_allocations
-            .length
-            .set(buf, content_length.into());
-        handshake_header_allocations.message_seq.set(buf, 1);
-        handshake_header_allocations
-            .fragment_offset
-            .set(buf, 0.into());
-        handshake_header_allocations
-            .fragment_length
-            .set(buf, content_length.into());
+        header.length.set(buf, content_length.into());
+        header.message_seq.set(buf, 1); // TODO: This should probably be something else than 1
+        header.fragment_offset.set(buf, 0.into());
+        header.fragment_length.set(buf, content_length.into());
 
-        // TODO: Is there more to do here?
+        // The Handshake is finished, ready for transcript hash and binders.
 
-        Ok(binders)
+        // TODO: Update transcript hash.
+        // TODO: Create transcript for binders if it was a client hello with PSK.
+
+        Ok(())
     }
 
     fn handshake_type(&self) -> HandshakeType {

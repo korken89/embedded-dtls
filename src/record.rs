@@ -5,6 +5,7 @@ use crate::{
     cipher_suites::TlsCipherSuite,
     handshake::{ClientConfig, ClientHandshake, ClientHello},
     integers::U48,
+    key_schedule::KeySchedule,
     DTlsError, UdpSocket,
 };
 
@@ -39,11 +40,18 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
     }
 
     /// Encode the record into a buffer.
-    pub fn encode<S: UdpSocket>(&self, buf: &mut impl DTlsBuffer) -> Result<(), DTlsError<S>> {
+    pub fn encode<S: UdpSocket>(
+        &self,
+        buf: &mut impl DTlsBuffer,
+        key_schedule: &mut KeySchedule<CipherSuite>,
+        transcript_hasher: &mut CipherSuite::Hash,
+    ) -> Result<(), DTlsError<S>> {
         let header = DTlsPlaintextHeader {
             type_: self.content_type(),
             sequence_number: 0.into(),
         };
+
+        // ------ Start record
 
         // Create record header.
         let content_start = buf.len();
@@ -51,22 +59,26 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
             .encode(buf)
             .map_err(|_| DTlsError::InsufficientSpace)?;
 
+        buf.forward_start();
+
+        // ------ Encode payload
+
         match self {
             ClientRecord::Handshake(handshake, encryption) => {
                 // TODO: handle encryption
-                let binders_allocation = handshake
-                    .encode(buf)
+                handshake
+                    .encode(buf, key_schedule, transcript_hasher)
                     .map_err(|_| DTlsError::InsufficientSpace)?;
 
-                if let Some(binders) = binders_allocation {
-                    if let &ClientRecord::Handshake(
-                        ClientHandshake::ClientHello(_),
-                        Encryption::Disabled,
-                    ) = self
-                    {
-                        // TODO: Handle binders
-                    }
-                }
+                // if let Some(binders) = binders_allocation {
+                //     if let &ClientRecord::Handshake(
+                //         ClientHandshake::ClientHello(_),
+                //         Encryption::Disabled,
+                //     ) = self
+                //     {
+                //         // TODO: Handle binders
+                //     }
+                // }
             }
             ClientRecord::Alert(_, _) => todo!(),
             ClientRecord::Heartbeat(_, _) => todo!(),
@@ -76,6 +88,8 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
 
         let content_length = (content_start - buf.len()) as u16;
         length_allocation.set(buf, content_length);
+
+        // ------ Finish record
 
         Ok(())
     }

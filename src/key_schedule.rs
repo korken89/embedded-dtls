@@ -132,9 +132,9 @@ where
     /// Initialize the handshake secret using the (EC)DHE shared secret as input key material.
     pub fn initialize_handshake_secret(&mut self, ecdhe_secret: &[u8]) {
         match self.keyschedule_state {
-            KeyScheduleState::EarlySecret(_) => {},
+            KeyScheduleState::EarlySecret(_) => {}
             _ => unreachable!(
-                "Internal error! We're not in early secret stage, cannot initialize handshake secret"
+                "Internal error! Not in early secret stage, cannot initialize handshake secret"
             ),
         }
 
@@ -148,9 +148,9 @@ where
     /// Initialize the master secret.
     pub fn initialize_master_secret(&mut self) {
         match self.keyschedule_state {
-            KeyScheduleState::HandshakeSecret(_) => {},
+            KeyScheduleState::HandshakeSecret(_) => {}
             _ => unreachable!(
-                "Internal error! We're not in handshake secret stage, cannot initialize master secret"
+                "Internal error! Not in handshake secret stage, cannot initialize master secret"
             ),
         }
 

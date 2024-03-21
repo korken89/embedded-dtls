@@ -36,11 +36,16 @@ pub mod slice_buffer {
     pub struct SliceBuffer<'a> {
         buf: &'a mut [u8],
         idx: usize,
+        start: usize,
     }
     impl<'a> SliceBuffer<'a> {
         /// Create new buffer from a slice.
         pub fn new(buf: &'a mut [u8]) -> Self {
-            Self { buf, idx: 0 }
+            Self {
+                buf,
+                idx: 0,
+                start: 0,
+            }
         }
     }
 
@@ -48,18 +53,22 @@ pub mod slice_buffer {
         type Target = [u8];
 
         fn deref(&self) -> &Self::Target {
-            &self.buf[..self.idx]
+            &self.buf[self.start..self.idx]
         }
     }
 
     impl<'a> DerefMut for SliceBuffer<'a> {
         fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.buf[..self.idx]
+            &mut self.buf[self.start..self.idx]
         }
     }
 
     impl<'a> DTlsBuffer for SliceBuffer<'a> {
         fn len(&self) -> usize {
+            self.idx - self.start
+        }
+
+        fn index(&self) -> usize {
             self.idx
         }
 
@@ -68,6 +77,7 @@ pub mod slice_buffer {
                 .get_mut(self.idx..self.idx + slice.len())
                 .ok_or(())?
                 .copy_from_slice(slice);
+            self.idx += slice.len();
 
             Ok(())
         }
@@ -77,6 +87,14 @@ pub mod slice_buffer {
             self.idx += 1;
 
             Ok(())
+        }
+
+        fn forward_start(&mut self) {
+            self.start = self.idx;
+        }
+
+        fn reset_start(&mut self) {
+            self.start = 0;
         }
     }
 }
@@ -140,6 +158,10 @@ pub mod array_buffer {
             self.idx
         }
 
+        fn index(&self) -> usize {
+            self.idx
+        }
+
         fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), ()> {
             self.buf
                 .get_mut(self.idx..self.idx + slice.len())
@@ -155,6 +177,14 @@ pub mod array_buffer {
 
             Ok(())
         }
+
+        fn forward_start(&mut self) {
+            todo!()
+        }
+
+        fn reset_start(&mut self) {
+            todo!()
+        }
     }
 }
 
@@ -165,6 +195,15 @@ pub mod std {
 pub trait DTlsBuffer: Deref<Target = [u8]> + DerefMut {
     /// The current length.
     fn len(&self) -> usize;
+
+    /// The current index.
+    fn index(&self) -> usize;
+
+    /// The the current index of the buffer to index 0.
+    fn forward_start(&mut self);
+
+    /// Reset the start index of the buffer to 0.
+    fn reset_start(&mut self);
 
     /// Extend from a slice.
     fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), ()>;
@@ -193,7 +232,7 @@ pub trait DTlsBuffer: Deref<Target = [u8]> + DerefMut {
 
     /// Allocate the space for a `u8` for later updating.
     fn alloc_u8(&mut self) -> Result<AllocU8Handle, ()> {
-        let index = DTlsBuffer::len(self);
+        let index = DTlsBuffer::index(self);
         DTlsBuffer::push_u8(self, 0)?;
 
         Ok(AllocU8Handle { index })
@@ -201,7 +240,7 @@ pub trait DTlsBuffer: Deref<Target = [u8]> + DerefMut {
 
     /// Allocate the space for a `u16` for later updating.
     fn alloc_u16(&mut self) -> Result<AllocU16Handle, ()> {
-        let index = DTlsBuffer::len(self);
+        let index = DTlsBuffer::index(self);
         DTlsBuffer::push_u16_be(self, 0)?;
 
         Ok(AllocU16Handle { index })
@@ -209,7 +248,7 @@ pub trait DTlsBuffer: Deref<Target = [u8]> + DerefMut {
 
     /// Allocate the space for a `u24` for later updating.
     fn alloc_u24(&mut self) -> Result<AllocU24Handle, ()> {
-        let index = DTlsBuffer::len(self);
+        let index = DTlsBuffer::index(self);
         DTlsBuffer::push_u24_be(self, U24::new(0))?;
 
         Ok(AllocU24Handle { index })
@@ -217,7 +256,7 @@ pub trait DTlsBuffer: Deref<Target = [u8]> + DerefMut {
 
     /// Allocate the space for a `u48` for later updating.
     fn alloc_u48(&mut self) -> Result<AllocU48Handle, ()> {
-        let index = DTlsBuffer::len(self);
+        let index = DTlsBuffer::index(self);
         DTlsBuffer::push_u48_be(self, U48::new(0))?;
 
         Ok(AllocU48Handle { index })
@@ -225,7 +264,7 @@ pub trait DTlsBuffer: Deref<Target = [u8]> + DerefMut {
 
     /// Allocate space for a slice for later updating.
     fn alloc_slice(&mut self, len: usize) -> Result<AllocSliceHandle, ()> {
-        let index = DTlsBuffer::len(self);
+        let index = DTlsBuffer::index(self);
 
         for _ in 0..len {
             DTlsBuffer::push_u8(self, 0)?;
@@ -236,6 +275,7 @@ pub trait DTlsBuffer: Deref<Target = [u8]> + DerefMut {
 }
 
 /// Handle to an allocated `u8` spot in a `DTlsBuffer`.
+#[must_use]
 pub struct AllocU8Handle {
     index: usize,
 }
@@ -255,6 +295,7 @@ impl Drop for AllocU8Handle {
 }
 
 /// Handle to an allocated `u16` spot in a `DTlsBuffer`.
+#[must_use]
 pub struct AllocU16Handle {
     index: usize,
 }
@@ -274,6 +315,7 @@ impl Drop for AllocU16Handle {
 }
 
 /// Handle to an allocated `u24` spot in a `DTlsBuffer`.
+#[must_use]
 pub struct AllocU24Handle {
     index: usize,
 }
@@ -293,6 +335,7 @@ impl Drop for AllocU24Handle {
 }
 
 /// Handle to an allocated `u48` spot in a `DTlsBuffer`.
+#[must_use]
 pub struct AllocU48Handle {
     index: usize,
 }
@@ -312,6 +355,7 @@ impl Drop for AllocU48Handle {
 }
 
 /// Handle to an allocated slice in a `DTlsBuffer`.
+#[must_use]
 pub struct AllocSliceHandle {
     index: usize,
     len: usize,
@@ -333,9 +377,59 @@ impl Drop for AllocSliceHandle {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn push() {}
+    use super::slice_buffer::SliceBuffer;
+    use crate::buffer::DTlsBuffer;
 
     #[test]
-    fn alloc() {}
+    fn push() {
+        let mut buf = [0; 128];
+        let mut buf = SliceBuffer::new(&mut buf);
+
+        assert_eq!(buf.len(), 0);
+
+        buf.push_u8(11).unwrap();
+        buf.push_u8(12).unwrap();
+        buf.push_u8(13).unwrap();
+        assert_eq!(buf[0], 11);
+        assert_eq!(buf[1], 12);
+        assert_eq!(buf[2], 13);
+
+        buf.forward_start();
+
+        assert_eq!(buf.len(), 0);
+
+        buf.push_u8(14).unwrap();
+        assert_eq!(buf[0], 14);
+
+        buf.reset_start();
+
+        assert_eq!(buf[0], 11);
+        assert_eq!(buf[1], 12);
+        assert_eq!(buf[2], 13);
+        assert_eq!(buf[3], 14);
+
+        buf.forward_start();
+
+        buf.extend_from_slice(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(buf[..4], [1, 2, 3, 4]);
+
+        buf.reset_start();
+        assert_eq!(buf[..], [11, 12, 13, 14, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn alloc() {
+        let mut buf = [0; 128];
+        let mut buf = SliceBuffer::new(&mut buf);
+
+        let a1 = buf.alloc_u8().unwrap();
+        let a2 = buf.alloc_slice(5).unwrap();
+
+        assert_eq!(buf.len(), 6);
+
+        a1.set(&mut buf, 1);
+        a2.set(&mut buf, &[1, 2, 3, 4, 5]);
+
+        assert_eq!(buf[..], [1, 1, 2, 3, 4, 5]);
+    }
 }

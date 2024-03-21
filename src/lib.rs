@@ -12,6 +12,7 @@
 
 use buffer::DTlsBuffer;
 use cipher_suites::TlsCipherSuite;
+use digest::Digest;
 use handshake::{ClientConfig, ClientHandshake};
 use key_schedule::KeySchedule;
 use rand_core::{CryptoRng, RngCore};
@@ -82,10 +83,13 @@ where
     where
         Rng: RngCore + CryptoRng,
     {
-        let key_schedule = KeySchedule::new();
+        let mut key_schedule = KeySchedule::new();
+        let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
 
         let hello = ClientRecord::<'_, CipherSuite>::client_hello(config, rng);
-        hello.encode::<Socket>(buf)?;
+        hello.encode::<Socket>(buf, &mut key_schedule, &mut transcript_hasher)?;
+
+        // TODO: ...
 
         Ok(DTlsClientConnection {
             socket,
