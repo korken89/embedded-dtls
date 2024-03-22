@@ -16,7 +16,7 @@
 
 use heapless::Vec;
 
-use crate::buffer::{AllocSliceHandle, DTlsBuffer};
+use crate::buffer::{AllocSliceHandle, Buffer};
 
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -46,26 +46,31 @@ pub enum ClientExtensions<'a> {
 impl<'a> ClientExtensions<'a> {
     /// Encode a client extension.
     /// Encode the offered pre-shared keys. Returns a handle to write the binders if needed.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<Option<AllocSliceHandle>, ()> {
+    pub fn encode(&self, buf: &mut Buffer) -> Result<Option<AllocSliceHandle>, ()> {
         buf.push_u8(self.extension_type() as u8)?;
 
-        let content_start = buf.len();
-        let extension_length_allocation = buf.alloc_u16()?;
+        let (extension_length_allocation, mut content_buf) = buf.alloc_u16()?;
 
         let r = match self {
             ClientExtensions::PskKeyExchangeModes(psk_exchange) => {
-                psk_exchange.encode(buf).map(|_| None)
+                psk_exchange.encode(&mut content_buf).map(|_| None)
             }
-            ClientExtensions::KeyShare(key_share) => key_share.encode(buf).map(|_| None),
-            ClientExtensions::SupportedVersions(versions) => versions.encode(buf).map(|_| None),
-            ClientExtensions::PreSharedKey(offered) => offered.encode(buf).map(|alloc| Some(alloc)),
-        };
+            ClientExtensions::KeyShare(key_share) => {
+                key_share.encode(&mut content_buf).map(|_| None)
+            }
+            ClientExtensions::SupportedVersions(versions) => {
+                versions.encode(&mut content_buf).map(|_| None)
+            }
+            ClientExtensions::PreSharedKey(offered) => {
+                offered.encode(&mut content_buf).map(|alloc| Some(alloc))
+            }
+        }?
+        .map(|r| r.0);
 
         // Fill in the length of this extension.
-        let content_length = (content_start - buf.len()) as u16;
-        extension_length_allocation.set(buf, content_length);
+        extension_length_allocation.set(content_buf.len() as u16);
 
-        r
+        Ok(r)
     }
 
     fn extension_type(&self) -> ExtensionType {
@@ -87,7 +92,7 @@ pub struct PskKeyExchangeModes {
 
 impl PskKeyExchangeModes {
     /// Encode a `psk_key_exchange_modes` extension.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut Buffer) -> Result<(), ()> {
         buf.push_u8(self.ke_modes.len() as u8)?;
         for mode in &self.ke_modes {
             buf.push_u8(*mode as u8)?;
@@ -107,7 +112,7 @@ pub struct KeyShareEntry<'a> {
 
 impl<'a> KeyShareEntry<'a> {
     /// Encode a `key_share` extension.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut Buffer) -> Result<(), ()> {
         buf.push_u16_be(2 + 2 + self.opaque.len() as u16)?;
 
         // one key-share
@@ -124,7 +129,7 @@ pub struct SupportedVersions {}
 
 impl SupportedVersions {
     /// Encode a `supported_versions` extension. We only support DTLS 1.3.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut Buffer) -> Result<(), ()> {
         buf.push_u8(2)?;
 
         // DTLS 1.3, RFC 9147, section 5.3
@@ -144,7 +149,10 @@ pub struct OfferedPsks<'a> {
 
 impl<'a> OfferedPsks<'a> {
     /// Encode the offered pre-shared keys. Returns a handle to write the binders.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<AllocSliceHandle, ()> {
+    pub fn encode<'binders>(
+        &self,
+        buf: &'binders mut Buffer,
+    ) -> Result<(AllocSliceHandle<'binders>, Buffer<'binders>), ()> {
         let ident_len = self
             .identities
             .iter()
@@ -180,7 +188,7 @@ pub struct PskIdentity<'a> {
 
 impl<'a> PskIdentity<'a> {
     /// Encode a pre-shared key identity into the buffer.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut Buffer) -> Result<(), ()> {
         // Encode length.
         buf.push_u16_be(self.identity.len() as u16)?;
 

@@ -1,4 +1,4 @@
-use crate::{buffer::DTlsBuffer, integers::U48, DTlsError, UdpSocket};
+use crate::{buffer::Buffer, integers::U48, DTlsError, UdpSocket};
 
 /// Record number tracking.
 pub struct RecordNumber {
@@ -25,7 +25,7 @@ impl RecordNumber {
     }
 
     // Encode into a DTLS buffer.
-    pub fn encode<S: UdpSocket>(&self, buf: &mut impl DTlsBuffer) -> Result<(), DTlsError<S>> {
+    pub fn encode<S: UdpSocket>(&self, mut buf: Buffer) -> Result<(), DTlsError<S>> {
         // Epoch (always 0), RFC 9147 - Appendix A.1
         buf.push_u16_be(0)
             .map_err(|_| DTlsError::InsufficientSpace)?;

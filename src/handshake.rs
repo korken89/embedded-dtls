@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 
 use crate::{
-    buffer::{AllocSliceHandle, AllocU16Handle, AllocU24Handle, DTlsBuffer},
+    buffer::{AllocSliceHandle, AllocU16Handle, AllocU24Handle, Buffer},
     cipher_suites::TlsCipherSuite,
     key_schedule::KeySchedule,
     record::LEGACY_DTLS_VERSION,
@@ -36,12 +36,12 @@ pub enum ClientHandshake<'a, CipherSuite> {
 impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
     pub fn encode(
         &self,
-        buf: &mut impl DTlsBuffer,
+        buf: &mut Buffer,
         key_schedule: &mut KeySchedule<CipherSuite>,
         transcript_hasher: &mut CipherSuite::Hash,
     ) -> Result<(), ()> {
         // TODO: Encode client handshake.
-        let header = HandshakeHeader {
+        let (header, mut buf) = HandshakeHeader {
             msg_type: self.handshake_type(),
         }
         .encode(buf)?;
@@ -53,19 +53,19 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
         let content_start = buf.len();
 
         let binders = match self {
-            ClientHandshake::ClientHello(hello) => Some(hello.encode(buf)?),
+            ClientHandshake::ClientHello(hello) => Some(hello.encode(&mut buf)?),
             ClientHandshake::Finished(finnished) => {
-                finnished.encode(buf)?;
+                finnished.encode(&mut buf)?;
                 None
             }
         };
 
         let content_length = (content_start - buf.len()) as u32;
 
-        header.length.set(buf, content_length.into());
-        header.message_seq.set(buf, 1); // TODO: This should probably be something else than 1
-        header.fragment_offset.set(buf, 0.into());
-        header.fragment_length.set(buf, content_length.into());
+        header.length.set(content_length.into());
+        header.message_seq.set(1); // TODO: This should probably be something else than 1
+        header.fragment_offset.set(0.into());
+        header.fragment_length.set(content_length.into());
 
         // The Handshake is finished, ready for transcript hash and binders.
 
@@ -144,30 +144,33 @@ pub struct HandshakeHeader {
 }
 
 /// The to-be-filled locations in the handshake header, defined in RFC 9147 section 5.2.
-pub struct HandshakeHeaderAllocations {
-    pub length: AllocU24Handle,
-    pub message_seq: AllocU16Handle,
-    pub fragment_offset: AllocU24Handle,
-    pub fragment_length: AllocU24Handle,
+pub struct HandshakeHeaderAllocations<'a> {
+    pub length: AllocU24Handle<'a>,
+    pub message_seq: AllocU16Handle<'a>,
+    pub fragment_offset: AllocU24Handle<'a>,
+    pub fragment_length: AllocU24Handle<'a>,
 }
 
 impl HandshakeHeader {
     /// Encode the handshake header. The return contains allocated space for
     /// `(length, fragment_length)`.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<HandshakeHeaderAllocations, ()> {
+    pub fn encode(&self, buf: &mut Buffer) -> Result<(HandshakeHeaderAllocations, Buffer), ()> {
         buf.push_u8(self.msg_type as u8)?;
 
-        let length = buf.alloc_u24()?;
-        let message_seq = buf.alloc_u16()?;
-        let fragment_offset = buf.alloc_u24()?;
-        let fragment_length = buf.alloc_u24()?;
+        let (length, mut buf) = buf.alloc_u24()?;
+        let (message_seq, mut buf) = buf.alloc_u16()?;
+        let (fragment_offset, mut buf) = buf.alloc_u24()?;
+        let (fragment_length, buf) = buf.alloc_u24()?;
 
-        Ok(HandshakeHeaderAllocations {
-            length,
-            message_seq,
-            fragment_offset,
-            fragment_length,
-        })
+        Ok((
+            HandshakeHeaderAllocations {
+                length,
+                message_seq,
+                fragment_offset,
+                fragment_length,
+            },
+            buf,
+        ))
     }
 }
 
@@ -210,7 +213,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
     /// Encode a client hello payload in a Handshake. RFC 9147 section 5.3.
     ///
     /// Returns the allocated position for binders.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<AllocSliceHandle, ()> {
+    pub fn encode(&self, buf: &mut Buffer) -> Result<AllocSliceHandle, ()> {
         // struct {
         //     ProtocolVersion legacy_version = { 254,253 }; // DTLSv1.2
         //     Random random;
@@ -243,32 +246,32 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
 
         // List of extensions.
         let content_start = buf.len();
-        let extensions_length_allocation = buf.alloc_u16()?;
+        let (extensions_length_allocation, mut extensions_buf) = buf.alloc_u16()?;
 
-        ClientExtensions::SupportedVersions(SupportedVersions {}).encode(buf)?;
+        ClientExtensions::SupportedVersions(SupportedVersions {}).encode(&mut extensions_buf)?;
 
         ClientExtensions::PskKeyExchangeModes(PskKeyExchangeModes {
             ke_modes: Vec::from_slice(&[PskKeyExchangeMode::PskDheKe]).unwrap(),
         })
-        .encode(buf)?;
+        .encode(&mut extensions_buf)?;
 
         ClientExtensions::KeyShare(KeyShareEntry {
             group: NamedGroup::X25519,
             opaque: PublicKey::from(&self.secret).as_bytes(),
         })
-        .encode(buf)?;
+        .encode(&mut extensions_buf)?;
 
         // IMPORTANT: Pre-shared key extension must come last.
         let binders_allocation = ClientExtensions::PreSharedKey(OfferedPsks {
             identities: self.config.psk_identities,
             hash_size: <CipherSuite::Hash as OutputSizeUser>::output_size(),
         })
-        .encode(buf)?
+        .encode(&mut extensions_buf)?
         .ok_or(())?;
 
         // Fill in the length of extensions.
         let content_length = (content_start - buf.len()) as u16;
-        extensions_length_allocation.set(buf, content_length);
+        extensions_length_allocation.set(content_length);
 
         Ok(binders_allocation)
     }
@@ -293,9 +296,10 @@ pub struct Finished<const HASH_LEN: usize> {
     pub verify: [u8; HASH_LEN],
     // pub hash: Option<[u8; 1]>,
 }
+
 impl<const HASH_LEN: usize> Finished<HASH_LEN> {
     /// Encode a Finished payload in an Handshake.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut Buffer) -> Result<(), ()> {
         buf.extend_from_slice(&self.verify)
     }
 }

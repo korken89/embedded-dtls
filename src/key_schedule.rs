@@ -15,7 +15,7 @@
 //                        Transcript-Hash(Messages), Hash.length)
 
 use crate::{
-    buffer::{array_buffer::ArrayBuffer, DTlsBuffer},
+    buffer::Buffer,
     cipher_suites::{CipherSuite, TlsCipherSuite},
 };
 use digest::{generic_array::GenericArray, OutputSizeUser};
@@ -174,7 +174,8 @@ fn hkdf_make_expanded_label<CipherSuite: TlsCipherSuite>(
     hkdf: &SimpleHkdf<CipherSuite::Hash>,
     label: HkdfLabelContext,
 ) -> GenericArray<u8, <<CipherSuite as TlsCipherSuite>::Hash as OutputSizeUser>::OutputSize> {
-    let mut hkdf_label = ArrayBuffer::<CipherSuite::LabelBufferSize>::new();
+    let buf = GenericArray::<u8, CipherSuite::LabelBufferSize>::default();
+    let mut hkdf_label = Buffer::new(&mut buf);
 
     // Length
     hkdf_label.push_u16_be(hkdf_label.capacity() as u16).ok();

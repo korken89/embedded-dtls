@@ -10,7 +10,7 @@
 #![no_std]
 #![allow(async_fn_in_trait)]
 
-use buffer::DTlsBuffer;
+use buffer::Buffer;
 use cipher_suites::TlsCipherSuite;
 use digest::Digest;
 use handshake::{ClientConfig, ClientHandshake};
@@ -76,18 +76,19 @@ where
     /// NOTE: This does not do timeout, it's up to the caller to give up.
     pub async fn open_client<Rng>(
         rng: &mut Rng,
-        buf: &mut impl DTlsBuffer,
+        buf: &mut [u8],
         socket: Socket,
         config: &ClientConfig<'_>,
     ) -> Result<Self, DTlsError<Socket>>
     where
         Rng: RngCore + CryptoRng,
     {
+        let mut buf = Buffer::new(buf);
         let mut key_schedule = KeySchedule::new();
         let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
 
         let hello = ClientRecord::<'_, CipherSuite>::client_hello(config, rng);
-        hello.encode::<Socket>(buf, &mut key_schedule, &mut transcript_hasher)?;
+        hello.encode::<Socket>(&mut buf, &mut key_schedule, &mut transcript_hasher)?;
 
         // TODO: ...
 

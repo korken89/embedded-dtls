@@ -1,7 +1,7 @@
 use rand_core::{CryptoRng, RngCore};
 
 use crate::{
-    buffer::{AllocU16Handle, DTlsBuffer},
+    buffer::{AllocU16Handle, Buffer},
     cipher_suites::TlsCipherSuite,
     handshake::{ClientConfig, ClientHandshake, ClientHello},
     integers::U48,
@@ -42,7 +42,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
     /// Encode the record into a buffer.
     pub fn encode<S: UdpSocket>(
         &self,
-        buf: &mut impl DTlsBuffer,
+        buf: &mut Buffer,
         key_schedule: &mut KeySchedule<CipherSuite>,
         transcript_hasher: &mut CipherSuite::Hash,
     ) -> Result<(), DTlsError<S>> {
@@ -55,11 +55,11 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
 
         // Create record header.
         let content_start = buf.len();
-        let length_allocation = header
-            .encode(buf)
+        let (length_allocation, mut buf) = header
+            .encode(&mut buf)
             .map_err(|_| DTlsError::InsufficientSpace)?;
 
-        buf.forward_start();
+        let mut buf = buf.forward();
 
         // ------ Encode payload
 
@@ -67,7 +67,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
             ClientRecord::Handshake(handshake, encryption) => {
                 // TODO: handle encryption
                 handshake
-                    .encode(buf, key_schedule, transcript_hasher)
+                    .encode(&mut buf, key_schedule, transcript_hasher)
                     .map_err(|_| DTlsError::InsufficientSpace)?;
 
                 // if let Some(binders) = binders_allocation {
@@ -87,7 +87,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
         }
 
         let content_length = (content_start - buf.len()) as u16;
-        length_allocation.set(buf, content_length);
+        length_allocation.set(content_length);
 
         // ------ Finish record
 
@@ -124,7 +124,7 @@ pub struct DTlsPlaintextHeader {
 
 impl DTlsPlaintextHeader {
     /// Encode a DTlsPlaintext header, return the allocation for the length field.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<AllocU16Handle, ()> {
+    pub fn encode(&self, buf: &mut Buffer) -> Result<(AllocU16Handle, Buffer), ()> {
         // DTlsPlaintext structure:
         //
         // type: ContentType,
