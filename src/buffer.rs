@@ -1,280 +1,154 @@
 use crate::integers::{U24, U48};
 use core::ops::{Deref, DerefMut};
 
-// pub mod embedded {
-//     use core::ops::{Deref, DerefMut};
-
-//     use heapless::Vec;
-
-//     use super::DTlsBuffer;
-
-//     /// A buffer handler wrapping a mutable slice.
-//     ///
-//     /// It allows for building DTLS records with look back for writing lengths.
-//     pub struct HeaplessTlsBuffer {
-//         buf: Vec<u8, 1024>,
-//         offset: usize,
-//     }
-
-//     impl HeaplessTlsBuffer {
-//         /// Create a new buffer wrapper.
-//         #[inline]
-//         pub fn new() -> Self {
-//             Self {
-//                 buf: Vec::new(),
-//                 offset: 0,
-//             }
-//         }
-//     }
-// }
-
-pub mod slice_buffer {
-    use super::DTlsBuffer;
-    use core::ops::{Deref, DerefMut};
-
-    /// A buffer handler wrapping a mutable slice.
-    pub struct SliceBuffer<'a> {
-        buf: &'a mut [u8],
-        idx: usize,
-        start: usize,
-    }
-    impl<'a> SliceBuffer<'a> {
-        /// Create new buffer from a slice.
-        pub fn new(buf: &'a mut [u8]) -> Self {
-            Self {
-                buf,
-                idx: 0,
-                start: 0,
-            }
-        }
-    }
-
-    impl<'a> Deref for SliceBuffer<'a> {
-        type Target = [u8];
-
-        fn deref(&self) -> &Self::Target {
-            &self.buf[self.start..self.idx]
-        }
-    }
-
-    impl<'a> DerefMut for SliceBuffer<'a> {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.buf[self.start..self.idx]
-        }
-    }
-
-    impl<'a> DTlsBuffer for SliceBuffer<'a> {
-        fn len(&self) -> usize {
-            self.idx - self.start
-        }
-
-        fn index(&self) -> usize {
-            self.idx
-        }
-
-        fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), ()> {
-            self.buf
-                .get_mut(self.idx..self.idx + slice.len())
-                .ok_or(())?
-                .copy_from_slice(slice);
-            self.idx += slice.len();
-
-            Ok(())
-        }
-
-        fn push_u8(&mut self, val: u8) -> Result<(), ()> {
-            *self.buf.get_mut(self.idx).ok_or(())? = val;
-            self.idx += 1;
-
-            Ok(())
-        }
-
-        fn forward_start(&mut self) {
-            self.start = self.idx;
-        }
-
-        fn reset_start(&mut self) {
-            self.start = 0;
-        }
-    }
+/// A buffer handler wrapping a mutable slice.
+#[derive(Debug)]
+pub struct SliceBuffer<'a> {
+    buf: &'a mut [u8],
+    idx: usize,
+    start: usize,
 }
 
-pub mod array_buffer {
-    use digest::generic_array::{ArrayLength, GenericArray};
-
-    use super::DTlsBuffer;
-    use core::ops::{Deref, DerefMut};
-
-    /// A buffer handler wrapping a mutable slice.
-    // TODO: We can use `MaybeUninit` if we want to optimize.
-    pub struct ArrayBuffer<N: ArrayLength<u8>> {
-        buf: GenericArray<u8, N>,
-        idx: usize,
-    }
-
-    impl<N> ArrayBuffer<N>
-    where
-        N: ArrayLength<u8>,
-    {
-        /// Create new buffer from a slice.
-        pub fn new() -> Self {
-            Self {
-                buf: GenericArray::default(),
-                idx: 0,
-            }
-        }
-
-        /// Capacity of the buffer.
-        pub fn capacity(&self) -> usize {
-            N::to_usize()
+impl<'a> SliceBuffer<'a> {
+    /// Create new buffer from a slice.
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self {
+            buf,
+            idx: 0,
+            start: 0,
         }
     }
 
-    impl<N> Deref for ArrayBuffer<N>
-    where
-        N: ArrayLength<u8>,
-    {
-        type Target = [u8];
-
-        fn deref(&self) -> &Self::Target {
-            &self.buf[..self.idx]
-        }
+    /// Current length of the buffer.
+    pub fn len(&self) -> usize {
+        self.idx - self.start
     }
 
-    impl<N> DerefMut for ArrayBuffer<N>
-    where
-        N: ArrayLength<u8>,
-    {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.buf[..self.idx]
-        }
+    /// Capacity of the buffer.
+    pub fn capacity(&self) -> usize {
+        self.buf.len()
     }
 
-    impl<N> DTlsBuffer for ArrayBuffer<N>
-    where
-        N: ArrayLength<u8>,
-    {
-        fn len(&self) -> usize {
-            self.idx
-        }
-
-        fn index(&self) -> usize {
-            self.idx
-        }
-
-        fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), ()> {
-            self.buf
-                .get_mut(self.idx..self.idx + slice.len())
-                .ok_or(())?
-                .copy_from_slice(slice);
-
-            Ok(())
-        }
-
-        fn push_u8(&mut self, val: u8) -> Result<(), ()> {
-            *self.buf.get_mut(self.idx).ok_or(())? = val;
-            self.idx += 1;
-
-            Ok(())
-        }
-
-        fn forward_start(&mut self) {
-            todo!()
-        }
-
-        fn reset_start(&mut self) {
-            todo!()
-        }
+    /// Current index of the buffer.
+    pub fn index(&self) -> usize {
+        self.idx
     }
-}
 
-pub mod std {
-    // TODO
-}
+    /// Extend with a slice.
+    pub fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), ()> {
+        self.buf
+            .get_mut(self.idx..self.idx + slice.len())
+            .ok_or(())?
+            .copy_from_slice(slice);
+        self.idx += slice.len();
 
-pub trait DTlsBuffer: Deref<Target = [u8]> + DerefMut {
-    /// The current length.
-    fn len(&self) -> usize;
+        Ok(())
+    }
 
-    /// The current index.
-    fn index(&self) -> usize;
+    /// Push a u8.
+    pub fn push_u8(&mut self, val: u8) -> Result<(), ()> {
+        *self.buf.get_mut(self.idx).ok_or(())? = val;
+        self.idx += 1;
 
-    /// The the current index of the buffer to index 0.
-    fn forward_start(&mut self);
+        Ok(())
+    }
 
-    /// Reset the start index of the buffer to 0.
-    fn reset_start(&mut self);
+    /// Move the start to the current index.
+    pub fn forward_start(&mut self) {
+        self.start = self.idx;
+    }
 
-    /// Extend from a slice.
-    fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), ()>;
-
-    /// Push a byte.
-    fn push_u8(&mut self, val: u8) -> Result<(), ()>;
+    /// Reset start to 0.
+    pub fn reset_start(&mut self) {
+        self.start = 0;
+    }
 
     /// Push a u16 in big-endian.
-    fn push_u16_be(&mut self, val: u16) -> Result<(), ()> {
-        DTlsBuffer::extend_from_slice(self, &val.to_be_bytes())
+    pub fn push_u16_be(&mut self, val: u16) -> Result<(), ()> {
+        self.extend_from_slice(&val.to_be_bytes())
     }
+
     /// Push a u24 in big-endian.
-    fn push_u24_be(&mut self, val: U24) -> Result<(), ()> {
-        DTlsBuffer::extend_from_slice(self, &val.to_be_bytes())
+    pub fn push_u24_be(&mut self, val: U24) -> Result<(), ()> {
+        self.extend_from_slice(&val.to_be_bytes())
     }
 
     /// Push a u32 in big-endian.
-    fn push_u32_be(&mut self, val: u32) -> Result<(), ()> {
-        DTlsBuffer::extend_from_slice(self, &val.to_be_bytes())
+    pub fn push_u32_be(&mut self, val: u32) -> Result<(), ()> {
+        self.extend_from_slice(&val.to_be_bytes())
     }
 
     /// Push a u48 in big-endian.
-    fn push_u48_be(&mut self, val: U48) -> Result<(), ()> {
-        DTlsBuffer::extend_from_slice(self, &val.to_be_bytes())
+    pub fn push_u48_be(&mut self, val: U48) -> Result<(), ()> {
+        self.extend_from_slice(&val.to_be_bytes())
     }
 
     /// Allocate the space for a `u8` for later updating.
-    fn alloc_u8(&mut self) -> Result<AllocU8Handle, ()> {
-        let index = DTlsBuffer::index(self);
-        DTlsBuffer::push_u8(self, 0)?;
+    pub fn alloc_u8(&mut self) -> Result<AllocU8Handle, ()> {
+        let index = self.index();
+        self.push_u8(0)?;
 
         Ok(AllocU8Handle { index })
     }
 
     /// Allocate the space for a `u16` for later updating.
-    fn alloc_u16(&mut self) -> Result<AllocU16Handle, ()> {
-        let index = DTlsBuffer::index(self);
-        DTlsBuffer::push_u16_be(self, 0)?;
+    pub fn alloc_u16(&mut self) -> Result<AllocU16Handle, ()> {
+        let index = self.index();
+        self.push_u16_be(0)?;
 
         Ok(AllocU16Handle { index })
     }
 
     /// Allocate the space for a `u24` for later updating.
-    fn alloc_u24(&mut self) -> Result<AllocU24Handle, ()> {
-        let index = DTlsBuffer::index(self);
-        DTlsBuffer::push_u24_be(self, U24::new(0))?;
+    pub fn alloc_u24(&mut self) -> Result<AllocU24Handle, ()> {
+        let index = self.index();
+        self.push_u24_be(U24::new(0))?;
 
         Ok(AllocU24Handle { index })
     }
 
     /// Allocate the space for a `u48` for later updating.
-    fn alloc_u48(&mut self) -> Result<AllocU48Handle, ()> {
-        let index = DTlsBuffer::index(self);
-        DTlsBuffer::push_u48_be(self, U48::new(0))?;
+    pub fn alloc_u48(&mut self) -> Result<AllocU48Handle, ()> {
+        let index = self.index();
+        self.push_u48_be(U48::new(0))?;
 
         Ok(AllocU48Handle { index })
     }
 
     /// Allocate space for a slice for later updating.
-    fn alloc_slice(&mut self, len: usize) -> Result<AllocSliceHandle, ()> {
-        let index = DTlsBuffer::index(self);
+    pub fn alloc_slice(&mut self, len: usize) -> Result<AllocSliceHandle, ()> {
+        let index = self.index();
 
         for _ in 0..len {
-            DTlsBuffer::push_u8(self, 0)?;
+            self.push_u8(0)?;
         }
 
         Ok(AllocSliceHandle { index, len })
     }
 }
 
+impl<'a> Deref for SliceBuffer<'a> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.buf.get(self.start..self.idx).unwrap_or(&[])
+    }
+}
+
+impl<'a> DerefMut for SliceBuffer<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.buf.get_mut(self.start..self.idx).unwrap_or(&mut [])
+    }
+}
+
+impl<'a> AsRef<[u8]> for SliceBuffer<'a> {
+    fn as_ref(&self) -> &[u8] {
+        self.deref()
+    }
+}
+
 /// Handle to an allocated `u8` spot in a `DTlsBuffer`.
+#[derive(Debug)]
 #[must_use]
 pub struct AllocU8Handle {
     index: usize,
@@ -282,7 +156,7 @@ pub struct AllocU8Handle {
 
 impl AllocU8Handle {
     /// Set the value.
-    pub fn set(self, buf: &mut impl DTlsBuffer, val: u8) {
+    pub fn set(self, buf: &mut SliceBuffer, val: u8) {
         buf[self.index] = val;
         core::mem::forget(self);
     }
@@ -295,6 +169,7 @@ impl Drop for AllocU8Handle {
 }
 
 /// Handle to an allocated `u16` spot in a `DTlsBuffer`.
+#[derive(Debug)]
 #[must_use]
 pub struct AllocU16Handle {
     index: usize,
@@ -302,7 +177,7 @@ pub struct AllocU16Handle {
 
 impl AllocU16Handle {
     /// Set the value.
-    pub fn set(self, buf: &mut impl DTlsBuffer, val: u16) {
+    pub fn set(self, buf: &mut SliceBuffer, val: u16) {
         buf[self.index..self.index + 2].copy_from_slice(&val.to_be_bytes());
         core::mem::forget(self);
     }
@@ -315,6 +190,7 @@ impl Drop for AllocU16Handle {
 }
 
 /// Handle to an allocated `u24` spot in a `DTlsBuffer`.
+#[derive(Debug)]
 #[must_use]
 pub struct AllocU24Handle {
     index: usize,
@@ -322,7 +198,7 @@ pub struct AllocU24Handle {
 
 impl AllocU24Handle {
     /// Set the value.
-    pub fn set(self, buf: &mut impl DTlsBuffer, val: U24) {
+    pub fn set(self, buf: &mut SliceBuffer, val: U24) {
         buf[self.index..self.index + 3].copy_from_slice(&val.to_be_bytes());
         core::mem::forget(self);
     }
@@ -335,6 +211,7 @@ impl Drop for AllocU24Handle {
 }
 
 /// Handle to an allocated `u48` spot in a `DTlsBuffer`.
+#[derive(Debug)]
 #[must_use]
 pub struct AllocU48Handle {
     index: usize,
@@ -342,7 +219,7 @@ pub struct AllocU48Handle {
 
 impl AllocU48Handle {
     /// Set the value.
-    pub fn set(self, buf: &mut impl DTlsBuffer, val: U48) {
+    pub fn set(self, buf: &mut SliceBuffer, val: U48) {
         buf[self.index..self.index + 6].copy_from_slice(&val.to_be_bytes());
         core::mem::forget(self);
     }
@@ -355,6 +232,7 @@ impl Drop for AllocU48Handle {
 }
 
 /// Handle to an allocated slice in a `DTlsBuffer`.
+#[derive(Debug)]
 #[must_use]
 pub struct AllocSliceHandle {
     index: usize,
@@ -362,9 +240,17 @@ pub struct AllocSliceHandle {
 }
 
 impl AllocSliceHandle {
+    /// The the slice from buffer that is everything up until this allocation starts.
+    pub fn slice_up_until<'a>(&'a self, buf: &'a SliceBuffer) -> &'a [u8] {
+        buf.buf.get(buf.start..self.index).unwrap_or(&[])
+    }
+
     /// Set the value.
-    pub fn set(self, buf: &mut impl DTlsBuffer, val: &[u8]) {
-        buf[self.index..self.index + self.len].copy_from_slice(val);
+    pub fn set(self, buf: &mut SliceBuffer, val: &[u8]) {
+        buf.buf
+            .get_mut(self.index..self.index + self.len)
+            .unwrap_or(&mut [])
+            .copy_from_slice(val);
         core::mem::forget(self);
     }
 }
@@ -377,8 +263,7 @@ impl Drop for AllocSliceHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::slice_buffer::SliceBuffer;
-    use crate::buffer::DTlsBuffer;
+    use super::SliceBuffer;
 
     #[test]
     fn push() {
@@ -398,7 +283,9 @@ mod tests {
 
         assert_eq!(buf.len(), 0);
 
+        println!("buf: {buf:?}");
         buf.push_u8(14).unwrap();
+        println!("buf: {buf:?}");
         assert_eq!(buf[0], 14);
 
         buf.reset_start();
@@ -431,5 +318,30 @@ mod tests {
         a2.set(&mut buf, &[1, 2, 3, 4, 5]);
 
         assert_eq!(buf[..], [1, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn slice_until() {
+        let mut buf = [0; 128];
+        let mut buf = SliceBuffer::new(&mut buf);
+
+        buf.extend_from_slice(&[1, 2, 3, 4, 5]).unwrap();
+        let a = buf.alloc_slice(3).unwrap();
+
+        assert_eq!(a.slice_up_until(&buf), [1, 2, 3, 4, 5]);
+        assert_eq!(buf.len(), 8);
+
+        a.set(&mut buf, &[1, 2, 3]);
+
+        println!("buf: {buf:?}");
+        assert_eq!(buf[..], [1, 2, 3, 4, 5, 1, 2, 3]);
+
+        buf.forward_start();
+        println!("buf: {buf:?}");
+        let a = buf.alloc_slice(3).unwrap();
+        println!("a: {a:?}");
+        assert_eq!(a.slice_up_until(&buf), []);
+
+        a.set(&mut buf, &[4, 5, 6]);
     }
 }

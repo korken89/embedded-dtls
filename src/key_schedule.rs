@@ -14,12 +14,9 @@
 //      HKDF-Expand-Label(Secret, Label,
 //                        Transcript-Hash(Messages), Hash.length)
 
-use crate::{
-    buffer::{array_buffer::ArrayBuffer, DTlsBuffer},
-    cipher_suites::{CipherSuite, TlsCipherSuite},
-};
-use digest::{generic_array::GenericArray, OutputSizeUser};
-use hkdf::SimpleHkdf;
+use crate::{buffer::SliceBuffer, cipher_suites::TlsCipherSuite};
+use digest::{generic_array::GenericArray, Digest, KeyInit, Mac, OutputSizeUser};
+use hkdf::{hmac::SimpleHmac, SimpleHkdf};
 
 /// Define the HDKF for a cipher suite, so it uses the hash function defined in the trait.
 pub type Hkdf<CipherSuite> = SimpleHkdf<<CipherSuite as TlsCipherSuite>::Hash>;
@@ -85,6 +82,31 @@ where
         };
 
         hkdf_make_expanded_label::<CipherSuite>(hkdf, label)
+    }
+
+    /// Calculate a binder.
+    pub fn create_binder(&self, transcript_hasher: &CipherSuite::Hash) -> HashArray<CipherSuite> {
+        let secret = match &self.keyschedule_state {
+            KeyScheduleState::EarlySecret(secret) => secret,
+            _ => {
+                unreachable!("Internal error! `create_binder` was called when not in early secret")
+            }
+        };
+
+        let binder_hkdf = Hkdf::<CipherSuite>::from_prk(&secret.binder_key).unwrap();
+        let binder_key = hkdf_make_expanded_label::<CipherSuite>(
+            &binder_hkdf,
+            HkdfLabelContext {
+                label: b"finished",
+                context: &[],
+            },
+        );
+
+        let mut hmac =
+            <SimpleHmac<CipherSuite::Hash> as KeyInit>::new_from_slice(&binder_key).unwrap();
+        Mac::update(&mut hmac, &transcript_hasher.clone().finalize());
+
+        hmac.finalize().into_bytes()
     }
 
     /// Move to the next step in the secrets.
@@ -174,7 +196,8 @@ fn hkdf_make_expanded_label<CipherSuite: TlsCipherSuite>(
     hkdf: &SimpleHkdf<CipherSuite::Hash>,
     label: HkdfLabelContext,
 ) -> GenericArray<u8, <<CipherSuite as TlsCipherSuite>::Hash as OutputSizeUser>::OutputSize> {
-    let mut hkdf_label = ArrayBuffer::<CipherSuite::LabelBufferSize>::new();
+    let mut hkdf_label = GenericArray::<u8, CipherSuite::LabelBufferSize>::default();
+    let mut hkdf_label = SliceBuffer::new(&mut hkdf_label);
 
     // Length
     hkdf_label.push_u16_be(hkdf_label.capacity() as u16).ok();

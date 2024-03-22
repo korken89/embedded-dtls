@@ -1,30 +1,26 @@
 use core::marker::PhantomData;
 
 use crate::{
-    buffer::{AllocSliceHandle, AllocU16Handle, AllocU24Handle, DTlsBuffer},
+    buffer::{AllocSliceHandle, AllocU16Handle, AllocU24Handle, SliceBuffer},
     cipher_suites::TlsCipherSuite,
     key_schedule::KeySchedule,
     record::LEGACY_DTLS_VERSION,
+    ClientConfig,
 };
-use digest::OutputSizeUser;
+use digest::{Digest, OutputSizeUser};
 use extensions::{ClientExtensions, PskKeyExchangeModes};
 use heapless::Vec;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use self::extensions::{
-    KeyShareEntry, NamedGroup, OfferedPsks, PskIdentity, PskKeyExchangeMode, SupportedVersions,
+    KeyShareEntry, NamedGroup, OfferedPsks, PskKeyExchangeMode, SupportedVersions,
 };
 
 pub mod extensions;
 
 /// The random bytes in a handshake.
 pub type Random = [u8; 32];
-
-pub struct ClientConfig<'a> {
-    /// List of PSK identities.
-    psk_identities: &'a [PskIdentity<'a>],
-}
 
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -36,7 +32,7 @@ pub enum ClientHandshake<'a, CipherSuite> {
 impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
     pub fn encode(
         &self,
-        buf: &mut impl DTlsBuffer,
+        buf: &mut SliceBuffer,
         key_schedule: &mut KeySchedule<CipherSuite>,
         transcript_hasher: &mut CipherSuite::Hash,
     ) -> Result<(), ()> {
@@ -68,9 +64,21 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
         header.fragment_length.set(buf, content_length.into());
 
         // The Handshake is finished, ready for transcript hash and binders.
+        if let Some(binders) = binders {
+            // Update the transcript with everything up until the binder itself.
+            transcript_hasher.update(binders.slice_up_until(buf));
 
-        // TODO: Update transcript hash.
-        // TODO: Create transcript for binders if it was a client hello with PSK.
+            // Calculate the binder entry.
+            let binder_entry = key_schedule.create_binder(transcript_hasher);
+
+            // Add the binder entry to the transcript.
+            transcript_hasher.update(&binder_entry);
+
+            // Save the binder entry to the correct location.
+            binders.set(buf, &binder_entry);
+        } else {
+            transcript_hasher.update(buf);
+        }
 
         Ok(())
     }
@@ -85,7 +93,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
     // /// Perform DTLS 1.3 handshake.
     // pub async fn perform<Socket, Rng>(
     //     &mut self,
-    //     buffer: &mut impl DTlsBuffer,
+    //     buffer: &mut SliceBuffer,
     //     socket: &Socket,
     //     rng: &mut Rng,
     // ) -> Result<(), DTlsError<Socket>>
@@ -154,7 +162,7 @@ pub struct HandshakeHeaderAllocations {
 impl HandshakeHeader {
     /// Encode the handshake header. The return contains allocated space for
     /// `(length, fragment_length)`.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<HandshakeHeaderAllocations, ()> {
+    pub fn encode(&self, buf: &mut SliceBuffer) -> Result<HandshakeHeaderAllocations, ()> {
         buf.push_u8(self.msg_type as u8)?;
 
         let length = buf.alloc_u24()?;
@@ -210,7 +218,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
     /// Encode a client hello payload in a Handshake. RFC 9147 section 5.3.
     ///
     /// Returns the allocated position for binders.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<AllocSliceHandle, ()> {
+    pub fn encode(&self, buf: &mut SliceBuffer) -> Result<AllocSliceHandle, ()> {
         // struct {
         //     ProtocolVersion legacy_version = { 254,253 }; // DTLSv1.2
         //     Random random;
@@ -242,8 +250,8 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
         buf.push_u8(0)?;
 
         // List of extensions.
-        let content_start = buf.len();
         let extensions_length_allocation = buf.alloc_u16()?;
+        let content_start = buf.len();
 
         ClientExtensions::SupportedVersions(SupportedVersions {}).encode(buf)?;
 
@@ -260,7 +268,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
 
         // IMPORTANT: Pre-shared key extension must come last.
         let binders_allocation = ClientExtensions::PreSharedKey(OfferedPsks {
-            identities: self.config.psk_identities,
+            identities: &[&self.config.psk],
             hash_size: <CipherSuite::Hash as OutputSizeUser>::output_size(),
         })
         .encode(buf)?
@@ -295,7 +303,7 @@ pub struct Finished<const HASH_LEN: usize> {
 }
 impl<const HASH_LEN: usize> Finished<HASH_LEN> {
     /// Encode a Finished payload in an Handshake.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut SliceBuffer) -> Result<(), ()> {
         buf.extend_from_slice(&self.verify)
     }
 }

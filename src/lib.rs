@@ -1,19 +1,22 @@
 //! A DTLS 1.3 PSK implementation.
 //!
+//! # Limitations
 //!
+//! - We only support that the client sends 1 PSK identity for now.
+//! - Only X25519 ECDHE
 //!
-//!
+//! # Thanks
 //!
 //! Heavily inspired by [`embedded-tls`].
 //! [`embedded-tls`]: https://github.com/drogue-iot/embedded-tls
 
-#![no_std]
+// #![no_std]
 #![allow(async_fn_in_trait)]
 
-use buffer::DTlsBuffer;
+use buffer::SliceBuffer;
 use cipher_suites::TlsCipherSuite;
 use digest::Digest;
-use handshake::{ClientConfig, ClientHandshake};
+use handshake::extensions::Psk;
 use key_schedule::KeySchedule;
 use rand_core::{CryptoRng, RngCore};
 use record::ClientRecord;
@@ -26,6 +29,14 @@ pub mod integers;
 pub mod key_schedule;
 pub mod record;
 pub mod session;
+
+/// Client configuration.
+pub struct ClientConfig<'a> {
+    /// Preshared key.
+    /// TODO: Support a list of PSKs, needs work in how to calculate binders and track all the
+    /// necessary early secrets derived from the PSKs.
+    psk: Psk<'a>,
+}
 
 // The TLS cake
 //
@@ -76,18 +87,19 @@ where
     /// NOTE: This does not do timeout, it's up to the caller to give up.
     pub async fn open_client<Rng>(
         rng: &mut Rng,
-        buf: &mut impl DTlsBuffer,
+        buf: &mut [u8],
         socket: Socket,
         config: &ClientConfig<'_>,
     ) -> Result<Self, DTlsError<Socket>>
     where
         Rng: RngCore + CryptoRng,
     {
+        let mut buf = SliceBuffer::new(buf);
         let mut key_schedule = KeySchedule::new();
         let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
 
         let hello = ClientRecord::<'_, CipherSuite>::client_hello(config, rng);
-        hello.encode::<Socket>(buf, &mut key_schedule, &mut transcript_hasher)?;
+        hello.encode::<Socket>(&mut buf, &mut key_schedule, &mut transcript_hasher)?;
 
         // TODO: ...
 
@@ -161,7 +173,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    // use super::*;
 
     #[test]
     fn open_connection() {}

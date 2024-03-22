@@ -14,9 +14,8 @@
 //!
 //! All this is defined in RFC 8446 (TLS 1.3) at Page 37.
 
+use crate::buffer::{AllocSliceHandle, SliceBuffer};
 use heapless::Vec;
-
-use crate::buffer::{AllocSliceHandle, DTlsBuffer};
 
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -46,11 +45,11 @@ pub enum ClientExtensions<'a> {
 impl<'a> ClientExtensions<'a> {
     /// Encode a client extension.
     /// Encode the offered pre-shared keys. Returns a handle to write the binders if needed.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<Option<AllocSliceHandle>, ()> {
+    pub fn encode(&self, buf: &mut SliceBuffer) -> Result<Option<AllocSliceHandle>, ()> {
         buf.push_u8(self.extension_type() as u8)?;
 
-        let content_start = buf.len();
         let extension_length_allocation = buf.alloc_u16()?;
+        let content_start = buf.len();
 
         let r = match self {
             ClientExtensions::PskKeyExchangeModes(psk_exchange) => {
@@ -87,7 +86,7 @@ pub struct PskKeyExchangeModes {
 
 impl PskKeyExchangeModes {
     /// Encode a `psk_key_exchange_modes` extension.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut SliceBuffer) -> Result<(), ()> {
         buf.push_u8(self.ke_modes.len() as u8)?;
         for mode in &self.ke_modes {
             buf.push_u8(*mode as u8)?;
@@ -107,7 +106,7 @@ pub struct KeyShareEntry<'a> {
 
 impl<'a> KeyShareEntry<'a> {
     /// Encode a `key_share` extension.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut SliceBuffer) -> Result<(), ()> {
         buf.push_u16_be(2 + 2 + self.opaque.len() as u16)?;
 
         // one key-share
@@ -124,7 +123,7 @@ pub struct SupportedVersions {}
 
 impl SupportedVersions {
     /// Encode a `supported_versions` extension. We only support DTLS 1.3.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut SliceBuffer) -> Result<(), ()> {
         buf.push_u8(2)?;
 
         // DTLS 1.3, RFC 9147, section 5.3
@@ -137,14 +136,14 @@ impl SupportedVersions {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct OfferedPsks<'a> {
     /// List of identities that can be used. Ticket age is set to 0.
-    pub identities: &'a [PskIdentity<'a>],
+    pub identities: &'a [&'a Psk<'a>],
     /// Size of the binder hash.
     pub hash_size: usize,
 }
 
 impl<'a> OfferedPsks<'a> {
     /// Encode the offered pre-shared keys. Returns a handle to write the binders.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<AllocSliceHandle, ()> {
+    pub fn encode(&self, buf: &mut SliceBuffer) -> Result<AllocSliceHandle, ()> {
         let ident_len = self
             .identities
             .iter()
@@ -169,18 +168,20 @@ impl<'a> OfferedPsks<'a> {
     }
 }
 
-/// Pre-shared key identity payload.
+/// Pre-shared key entry.
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct PskIdentity<'a> {
-    /// A label for a key. For instance, a ticket (as defined in Appendix B.3.4) or a label
+pub struct Psk<'a> {
+    /// A label for the key. For instance, a ticket (as defined in Appendix B.3.4) or a label
     /// for a pre-shared key established externally.
     pub identity: &'a [u8],
+    /// The pre-shared key.
+    pub key: &'a [u8],
 }
 
-impl<'a> PskIdentity<'a> {
+impl<'a> Psk<'a> {
     /// Encode a pre-shared key identity into the buffer.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut SliceBuffer) -> Result<(), ()> {
         // Encode length.
         buf.push_u16_be(self.identity.len() as u16)?;
 

@@ -1,12 +1,12 @@
 use rand_core::{CryptoRng, RngCore};
 
 use crate::{
-    buffer::{AllocU16Handle, DTlsBuffer},
+    buffer::{AllocU16Handle, SliceBuffer},
     cipher_suites::TlsCipherSuite,
-    handshake::{ClientConfig, ClientHandshake, ClientHello},
+    handshake::{ClientHandshake, ClientHello},
     integers::U48,
     key_schedule::KeySchedule,
-    DTlsError, UdpSocket,
+    ClientConfig, DTlsError, UdpSocket,
 };
 
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
@@ -20,7 +20,7 @@ pub enum Encryption {
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ClientRecord<'a, CipherSuite> {
-    Handshake(ClientHandshake<'a, CipherSuite>, Encryption),
+    Handshake(ClientHandshake<'a, CipherSuite>),
     Alert(/* Alert, */ (), Encryption),
     Heartbeat((), Encryption),
     Ack((), Encryption),
@@ -33,16 +33,13 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
     where
         Rng: RngCore + CryptoRng,
     {
-        ClientRecord::Handshake(
-            ClientHandshake::ClientHello(ClientHello::new(config, rng)),
-            Encryption::Disabled,
-        )
+        ClientRecord::Handshake(ClientHandshake::ClientHello(ClientHello::new(config, rng)))
     }
 
     /// Encode the record into a buffer.
     pub fn encode<S: UdpSocket>(
         &self,
-        buf: &mut impl DTlsBuffer,
+        buf: &mut SliceBuffer,
         key_schedule: &mut KeySchedule<CipherSuite>,
         transcript_hasher: &mut CipherSuite::Hash,
     ) -> Result<(), DTlsError<S>> {
@@ -64,21 +61,11 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
         // ------ Encode payload
 
         match self {
-            ClientRecord::Handshake(handshake, encryption) => {
-                // TODO: handle encryption
+            // NOTE: Each record encoder needs to update the transcript hash at their end.
+            ClientRecord::Handshake(handshake) => {
                 handshake
                     .encode(buf, key_schedule, transcript_hasher)
                     .map_err(|_| DTlsError::InsufficientSpace)?;
-
-                // if let Some(binders) = binders_allocation {
-                //     if let &ClientRecord::Handshake(
-                //         ClientHandshake::ClientHello(_),
-                //         Encryption::Disabled,
-                //     ) = self
-                //     {
-                //         // TODO: Handle binders
-                //     }
-                // }
             }
             ClientRecord::Alert(_, _) => todo!(),
             ClientRecord::Heartbeat(_, _) => todo!(),
@@ -90,18 +77,18 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
         length_allocation.set(buf, content_length);
 
         // ------ Finish record
+        buf.reset_start();
 
         Ok(())
     }
 
     fn content_type(&self) -> ContentType {
         match self {
-            ClientRecord::Handshake(_, Encryption::Disabled) => ContentType::Handshake,
+            ClientRecord::Handshake(_) => ContentType::Handshake,
             ClientRecord::Alert(_, Encryption::Disabled) => ContentType::Alert,
             ClientRecord::Heartbeat(_, Encryption::Disabled) => ContentType::Heartbeat,
             ClientRecord::Ack(_, Encryption::Disabled) => ContentType::Ack,
             // All encrypted communication is marked as `ApplicationData`.
-            ClientRecord::Handshake(_, Encryption::Enabled) => ContentType::ApplicationData,
             ClientRecord::Alert(_, Encryption::Enabled) => ContentType::ApplicationData,
             ClientRecord::Heartbeat(_, Encryption::Enabled) => ContentType::ApplicationData,
             ClientRecord::Ack(_, Encryption::Enabled) => ContentType::ApplicationData,
@@ -124,7 +111,7 @@ pub struct DTlsPlaintextHeader {
 
 impl DTlsPlaintextHeader {
     /// Encode a DTlsPlaintext header, return the allocation for the length field.
-    pub fn encode(&self, buf: &mut impl DTlsBuffer) -> Result<AllocU16Handle, ()> {
+    pub fn encode(&self, buf: &mut SliceBuffer) -> Result<AllocU16Handle, ()> {
         // DTlsPlaintext structure:
         //
         // type: ContentType,
