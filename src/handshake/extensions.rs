@@ -61,7 +61,7 @@ impl<'a> ClientExtensions<'a> {
         };
 
         // Fill in the length of this extension.
-        let content_length = (content_start - buf.len()) as u16;
+        let content_length = (buf.len() - content_start) as u16;
         extension_length_allocation.set(buf, content_length);
 
         r
@@ -157,10 +157,6 @@ impl<'a> OfferedPsks<'a> {
         for identity in self.identities {
             identity.encode(buf)?;
         }
-
-        // TODO: To this point is where we need to calculate the transcript hash for adding into
-        // the binders.
-        // PSK Binder is defined in RFC8446, section 4.2.11.2 page 58.
 
         // Allocate space for binders and return it for future use.
         let binders_len = (1 + self.hash_size) * self.identities.len();

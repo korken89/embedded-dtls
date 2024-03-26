@@ -14,7 +14,7 @@
 //      HKDF-Expand-Label(Secret, Label,
 //                        Transcript-Hash(Messages), Hash.length)
 
-use crate::{buffer::SliceBuffer, cipher_suites::TlsCipherSuite};
+use crate::{buffer::SliceBuffer, cipher_suites::TlsCipherSuite, handshake::extensions::Psk};
 use digest::{generic_array::GenericArray, Digest, KeyInit, Mac, OutputSizeUser};
 use hkdf::{hmac::SimpleHmac, SimpleHkdf};
 
@@ -120,7 +120,7 @@ where
     }
 
     /// Initialize the key schedule with an optional PSK.
-    pub fn initialize_early_secret(&mut self, psk: Option<&[u8]>) {
+    pub fn initialize_early_secret(&mut self, psk: Option<Psk>) {
         match self.keyschedule_state {
             KeyScheduleState::Uninitialized => {}
             _ => unreachable!(
@@ -131,7 +131,7 @@ where
         let no_psk_ikm = HashArray::<CipherSuite>::default();
         let (secret, hkdf) = Hkdf::<CipherSuite>::extract(
             Some(&HashArray::<CipherSuite>::default()),
-            psk.unwrap_or(&no_psk_ikm),
+            psk.map(|psk| psk.key).unwrap_or(&no_psk_ikm),
         );
 
         // binder_key derivation, not using `derive_secret` due to the `keyschedule_state` being

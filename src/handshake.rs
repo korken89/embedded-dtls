@@ -56,7 +56,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
             }
         };
 
-        let content_length = (content_start - buf.len()) as u32;
+        let content_length = (buf.len() - content_start) as u32;
 
         header.length.set(buf, content_length.into());
         header.message_seq.set(buf, 1); // TODO: This should probably be something else than 1
@@ -71,11 +71,14 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
             // Calculate the binder entry.
             let binder_entry = key_schedule.create_binder(transcript_hasher);
 
-            // Add the binder entry to the transcript.
-            transcript_hasher.update(&binder_entry);
-
             // Save the binder entry to the correct location.
-            binders.set(buf, &binder_entry);
+            // TODO: For each binder.
+            let buf = binders.into_buffer(buf);
+            buf[0] = binder_entry.len() as u8;
+            buf[1..].copy_from_slice(&binder_entry);
+
+            // Add the binder entry to the transcript.
+            transcript_hasher.update(&buf);
         } else {
             transcript_hasher.update(buf);
         }
@@ -275,7 +278,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
         .ok_or(())?;
 
         // Fill in the length of extensions.
-        let content_length = (content_start - buf.len()) as u16;
+        let content_length = (buf.len() - content_start) as u16;
         extensions_length_allocation.set(buf, content_length);
 
         Ok(binders_allocation)

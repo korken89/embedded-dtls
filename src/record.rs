@@ -37,12 +37,12 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
     }
 
     /// Encode the record into a buffer.
-    pub fn encode<S: UdpSocket>(
+    pub fn encode<'buf, S: UdpSocket>(
         &self,
-        buf: &mut SliceBuffer,
+        buf: &'buf mut SliceBuffer,
         key_schedule: &mut KeySchedule<CipherSuite>,
         transcript_hasher: &mut CipherSuite::Hash,
-    ) -> Result<(), DTlsError<S>> {
+    ) -> Result<&'buf [u8], DTlsError<S>> {
         let header = DTlsPlaintextHeader {
             type_: self.content_type(),
             sequence_number: 0.into(),
@@ -73,13 +73,13 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
             ClientRecord::ApplicationData() => todo!(),
         }
 
-        let content_length = (content_start - buf.len()) as u16;
+        let content_length = (buf.len() - content_start) as u16;
         length_allocation.set(buf, content_length);
 
         // ------ Finish record
         buf.reset_start();
 
-        Ok(())
+        Ok(&*buf)
     }
 
     fn content_type(&self) -> ContentType {

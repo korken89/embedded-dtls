@@ -1,12 +1,27 @@
 use crate::integers::{U24, U48};
-use core::ops::{Deref, DerefMut};
+use core::{
+    fmt,
+    ops::{Deref, DerefMut},
+};
 
 /// A buffer handler wrapping a mutable slice.
-#[derive(Debug)]
 pub struct SliceBuffer<'a> {
     buf: &'a mut [u8],
     idx: usize,
     start: usize,
+}
+
+impl<'a> fmt::Debug for SliceBuffer<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SliceBuffer (start = {}, idx = {}, capacity = {}) {:?}",
+            self.start,
+            self.idx,
+            self.buf.len(),
+            &self.buf[..self.idx]
+        )
+    }
 }
 
 impl<'a> SliceBuffer<'a> {
@@ -157,7 +172,7 @@ pub struct AllocU8Handle {
 impl AllocU8Handle {
     /// Set the value.
     pub fn set(self, buf: &mut SliceBuffer, val: u8) {
-        buf[self.index] = val;
+        buf.buf[self.index] = val;
         core::mem::forget(self);
     }
 }
@@ -178,7 +193,7 @@ pub struct AllocU16Handle {
 impl AllocU16Handle {
     /// Set the value.
     pub fn set(self, buf: &mut SliceBuffer, val: u16) {
-        buf[self.index..self.index + 2].copy_from_slice(&val.to_be_bytes());
+        buf.buf[self.index..self.index + 2].copy_from_slice(&val.to_be_bytes());
         core::mem::forget(self);
     }
 }
@@ -199,7 +214,7 @@ pub struct AllocU24Handle {
 impl AllocU24Handle {
     /// Set the value.
     pub fn set(self, buf: &mut SliceBuffer, val: U24) {
-        buf[self.index..self.index + 3].copy_from_slice(&val.to_be_bytes());
+        buf.buf[self.index..self.index + 3].copy_from_slice(&val.to_be_bytes());
         core::mem::forget(self);
     }
 }
@@ -220,7 +235,7 @@ pub struct AllocU48Handle {
 impl AllocU48Handle {
     /// Set the value.
     pub fn set(self, buf: &mut SliceBuffer, val: U48) {
-        buf[self.index..self.index + 6].copy_from_slice(&val.to_be_bytes());
+        buf.buf[self.index..self.index + 6].copy_from_slice(&val.to_be_bytes());
         core::mem::forget(self);
     }
 }
@@ -252,6 +267,17 @@ impl AllocSliceHandle {
             .unwrap_or(&mut [])
             .copy_from_slice(val);
         core::mem::forget(self);
+    }
+
+    /// Get the underlying buffer and manually set it.
+    pub fn into_buffer<'a>(self, buf: &'a mut SliceBuffer) -> &'a mut [u8] {
+        let r = buf
+            .buf
+            .get_mut(self.index..self.index + self.len)
+            .unwrap_or(&mut []);
+        core::mem::forget(self);
+
+        r
     }
 }
 

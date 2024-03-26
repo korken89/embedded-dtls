@@ -22,13 +22,13 @@ use rand_core::{CryptoRng, RngCore};
 use record::ClientRecord;
 use session::RecordNumber;
 
-pub mod buffer;
-pub mod cipher_suites;
+pub(crate) mod buffer;
+pub(crate) mod cipher_suites;
 pub(crate) mod handshake;
-pub mod integers;
-pub mod key_schedule;
-pub mod record;
-pub mod session;
+pub(crate) mod integers;
+pub(crate) mod key_schedule;
+pub(crate) mod record;
+pub(crate) mod session;
 
 /// Client configuration.
 pub struct ClientConfig<'a> {
@@ -57,14 +57,14 @@ pub enum DTlsError<Socket: UdpSocket> {
 /// sender/receiver pair which splits the incoming packets based on IP or similar.
 pub trait UdpSocket {
     /// Error type for sending.
-    type SendError: defmt::Format;
+    type SendError: defmt::Format + core::fmt::Debug;
     /// Error type for receiving.
-    type ReceiveError: defmt::Format;
+    type ReceiveError: defmt::Format + core::fmt::Debug;
 
     /// Send a UDP packet.
     async fn send(&self, buf: &[u8]) -> Result<(), Self::SendError>;
     /// Receive a UDP packet.
-    async fn recv(&self, buf: &mut [u8]) -> Result<(), Self::ReceiveError>;
+    async fn recv<'a>(&self, buf: &'a mut [u8]) -> Result<&'a [u8], Self::ReceiveError>;
 }
 
 // TODO: How to select between server and client? Typestate, flag or two separate structs?
@@ -78,7 +78,7 @@ pub struct DTlsClientConnection<Socket, CipherSuite: TlsCipherSuite> {
 
 impl<Socket, CipherSuite> DTlsClientConnection<Socket, CipherSuite>
 where
-    Socket: UdpSocket + Clone,
+    Socket: UdpSocket,
     CipherSuite: TlsCipherSuite,
 {
     /// Open a DTLS 1.3 client connection.
@@ -94,14 +94,23 @@ where
     where
         Rng: RngCore + CryptoRng,
     {
-        let mut buf = SliceBuffer::new(buf);
+        let mut ser_buf = SliceBuffer::new(buf);
         let mut key_schedule = KeySchedule::new();
         let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
 
+        // TODO: In the future, implement support for more than 1 PSK.
+        key_schedule.initialize_early_secret(Some(config.psk.clone()));
         let hello = ClientRecord::<'_, CipherSuite>::client_hello(config, rng);
-        hello.encode::<Socket>(&mut buf, &mut key_schedule, &mut transcript_hasher)?;
+        let send_buf =
+            hello.encode::<Socket>(&mut ser_buf, &mut key_schedule, &mut transcript_hasher)?;
 
-        // TODO: ...
+        socket
+            .send(send_buf)
+            .await
+            .map_err(|e| DTlsError::UdpSend(e))?;
+
+        // TODO: Wait for response.
+        let resp = socket.recv(buf).await.map_err(|e| DTlsError::UdpRecv(e))?;
 
         Ok(DTlsClientConnection {
             socket,
@@ -173,8 +182,93 @@ where
 
 #[cfg(test)]
 mod test {
-    // use super::*;
+    use super::*;
+    use crate::cipher_suites::TlsEcdhePskWithChacha20Poly1305Sha256;
+    use rand::{rngs::StdRng, SeedableRng};
+    use tokio::sync::{
+        mpsc::{channel, Receiver, Sender},
+        Mutex,
+    };
 
-    #[test]
-    fn open_connection() {}
+    #[derive(Debug)]
+    struct ChannelSocket {
+        who: &'static str,
+        rx: Mutex<Receiver<Vec<u8>>>,
+        tx: Sender<Vec<u8>>,
+    }
+
+    impl UdpSocket for ChannelSocket {
+        type SendError = ();
+        type ReceiveError = ();
+
+        async fn send(&self, buf: &[u8]) -> Result<(), Self::SendError> {
+            l0g::trace!("{} send ({}): {:02x?}", self.who, buf.len(), buf);
+            self.tx.send(buf.into()).await.map_err(|_| ())
+        }
+
+        async fn recv<'a>(&self, buf: &'a mut [u8]) -> Result<&'a [u8], Self::ReceiveError> {
+            let r = self.rx.lock().await.recv().await.ok_or(())?;
+
+            buf[..r.len()].copy_from_slice(&r);
+
+            Ok(&buf[..r.len()])
+        }
+    }
+
+    fn make_server_client_channel() -> (ChannelSocket, ChannelSocket) {
+        let (s1, r1) = channel(10);
+        let (s2, r2) = channel(10);
+
+        (
+            ChannelSocket {
+                who: "server",
+                rx: Mutex::new(r1),
+                tx: s2,
+            },
+            ChannelSocket {
+                who: "client",
+                rx: Mutex::new(r2),
+                tx: s1,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn open_connection() {
+        simple_logger::SimpleLogger::new().init().unwrap();
+
+        let (server_socket, client_socket) = make_server_client_channel();
+
+        // Client
+        let c = tokio::spawn(async move {
+            let client_buf = &mut [0; 1024];
+            let mut rng: StdRng = SeedableRng::from_entropy();
+            let client_config = ClientConfig {
+                psk: Psk {
+                    identity: b"hello world",
+                    key: b"1234567890qwertyuiopasdfghjklzxc",
+                },
+            };
+
+            let mut client_connection = DTlsClientConnection::<
+                _,
+                TlsEcdhePskWithChacha20Poly1305Sha256,
+            >::open_client(
+                &mut rng, client_buf, client_socket, &client_config
+            )
+            .await
+            .unwrap();
+        });
+
+        // Server
+        let s = tokio::spawn(async move {
+            let mut rng: StdRng = SeedableRng::from_entropy();
+            let mut server_connection = DTlsServerConnection::open(&mut rng, server_socket)
+                .await
+                .unwrap();
+        });
+
+        c.await.unwrap();
+        s.await.unwrap();
+    }
 }
