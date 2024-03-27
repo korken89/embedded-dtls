@@ -171,6 +171,9 @@ pub mod server {
             let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
 
             let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+            l0g::trace!("Got datagram!");
+
+            let hello = parse_hello(resp);
 
             Ok(ServerConnection {
                 socket,
