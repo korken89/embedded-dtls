@@ -21,7 +21,6 @@ pub(crate) mod handshake;
 pub(crate) mod integers;
 pub(crate) mod key_schedule;
 pub(crate) mod record;
-pub(crate) mod session;
 
 /// Client configuration.
 pub struct ClientConfig<'a> {
@@ -141,17 +140,16 @@ pub mod server {
 
     // TODO: How to select between server and client? Typestate, flag or two separate structs?
     /// A DTLS 1.3 connection.
-    pub struct ServerConnection<Socket, CipherSuite: TlsCipherSuite> {
+    pub struct ServerConnection<Socket> {
         /// Sender/receiver of data.
         socket: Socket,
-        /// TODO: Keys for client->server and server->client. Also called "key schedule".
-        key_schedule: KeySchedule<CipherSuite>,
+        // / TODO: Keys for client->server and server->client. Also called "key schedule".
+        // key_schedule: KeySchedule<CipherSuite>,
     }
 
-    impl<Socket, CipherSuite> ServerConnection<Socket, CipherSuite>
+    impl<Socket> ServerConnection<Socket>
     where
         Socket: Datagram,
-        CipherSuite: TlsCipherSuite,
     {
         /// Open a DTLS 1.3 server connection.
         /// This returns an active connection after handshake is completed.
@@ -167,17 +165,17 @@ pub mod server {
             Rng: RngCore + CryptoRng,
         {
             let mut ser_buf = SliceBuffer::new(buf);
-            let mut key_schedule = KeySchedule::new();
-            let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
+            // let mut key_schedule = KeySchedule::new();
+            // let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
 
             let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
             l0g::trace!("Got datagram!");
 
-            let hello = parse_hello(resp);
+            // let hello = parse_hello(resp);
 
             Ok(ServerConnection {
                 socket,
-                key_schedule,
+                // key_schedule,
             })
         }
     }
@@ -186,7 +184,10 @@ pub mod server {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{cipher_suites::TlsEcdhePskWithChacha20Poly1305Sha256, client::ClientConnection};
+    use crate::{
+        cipher_suites::TlsEcdhePskWithChacha20Poly1305Sha256, client::ClientConnection,
+        server::ServerConnection,
+    };
     use rand::{rngs::StdRng, SeedableRng};
     use tokio::sync::{
         mpsc::{channel, Receiver, Sender},
@@ -242,8 +243,6 @@ mod test {
 
         let (server_socket, client_socket) = make_server_client_channel();
 
-        let v = Vec::new();
-
         // Client
         let c = tokio::spawn(async move {
             let client_buf = &mut [0; 1024];
@@ -268,10 +267,12 @@ mod test {
 
         // Server
         let s = tokio::spawn(async move {
+            let server_buf = &mut [0; 1024];
             let mut rng: StdRng = SeedableRng::from_entropy();
-            let mut server_connection = ServerConnection::open(&mut rng, server_socket)
-                .await
-                .unwrap();
+            let mut server_connection =
+                ServerConnection::open_server(&mut rng, server_buf, server_socket)
+                    .await
+                    .unwrap();
         });
 
         c.await.unwrap();
