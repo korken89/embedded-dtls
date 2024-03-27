@@ -10,17 +10,10 @@
 //! Heavily inspired by [`embedded-tls`].
 //! [`embedded-tls`]: https://github.com/drogue-iot/embedded-tls
 
-// #![no_std]
+#![cfg_attr(not(test), no_std)]
 #![allow(async_fn_in_trait)]
 
-use buffer::SliceBuffer;
-use cipher_suites::TlsCipherSuite;
-use digest::Digest;
 use handshake::extensions::Psk;
-use key_schedule::KeySchedule;
-use rand_core::{CryptoRng, RngCore};
-use record::ClientRecord;
-use session::RecordNumber;
 
 pub(crate) mod buffer;
 pub(crate) mod cipher_suites;
@@ -33,8 +26,8 @@ pub(crate) mod session;
 /// Client configuration.
 pub struct ClientConfig<'a> {
     /// Preshared key.
-    /// TODO: Support a list of PSKs, needs work in how to calculate binders and track all the
-    /// necessary early secrets derived from the PSKs.
+    /// TODO: Support a list of PSKs. Needs work in how to calculate binders and track all the
+    /// necessary early secrets derived from the PSKs until the server selects one PSK.
     psk: Psk<'a>,
 }
 
@@ -43,147 +36,154 @@ pub struct ClientConfig<'a> {
 // 1. Record layer (fragmentation and such)
 // 2. The payload (Handshake, ChangeCipherSpec, Alert, ApplicationData)
 
-#[derive(Debug, Copy, Clone, defmt::Format)]
-pub enum DTlsError<Socket: UdpSocket> {
+#[derive(Debug, Copy, Clone)]
+pub enum Error<D: Datagram> {
     /// The backing buffer ran out of space.
     InsufficientSpace,
-    UdpSend(Socket::SendError),
-    UdpRecv(Socket::ReceiveError),
+    Send(D::SendError),
+    Recv(D::ReceiveError),
 }
 
-/// UDP socket trait, send and receives from/to a single endpoint.
+// TODO: Make this not hard-implement this.
+impl<D> defmt::Format for Error<D>
+where
+    D: Datagram,
+    <D as Datagram>::SendError: defmt::Format,
+    <D as Datagram>::ReceiveError: defmt::Format,
+{
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "{}", self);
+    }
+}
+
+/// Datagram trait, send and receives datagrams from/to a single endpoint.
 ///
 /// This means on `std` that it cannot be implemented directly on a socket, but probably a
 /// sender/receiver pair which splits the incoming packets based on IP or similar.
-pub trait UdpSocket {
+pub trait Datagram {
     /// Error type for sending.
-    type SendError: defmt::Format + core::fmt::Debug;
+    type SendError;
     /// Error type for receiving.
-    type ReceiveError: defmt::Format + core::fmt::Debug;
+    type ReceiveError;
 
-    /// Send a UDP packet.
+    /// Send a complete datagram.
     async fn send(&self, buf: &[u8]) -> Result<(), Self::SendError>;
-    /// Receive a UDP packet.
+    /// Receive a complete datagram.
     async fn recv<'a>(&self, buf: &'a mut [u8]) -> Result<&'a [u8], Self::ReceiveError>;
 }
 
-// TODO: How to select between server and client? Typestate, flag or two separate structs?
-/// A DTLS 1.3 connection.
-pub struct DTlsClientConnection<Socket, CipherSuite: TlsCipherSuite> {
-    /// Sender/receiver of data.
-    socket: Socket,
-    /// TODO: Keys for client->server and server->client. Also called "key schedule".
-    key_schedule: KeySchedule<CipherSuite>,
-}
+pub mod client {
+    use crate::{
+        buffer::SliceBuffer, cipher_suites::TlsCipherSuite, key_schedule::KeySchedule,
+        record::ClientRecord, ClientConfig, Datagram, Error,
+    };
+    use digest::Digest;
+    use rand_core::{CryptoRng, RngCore};
 
-impl<Socket, CipherSuite> DTlsClientConnection<Socket, CipherSuite>
-where
-    Socket: UdpSocket,
-    CipherSuite: TlsCipherSuite,
-{
-    /// Open a DTLS 1.3 client connection.
-    /// This returns an active connection after handshake is completed.
-    ///
-    /// NOTE: This does not do timeout, it's up to the caller to give up.
-    pub async fn open_client<Rng>(
-        rng: &mut Rng,
-        buf: &mut [u8],
+    // TODO: How to select between server and client? Typestate, flag or two separate structs?
+    /// A DTLS 1.3 connection.
+    pub struct ClientConnection<Socket, CipherSuite: TlsCipherSuite> {
+        /// Sender/receiver of data.
         socket: Socket,
-        config: &ClientConfig<'_>,
-    ) -> Result<Self, DTlsError<Socket>>
+        /// TODO: Keys for client->server and server->client. Also called "key schedule".
+        key_schedule: KeySchedule<CipherSuite>,
+    }
+
+    impl<Socket, CipherSuite> ClientConnection<Socket, CipherSuite>
     where
-        Rng: RngCore + CryptoRng,
+        Socket: Datagram,
+        CipherSuite: TlsCipherSuite,
     {
-        let mut ser_buf = SliceBuffer::new(buf);
-        let mut key_schedule = KeySchedule::new();
-        let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
+        /// Open a DTLS 1.3 client connection.
+        /// This returns an active connection after handshake is completed.
+        ///
+        /// NOTE: This does not do timeout, it's up to the caller to give up.
+        pub async fn open_client<Rng>(
+            rng: &mut Rng,
+            buf: &mut [u8],
+            socket: Socket,
+            config: &ClientConfig<'_>,
+        ) -> Result<Self, Error<Socket>>
+        where
+            Rng: RngCore + CryptoRng,
+        {
+            let mut ser_buf = SliceBuffer::new(buf);
+            let mut key_schedule = KeySchedule::new();
+            let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
 
-        // TODO: In the future, implement support for more than 1 PSK.
-        key_schedule.initialize_early_secret(Some(config.psk.clone()));
-        let hello = ClientRecord::<'_, CipherSuite>::client_hello(config, rng);
-        let send_buf =
-            hello.encode::<Socket>(&mut ser_buf, &mut key_schedule, &mut transcript_hasher)?;
+            // TODO: In the future, implement support for more than 1 PSK.
+            key_schedule.initialize_early_secret(Some(config.psk.clone()));
+            let hello = ClientRecord::<'_, CipherSuite>::client_hello(config, rng);
+            let send_buf = hello
+                .encode(&mut ser_buf, &mut key_schedule, &mut transcript_hasher)
+                .map_err(|_| Error::InsufficientSpace)?;
 
-        socket
-            .send(send_buf)
-            .await
-            .map_err(|e| DTlsError::UdpSend(e))?;
+            socket.send(send_buf).await.map_err(|e| Error::Send(e))?;
 
-        // TODO: Wait for response.
-        let resp = socket.recv(buf).await.map_err(|e| DTlsError::UdpRecv(e))?;
+            // TODO: Wait for response.
+            let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
 
-        Ok(DTlsClientConnection {
-            socket,
-            key_schedule,
-        })
-    }
-
-    // TODO: Move to its own struct.
-    // /// Open a DTLS 1.3 server connection.
-    // /// This returns an active connection after handshake is completed.
-    // ///
-    // /// NOTE: This does not do timeout, it's up to the caller to give up.
-    // pub async fn open_server<Rng>(
-    //     rng: &mut Rng,
-    //     buf: &mut impl DTlsBuffer,
-    //     socket: Socket,
-    // ) -> Result<Self, DTlsError<Socket>>
-    // where
-    //     Rng: RngCore + CryptoRng,
-    // {
-    //     todo!()
-    // }
-
-    // TODO: Seems like this is the interface we want in the end.
-    pub async fn split(
-        &mut self,
-    ) -> (
-        DTlsSender<'_, Socket, CipherSuite>,
-        DTlsReceiver<'_, Socket, CipherSuite>,
-    ) {
-        (
-            DTlsSender {
-                connection: self,
-                record_number: RecordNumber::new(),
-            },
-            DTlsReceiver {
-                connection: self,
-                record_number: RecordNumber::new(),
-            },
-        )
+            Ok(ClientConnection {
+                socket,
+                key_schedule,
+            })
+        }
     }
 }
 
-/// Sender half of a DTLS connection.
-pub struct DTlsSender<'a, Socket, CipherSuite: TlsCipherSuite> {
-    connection: &'a DTlsClientConnection<Socket, CipherSuite>,
-    record_number: RecordNumber,
-}
+pub mod server {
+    use crate::{
+        buffer::SliceBuffer, cipher_suites::TlsCipherSuite, key_schedule::KeySchedule, Datagram,
+        Error,
+    };
+    use digest::Digest;
+    use rand_core::{CryptoRng, RngCore};
 
-impl<'a, Socket, CipherSuite> DTlsSender<'a, Socket, CipherSuite>
-where
-    Socket: UdpSocket + Clone + 'a,
-    CipherSuite: TlsCipherSuite,
-{
-}
+    // TODO: How to select between server and client? Typestate, flag or two separate structs?
+    /// A DTLS 1.3 connection.
+    pub struct ServerConnection<Socket, CipherSuite: TlsCipherSuite> {
+        /// Sender/receiver of data.
+        socket: Socket,
+        /// TODO: Keys for client->server and server->client. Also called "key schedule".
+        key_schedule: KeySchedule<CipherSuite>,
+    }
 
-/// Receiver half of a DTLS connection.
-pub struct DTlsReceiver<'a, Socket, CipherSuite: TlsCipherSuite> {
-    connection: &'a DTlsClientConnection<Socket, CipherSuite>,
-    record_number: RecordNumber,
-}
+    impl<Socket, CipherSuite> ServerConnection<Socket, CipherSuite>
+    where
+        Socket: Datagram,
+        CipherSuite: TlsCipherSuite,
+    {
+        /// Open a DTLS 1.3 server connection.
+        /// This returns an active connection after handshake is completed.
+        ///
+        /// NOTE: This does not do timeout, it's up to the caller to give up.
+        // TODO: Should this be some kind of iterator that gives out new DTLS connections?
+        pub async fn open_server<Rng>(
+            rng: &mut Rng,
+            buf: &mut [u8],
+            socket: Socket,
+        ) -> Result<Self, Error<Socket>>
+        where
+            Rng: RngCore + CryptoRng,
+        {
+            let mut ser_buf = SliceBuffer::new(buf);
+            let mut key_schedule = KeySchedule::new();
+            let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
 
-impl<'a, Socket, CipherSuite> DTlsReceiver<'a, Socket, CipherSuite>
-where
-    Socket: UdpSocket + Clone + 'a,
-    CipherSuite: TlsCipherSuite,
-{
+            let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+
+            Ok(ServerConnection {
+                socket,
+                key_schedule,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::cipher_suites::TlsEcdhePskWithChacha20Poly1305Sha256;
+    use crate::{cipher_suites::TlsEcdhePskWithChacha20Poly1305Sha256, client::ClientConnection};
     use rand::{rngs::StdRng, SeedableRng};
     use tokio::sync::{
         mpsc::{channel, Receiver, Sender},
@@ -197,7 +197,7 @@ mod test {
         tx: Sender<Vec<u8>>,
     }
 
-    impl UdpSocket for ChannelSocket {
+    impl Datagram for ChannelSocket {
         type SendError = ();
         type ReceiveError = ();
 
@@ -239,6 +239,8 @@ mod test {
 
         let (server_socket, client_socket) = make_server_client_channel();
 
+        let v = Vec::new();
+
         // Client
         let c = tokio::spawn(async move {
             let client_buf = &mut [0; 1024];
@@ -250,20 +252,21 @@ mod test {
                 },
             };
 
-            let mut client_connection = DTlsClientConnection::<
-                _,
-                TlsEcdhePskWithChacha20Poly1305Sha256,
-            >::open_client(
-                &mut rng, client_buf, client_socket, &client_config
-            )
-            .await
-            .unwrap();
+            let mut client_connection =
+                ClientConnection::<_, TlsEcdhePskWithChacha20Poly1305Sha256>::open_client(
+                    &mut rng,
+                    client_buf,
+                    client_socket,
+                    &client_config,
+                )
+                .await
+                .unwrap();
         });
 
         // Server
         let s = tokio::spawn(async move {
             let mut rng: StdRng = SeedableRng::from_entropy();
-            let mut server_connection = DTlsServerConnection::open(&mut rng, server_socket)
+            let mut server_connection = ServerConnection::open(&mut rng, server_socket)
                 .await
                 .unwrap();
         });

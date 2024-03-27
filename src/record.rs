@@ -6,7 +6,7 @@ use crate::{
     handshake::{ClientHandshake, ClientHello},
     integers::U48,
     key_schedule::KeySchedule,
-    ClientConfig, DTlsError, UdpSocket,
+    ClientConfig,
 };
 
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
@@ -37,12 +37,12 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
     }
 
     /// Encode the record into a buffer.
-    pub fn encode<'buf, S: UdpSocket>(
+    pub fn encode<'buf>(
         &self,
         buf: &'buf mut SliceBuffer,
         key_schedule: &mut KeySchedule<CipherSuite>,
         transcript_hasher: &mut CipherSuite::Hash,
-    ) -> Result<&'buf [u8], DTlsError<S>> {
+    ) -> Result<&'buf [u8], ()> {
         let header = DTlsPlaintextHeader {
             type_: self.content_type(),
             sequence_number: 0.into(),
@@ -52,9 +52,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
 
         // Create record header.
         let content_start = buf.len();
-        let length_allocation = header
-            .encode(buf)
-            .map_err(|_| DTlsError::InsufficientSpace)?;
+        let length_allocation = header.encode(buf)?;
 
         buf.forward_start();
 
@@ -63,9 +61,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
         match self {
             // NOTE: Each record encoder needs to update the transcript hash at their end.
             ClientRecord::Handshake(handshake) => {
-                handshake
-                    .encode(buf, key_schedule, transcript_hasher)
-                    .map_err(|_| DTlsError::InsufficientSpace)?;
+                handshake.encode(buf, key_schedule, transcript_hasher)?;
             }
             ClientRecord::Alert(_, _) => todo!(),
             ClientRecord::Heartbeat(_, _) => todo!(),

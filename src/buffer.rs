@@ -162,7 +162,7 @@ impl<'a> AsRef<[u8]> for SliceBuffer<'a> {
     }
 }
 
-/// Handle to an allocated `u8` spot in a `DTlsBuffer`.
+/// Handle to an allocated `u8` spot in a `Buffer`.
 #[derive(Debug)]
 #[must_use]
 pub struct AllocU8Handle {
@@ -183,7 +183,7 @@ impl Drop for AllocU8Handle {
     }
 }
 
-/// Handle to an allocated `u16` spot in a `DTlsBuffer`.
+/// Handle to an allocated `u16` spot in a `Buffer`.
 #[derive(Debug)]
 #[must_use]
 pub struct AllocU16Handle {
@@ -204,7 +204,7 @@ impl Drop for AllocU16Handle {
     }
 }
 
-/// Handle to an allocated `u24` spot in a `DTlsBuffer`.
+/// Handle to an allocated `u24` spot in a `Buffer`.
 #[derive(Debug)]
 #[must_use]
 pub struct AllocU24Handle {
@@ -225,7 +225,7 @@ impl Drop for AllocU24Handle {
     }
 }
 
-/// Handle to an allocated `u48` spot in a `DTlsBuffer`.
+/// Handle to an allocated `u48` spot in a `Buffer`.
 #[derive(Debug)]
 #[must_use]
 pub struct AllocU48Handle {
@@ -246,7 +246,7 @@ impl Drop for AllocU48Handle {
     }
 }
 
-/// Handle to an allocated slice in a `DTlsBuffer`.
+/// Handle to an allocated slice in a `Buffer`.
 #[derive(Debug)]
 #[must_use]
 pub struct AllocSliceHandle {

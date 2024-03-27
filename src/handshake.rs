@@ -44,7 +44,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
 
         // TODO: How to support fragmentation so we can ship this over e.g. IEEE802.15.4 radio that
         // only has payload of 60-100 bytes?
-        // For now just assume everything goes into one `DTlsHandshake`.
+        // For now just assume everything goes into one `Handshake`.
 
         let content_start = buf.len();
 
@@ -99,7 +99,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
     //     buffer: &mut SliceBuffer,
     //     socket: &Socket,
     //     rng: &mut Rng,
-    // ) -> Result<(), DTlsError<Socket>>
+    // ) -> Result<(), Error<Socket>>
     // where
     //     Socket: UdpSocket,
     //     Rng: RngCore + CryptoRng,
@@ -182,7 +182,7 @@ impl HandshakeHeader {
     }
 }
 
-/// ClientHello payload in an DTlsHandshake.
+/// ClientHello payload in an Handshake.
 pub struct ClientHello<'a, CipherSuite> {
     random: Random,
     secret: EphemeralSecret,
@@ -297,7 +297,7 @@ impl defmt::Format for ClientHello {
     }
 }
 
-/// Finished payload in an DTlsHandshake.
+/// Finished payload in an Handshake.
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Finished<const HASH_LEN: usize> {
