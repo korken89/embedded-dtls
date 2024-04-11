@@ -157,10 +157,12 @@ pub mod server {
         buffer::{EncodingBuffer, ParseBuffer},
         cipher_suites,
         handshake::{
-            extensions::{ExtensionType, PskKeyExchangeMode, DTLS_13_VERSION},
+            extensions::{ExtensionType, NamedGroup, PskKeyExchangeMode, DTLS_13_VERSION},
             HandshakeHeader, HandshakeType, Random,
         },
-        record::{ClientRecord, ContentType, DTlsPlaintextHeader, ProtocolVersion},
+        record::{
+            ClientRecord, ContentType, DTlsPlaintextHeader, ProtocolVersion, LEGACY_DTLS_VERSION,
+        },
         Datagram, Error,
     };
     use rand_core::{CryptoRng, RngCore};
@@ -238,7 +240,19 @@ pub mod server {
 
             match record_header.type_ {
                 ContentType::Handshake => {
-                    let handshake = ClientHandshake::parse(&mut buf);
+                    let handshake = ClientHandshake::parse(&mut buf)?;
+
+                    // Validate parsed data.
+                    match handshake {
+                        ClientHandshake::ClientHello(hello) => {
+                            if !hello.is_valid() {
+                                l0g::error!("ClientHello is not valid");
+                                return None;
+                            }
+                        }
+                        ClientHandshake::Finished() => todo!(),
+                        ClientHandshake::KeyUpdate() => todo!(),
+                    }
 
                     todo!()
                 }
@@ -254,7 +268,6 @@ pub mod server {
 
     enum ClientHandshake {
         ClientHello(ClientHello),
-        ServerHello(),
         Finished(),
         KeyUpdate(),
     }
@@ -279,7 +292,9 @@ pub mod server {
                     let mut buf = ParseBuffer::new(handshake_payload);
                     let client_hello = ClientHello::parse(&mut buf)?;
 
-                    l0g::trace!("Got client hello: {:02x?}", client_hello);
+                    l0g::trace!("Got client hello: {:#02x?}", client_hello);
+
+                    if !client_hello.is_valid() {}
 
                     todo!()
                 }
@@ -351,64 +366,128 @@ pub mod server {
                 extensions,
             })
         }
+
+        /// Check a client hello if it is valid.
+        pub fn is_valid(&self) -> bool {
+            if self.version != LEGACY_DTLS_VERSION {
+                l0g::error!(
+                    "ClientHello version is not legacy DTLS version: {:02x?}",
+                    self.version
+                );
+                return false;
+            }
+
+            // Are all the extensions there?
+            let (
+                Some(psk_key_exchange_modes),
+                Some(supported_versions),
+                Some(key_share),
+                Some(pre_shared_key),
+            ) = (
+                &self.extensions.psk_key_exchange_modes,
+                &self.extensions.supported_versions,
+                &self.extensions.key_share,
+                &self.extensions.pre_shared_key,
+            )
+            else {
+                l0g::error!("ClientHello: Not all extensions are provided");
+                return false;
+            };
+
+            todo!()
+        }
     }
 
     #[derive(Debug, Default)]
     pub struct ClientExtensions {
         pub psk_key_exchange_modes: Option<PskKeyExchangeModes>,
-        pub key_share: Option<()>,
         pub supported_versions: Option<SupportedVersions>,
-        pub pre_shared_key: Option<()>,
+        pub key_share: Option<KeyShare>,
+        pub pre_shared_key: Option<PreSharedKey>,
     }
 
     impl ClientExtensions {
         pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
-            let extensions_length = buf.pop_u16_be()?;
-            // let continue_here_emil = ;
-
             let mut ret = ClientExtensions::default();
 
+            let extensions_length = buf.pop_u16_be()?;
             let mut extensions = ParseBuffer::new(buf.pop_slice(extensions_length as usize)?);
 
             while let Some(extension) = Extension::parse(&mut extensions) {
-                l0g::trace!(
-                    "extension {:?}: {:02x?}",
-                    extension.extension_type,
-                    extension.extension_data
-                );
+                if ret.pre_shared_key.is_some() {
+                    l0g::error!("Got more extensions after PreSharedKey!");
+                    return None;
+                }
 
                 match extension.extension_type {
-                    ExtensionType::PskKeyExchangeModes => {
-                        if let Some(v) = PskKeyExchangeModes::parse(&mut ParseBuffer::new(
-                            extension.extension_data,
-                        )) {
-                            if ret.psk_key_exchange_modes.is_some() {
-                                l0g::error!("PskKeyExchangeModes extension already parsed!");
-                                return None;
-                            }
-
-                            ret.psk_key_exchange_modes = Some(v);
-                        }
-                    }
-                    ExtensionType::KeyShare => todo!(),
                     ExtensionType::SupportedVersions => {
-                        if let Some(v) = SupportedVersions::parse(&mut ParseBuffer::new(
+                        let Some(v) = SupportedVersions::parse(&mut ParseBuffer::new(
                             extension.extension_data,
-                        )) {
-                            if ret.supported_versions.is_some() {
-                                l0g::error!("Supported version extension already parsed!");
-                                return None;
-                            }
+                        )) else {
+                            l0g::error!("Failed to parse supported version");
+                            return None;
+                        };
 
-                            ret.supported_versions = Some(v);
+                        if ret.supported_versions.is_some() {
+                            l0g::error!("Supported version extension already parsed!");
+                            return None;
                         }
+
+                        ret.supported_versions = Some(v);
                     }
-                    ExtensionType::PreSharedKey => todo!(),
-                    _ => todo!(),
+                    ExtensionType::PskKeyExchangeModes => {
+                        let Some(v) = PskKeyExchangeModes::parse(&mut ParseBuffer::new(
+                            extension.extension_data,
+                        )) else {
+                            l0g::error!("Failed to parse PskKeyExchange");
+                            return None;
+                        };
+
+                        if ret.psk_key_exchange_modes.is_some() {
+                            l0g::error!("PskKeyExchangeModes extension already parsed!");
+                            return None;
+                        }
+
+                        ret.psk_key_exchange_modes = Some(v);
+                    }
+                    ExtensionType::KeyShare => {
+                        let Some(v) =
+                            KeyShare::parse(&mut ParseBuffer::new(extension.extension_data))
+                        else {
+                            l0g::error!("Failed to parse PskKeyExchange");
+                            return None;
+                        };
+
+                        if ret.key_share.is_some() {
+                            l0g::error!("Keyshare extension already parsed!");
+                            return None;
+                        }
+
+                        ret.key_share = Some(v);
+                    }
+                    ExtensionType::PreSharedKey => {
+                        let Some(v) =
+                            PreSharedKey::parse(&mut ParseBuffer::new(extension.extension_data))
+                        else {
+                            l0g::error!("Failed to parse PreSharedKey");
+                            return None;
+                        };
+
+                        if ret.pre_shared_key.is_some() {
+                            l0g::error!("PreSharedKey extension already parsed!");
+                            return None;
+                        }
+
+                        ret.pre_shared_key = Some(v);
+                    }
+                    _ => {
+                        l0g::error!("Got more extensions than what's supported!");
+                        return None;
+                    }
                 }
             }
 
-            None
+            Some(ret)
         }
     }
 
@@ -435,7 +514,7 @@ pub mod server {
 
     impl SupportedVersions {
         pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
-            let size = buf.pop_u16_be()?;
+            let size = buf.pop_u8()?;
 
             if size != 2 {
                 // Only one version for now
@@ -445,6 +524,7 @@ pub mod server {
             let version = buf.pop_u16_be()?;
 
             if version != DTLS_13_VERSION {
+                l0g::error!("Not DTLS 1.3");
                 // Only support DTLS 1.3 for now
                 return None;
             }
@@ -467,6 +547,85 @@ pub mod server {
             let ke_modes = buf.pop_u8()?.try_into().ok()?;
 
             Some(PskKeyExchangeModes { ke_modes })
+        }
+    }
+
+    #[derive(Debug)]
+    struct KeyShare {
+        named_group: NamedGroup,
+        key: [u8; 32],
+    }
+
+    impl KeyShare {
+        pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+            let size = buf.pop_u16_be()?;
+            let named_group = NamedGroup::try_from(buf.pop_u16_be()?).ok()?;
+            let key_length = buf.pop_u16_be()?;
+
+            // TODO: We only support one key for now.
+            let expected_size = key_length + 2 + 2;
+            if expected_size != size {
+                l0g::error!("The keyshare size does not match only one key, expected {size} got {expected_size}");
+                return None;
+            }
+
+            let key = buf.pop_slice(key_length as usize)?;
+
+            // TODO: Only one key share for now and it's X25519
+            Some(KeyShare {
+                named_group,
+                key: key.try_into().ok()?,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PreSharedKey {
+        identity: Vec<u8>,
+        binder: Vec<u8>,
+        ticket_age: u32,
+    }
+
+    impl PreSharedKey {
+        pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+            // Identity part
+            let identity_size = buf.pop_u16_be()?;
+            let identity_length = buf.pop_u16_be()?;
+
+            // TODO: For now we only support one identity.
+            let expected_identity_size = identity_length + 4 + 2; // +4 for the ticket, +2 for size
+            if identity_size != expected_identity_size {
+                l0g::error!(
+                    "Identity size failure, expected {expected_identity_size}, got {identity_size}"
+                );
+
+                return None;
+            }
+
+            let identity = buf.pop_slice(identity_length as usize)?;
+            let ticket_age = buf.pop_u32_be()?;
+
+            // Binders part
+            let binders_size = buf.pop_u16_be()?;
+            // TODO: We should check expected length based on code point
+            let binder_length = buf.pop_u8()?;
+
+            let expected_binders_size = binder_length as u16 + 1;
+            if binders_size != expected_binders_size {
+                l0g::error!(
+                    "Binders size failure, expected {expected_binders_size}, got {binders_size}"
+                );
+
+                return None;
+            }
+
+            let binder = buf.pop_slice(binder_length as usize)?;
+
+            Some(PreSharedKey {
+                identity: identity.into(),
+                binder: binder.into(),
+                ticket_age,
+            })
         }
     }
 }

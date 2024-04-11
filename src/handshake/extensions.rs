@@ -161,6 +161,9 @@ impl<'a> OfferedPsks<'a> {
 
         // Allocate space for binders and return it for future use.
         let binders_len = (1 + self.hash_size) * self.identities.len();
+
+        // Binders length.
+        buf.push_u16_be(binders_len as u16)?;
         buf.alloc_slice(binders_len)
     }
 }
