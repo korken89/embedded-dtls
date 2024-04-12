@@ -14,41 +14,45 @@
 //      HKDF-Expand-Label(Secret, Label,
 //                        Transcript-Hash(Messages), Hash.length)
 
-use crate::{buffer::EncodingBuffer, cipher_suites::TlsCipherSuite, handshake::extensions::Psk};
-use digest::{generic_array::GenericArray, Digest, KeyInit, Mac, OutputSizeUser};
+use crate::{buffer::EncodingBuffer, handshake::extensions::Psk};
+use digest::{
+    core_api::BlockSizeUser,
+    generic_array::{ArrayLength, GenericArray},
+    Digest, KeyInit, Mac, OutputSizeUser,
+};
 use hkdf::{hmac::SimpleHmac, SimpleHkdf};
+use typenum::{Sum, U22};
 
-/// Define the HDKF for a cipher suite, so it uses the hash function defined in the trait.
-pub type Hkdf<CipherSuite> = SimpleHkdf<<CipherSuite as TlsCipherSuite>::Hash>;
+// /// Define the HDKF for a cipher suite, so it uses the hash function defined in the trait.
+// pub type Hkdf<D> = SimpleHkdf<<D as Digest>::Hash>;
 
-type HashArray<CipherSuite> =
-    GenericArray<u8, <<CipherSuite as TlsCipherSuite>::Hash as OutputSizeUser>::OutputSize>;
+type HashArray<D> = GenericArray<u8, <D as OutputSizeUser>::OutputSize>;
 
-struct EarlySecret<CipherSuite: TlsCipherSuite> {
+struct EarlySecret<D: Digest + OutputSizeUser + BlockSizeUser + Clone> {
     /// Extract secret.
-    secret: HashArray<CipherSuite>,
+    secret: HashArray<D>,
     /// Binder key.
-    binder_key: HashArray<CipherSuite>,
+    binder_key: HashArray<D>,
     /// HKDF to derive secrets from.
-    hkdf: Hkdf<CipherSuite>,
+    hkdf: SimpleHkdf<D>,
 }
 
-struct Secret<CipherSuite: TlsCipherSuite> {
+struct Secret<D: Digest + OutputSizeUser + BlockSizeUser + Clone> {
     /// Extract secret.
-    secret: HashArray<CipherSuite>,
+    secret: HashArray<D>,
     // HKDF to derive secrets from.
-    hkdf: Hkdf<CipherSuite>,
+    hkdf: SimpleHkdf<D>,
 }
 
-enum KeyScheduleState<CipherSuite: TlsCipherSuite> {
+enum KeyScheduleState<D: Digest + OutputSizeUser + BlockSizeUser + Clone> {
     /// Not initialized.
     Uninitialized,
     /// Optional PSK initialization is done.
-    EarlySecret(EarlySecret<CipherSuite>),
+    EarlySecret(EarlySecret<D>),
     /// Handshake secret is created.
-    HandshakeSecret(Secret<CipherSuite>),
+    HandshakeSecret(Secret<D>),
     /// Master secret is created.
-    MasterSecret(Secret<CipherSuite>),
+    MasterSecret(Secret<D>),
 }
 
 /// This tracks the state of the shared secrets.
@@ -56,15 +60,15 @@ enum KeyScheduleState<CipherSuite: TlsCipherSuite> {
 // Check the flow-chart in RFC8446 section 7.1, page 93 to see the entire flow.
 // This means that the HKDF needs to be tracked as continous state for the entire lifetime of the
 // connection.
-pub struct KeySchedule<CipherSuite: TlsCipherSuite> {
-    keyschedule_state: KeyScheduleState<CipherSuite>,
-    // server_state: ServerKeySchedule<CipherSuite>,
-    // client_state: ClientKeySchedule<CipherSuite>,
+pub struct KeySchedule<D: Digest + OutputSizeUser + BlockSizeUser + Clone> {
+    keyschedule_state: KeyScheduleState<D>,
+    // server_state: ServerKeySchedule<D>,
+    // client_state: ClientKeySchedule<D>,
 }
 
-impl<CipherSuite> KeySchedule<CipherSuite>
+impl<D> KeySchedule<D>
 where
-    CipherSuite: TlsCipherSuite,
+    D: Digest + OutputSizeUser + BlockSizeUser + Clone,
 {
     pub fn new() -> Self {
         Self {
@@ -73,7 +77,7 @@ where
     }
 
     /// Derive a secret for the current state in the key schedule.
-    pub fn derive_secret(&self, label: HkdfLabelContext) -> HashArray<CipherSuite> {
+    pub fn derive_secret(&self, label: HkdfLabelContext) -> HashArray<D> {
         let hkdf = match &self.keyschedule_state {
             KeyScheduleState::Uninitialized => unreachable!("Internal error! `derive_secret` was called before the key schedule was initialized"),
             KeyScheduleState::EarlySecret(secret) =>  &secret.hkdf,
@@ -81,11 +85,11 @@ where
             KeyScheduleState::MasterSecret(secret) => &secret.hkdf,
         };
 
-        hkdf_make_expanded_label::<CipherSuite>(hkdf, label)
+        hkdf_make_expanded_label::<D>(hkdf, label)
     }
 
     /// Calculate a binder.
-    pub fn create_binder(&self, transcript_hasher: &CipherSuite::Hash) -> HashArray<CipherSuite> {
+    pub fn create_binder(&self, transcript_hasher: &D) -> HashArray<D> {
         let secret = match &self.keyschedule_state {
             KeyScheduleState::EarlySecret(secret) => secret,
             _ => {
@@ -93,8 +97,8 @@ where
             }
         };
 
-        let binder_hkdf = Hkdf::<CipherSuite>::from_prk(&secret.binder_key).unwrap();
-        let binder_key = hkdf_make_expanded_label::<CipherSuite>(
+        let binder_hkdf = SimpleHkdf::<D>::from_prk(&secret.binder_key).unwrap();
+        let binder_key = hkdf_make_expanded_label::<D>(
             &binder_hkdf,
             HkdfLabelContext {
                 label: b"finished",
@@ -102,8 +106,7 @@ where
             },
         );
 
-        let mut hmac =
-            <SimpleHmac<CipherSuite::Hash> as KeyInit>::new_from_slice(&binder_key).unwrap();
+        let mut hmac = <SimpleHmac<D> as KeyInit>::new_from_slice(&binder_key).unwrap();
         Mac::update(&mut hmac, &transcript_hasher.clone().finalize());
 
         hmac.finalize().into_bytes()
@@ -112,7 +115,7 @@ where
     /// Move to the next step in the secrets.
     ///
     /// Note that the next state needs to be initialized with new input key material.
-    fn derived(&mut self) -> HashArray<CipherSuite> {
+    fn derived(&mut self) -> HashArray<D> {
         self.derive_secret(HkdfLabelContext {
             label: b"derived",
             context: &[],
@@ -128,15 +131,15 @@ where
             ),
         }
 
-        let no_psk_ikm = HashArray::<CipherSuite>::default();
-        let (secret, hkdf) = Hkdf::<CipherSuite>::extract(
-            Some(&HashArray::<CipherSuite>::default()),
+        let no_psk_ikm = HashArray::<D>::default();
+        let (secret, hkdf) = SimpleHkdf::<D>::extract(
+            Some(&HashArray::<D>::default()),
             psk.map(|psk| psk.key).unwrap_or(&no_psk_ikm),
         );
 
         // binder_key derivation, not using `derive_secret` due to the `keyschedule_state` being
         // wrong here. We update it below.
-        let binder_key = hkdf_make_expanded_label::<CipherSuite>(
+        let binder_key = hkdf_make_expanded_label::<D>(
             &hkdf,
             HkdfLabelContext {
                 label: b"ext binder",
@@ -161,7 +164,7 @@ where
         }
 
         // Prepare the previous secret for use in the next stage.
-        let (secret, hkdf) = Hkdf::<CipherSuite>::extract(Some(&self.derived()), ecdhe_secret);
+        let (secret, hkdf) = SimpleHkdf::<D>::extract(Some(&self.derived()), ecdhe_secret);
         self.keyschedule_state = KeyScheduleState::HandshakeSecret(Secret { secret, hkdf });
 
         // TODO: Create traffic secrets
@@ -177,9 +180,9 @@ where
         }
 
         // Prepare the previous secret for use in the next stage.
-        let (secret, hkdf) = Hkdf::<CipherSuite>::extract(
+        let (secret, hkdf) = SimpleHkdf::<D>::extract(
             Some(&self.derived()),
-            &HashArray::<CipherSuite>::default(), // The input key material is the "0" string
+            &HashArray::<D>::default(), // The input key material is the "0" string
         );
         self.keyschedule_state = KeyScheduleState::MasterSecret(Secret { secret, hkdf });
 
@@ -192,11 +195,24 @@ pub struct HkdfLabelContext<'a, 'b> {
     context: &'b [u8],
 }
 
-fn hkdf_make_expanded_label<CipherSuite: TlsCipherSuite>(
-    hkdf: &SimpleHkdf<CipherSuite::Hash>,
+fn hkdf_make_expanded_label<D>(
+    hkdf: &SimpleHkdf<D>,
     label: HkdfLabelContext,
-) -> GenericArray<u8, <<CipherSuite as TlsCipherSuite>::Hash as OutputSizeUser>::OutputSize> {
-    let mut hkdf_label = GenericArray::<u8, CipherSuite::LabelBufferSize>::default();
+) -> GenericArray<u8, <D as OutputSizeUser>::OutputSize>
+where
+    D: Digest + BlockSizeUser + Clone,
+{
+    // Max length of a label is:
+    // - length: 2
+    // - label: 1 + 18
+    // - context: 1 + hash length
+    // = 22 + hash length
+    // and lets assume the largest hash is 512 bits = 64 bytes
+    // this gives the max size of 86 bytes.
+
+    // NOTE: Why is this not a typenum sum? It infects the entire call tree with trait bounds.
+    // Instead we just pay the stack overhead of a few bytes here.
+    let mut hkdf_label = [0; 86];
     let mut hkdf_label = EncodingBuffer::new(&mut hkdf_label);
 
     // Length

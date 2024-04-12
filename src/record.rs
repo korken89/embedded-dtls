@@ -41,7 +41,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
     pub fn encode<'buf>(
         &self,
         buf: &'buf mut EncodingBuffer,
-        key_schedule: &mut KeySchedule<CipherSuite>,
+        key_schedule: &mut KeySchedule<<CipherSuite as TlsCipherSuite>::Hash>,
         transcript_hasher: &mut CipherSuite::Hash,
     ) -> Result<&'buf [u8], ()> {
         let header = DTlsPlaintextHeader {

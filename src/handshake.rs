@@ -35,7 +35,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
     pub fn encode(
         &self,
         buf: &mut EncodingBuffer,
-        key_schedule: &mut KeySchedule<CipherSuite>,
+        key_schedule: &mut KeySchedule<<CipherSuite as TlsCipherSuite>::Hash>,
         transcript_hasher: &mut CipherSuite::Hash,
     ) -> Result<(), ()> {
         // TODO: Encode client handshake.

@@ -60,6 +60,10 @@ pub mod server_config {
 pub enum Error<D: Datagram> {
     /// The backing buffer ran out of space.
     InsufficientSpace,
+    /// Failed to parse a message.
+    Parse,
+    /// The client hello did not pass validation.
+    InvalidClientHello,
     Send(D::SendError),
     Recv(D::ReceiveError),
 }
@@ -106,7 +110,7 @@ pub mod client {
         /// Sender/receiver of data.
         socket: Socket,
         /// TODO: Keys for client->server and server->client. Also called "key schedule".
-        key_schedule: KeySchedule<CipherSuite>,
+        key_schedule: KeySchedule<<CipherSuite as TlsCipherSuite>::Hash>,
     }
 
     impl<Socket, CipherSuite> ClientConnection<Socket, CipherSuite>
@@ -200,7 +204,11 @@ pub mod server {
             let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
             l0g::trace!("Got datagram!");
 
-            let hello = parse_hello(resp);
+            let client_hello = parse_client_hello(resp).ok_or(Error::Parse)?;
+
+            if !client_hello.is_valid() {
+                return Err(Error::InvalidClientHello);
+            }
 
             Ok(ServerConnection {
                 socket,
@@ -209,20 +217,24 @@ pub mod server {
         }
     }
 
-    fn parse_hello(buf: &[u8]) -> Option<()> {
+    fn parse_client_hello(buf: &[u8]) -> Option<ClientHello> {
         let mut buf = ParseBuffer::new(buf);
 
-        let client_handshake = Record::parse(&mut buf);
+        let record = Record::parse(&mut buf)?;
 
         if !buf.pop_rest().is_empty() {
             return None;
         }
 
-        Some(())
+        if let Record::Handshake(ClientHandshake::ClientHello(hello)) = record {
+            return Some(hello);
+        }
+
+        None
     }
 
     enum Record {
-        Handshake(),
+        Handshake(ClientHandshake),
         Alert(),
         Heartbeat(),
         Ack(),
@@ -240,21 +252,7 @@ pub mod server {
 
             match record_header.type_ {
                 ContentType::Handshake => {
-                    let handshake = ClientHandshake::parse(&mut buf)?;
-
-                    // Validate parsed data.
-                    match handshake {
-                        ClientHandshake::ClientHello(hello) => {
-                            if !hello.is_valid() {
-                                l0g::error!("ClientHello is not valid");
-                                return None;
-                            }
-                        }
-                        ClientHandshake::Finished() => todo!(),
-                        ClientHandshake::KeyUpdate() => todo!(),
-                    }
-
-                    todo!()
+                    return Some(Record::Handshake(ClientHandshake::parse(&mut buf)?));
                 }
                 ContentType::Ack => todo!(),
                 ContentType::Heartbeat => todo!(),
@@ -294,9 +292,7 @@ pub mod server {
 
                     l0g::trace!("Got client hello: {:#02x?}", client_hello);
 
-                    if !client_hello.is_valid() {}
-
-                    todo!()
+                    Some(Self::ClientHello(client_hello))
                 }
                 HandshakeType::Finished => todo!(),
                 HandshakeType::KeyUpdate => todo!(),
@@ -390,16 +386,25 @@ pub mod server {
                 &self.extensions.pre_shared_key,
             )
             else {
-                l0g::error!("ClientHello: Not all extensions are provided");
+                // TODO: For now we expect these specific extensions.
+                l0g::error!("ClientHello: Not all expected extensions are provided {self:02x?}");
                 return false;
             };
+
+            if key_share.named_group != NamedGroup::X25519 {
+                l0g::error!(
+                    "ClientHello: The keyshare named group is unsupported {:?}",
+                    key_share.named_group
+                );
+                return false;
+            }
 
             todo!()
         }
     }
 
     #[derive(Debug, Default)]
-    pub struct ClientExtensions {
+    struct ClientExtensions {
         pub psk_key_exchange_modes: Option<PskKeyExchangeModes>,
         pub supported_versions: Option<SupportedVersions>,
         pub key_share: Option<KeyShare>,
