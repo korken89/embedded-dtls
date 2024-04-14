@@ -70,9 +70,18 @@ impl<D> KeySchedule<D>
 where
     D: Digest + OutputSizeUser + BlockSizeUser + Clone,
 {
+    /// Create a new key schedule.
     pub fn new() -> Self {
         Self {
             keyschedule_state: KeyScheduleState::Uninitialized,
+        }
+    }
+
+    /// Check if the key schedule is uninitialized.
+    pub fn is_uninitialized(&self) -> bool {
+        match &self.keyschedule_state {
+            KeyScheduleState::Uninitialized => true,
+            _ => false,
         }
     }
 

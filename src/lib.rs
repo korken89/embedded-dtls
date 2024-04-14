@@ -33,21 +33,41 @@ pub mod client_config {
 }
 
 pub mod server_config {
+    use std::collections::HashMap;
+
     use zeroize::Zeroizing;
+
+    /// Pre-shared key identity.
+    #[derive(PartialEq, Eq, Hash)]
+    pub struct Identity(Vec<u8>);
+
+    impl<T> From<T> for Identity
+    where
+        T: AsRef<[u8]>,
+    {
+        fn from(value: T) -> Self {
+            Self(Vec::from(value.as_ref()))
+        }
+    }
 
     /// Pre-shared key value.
     pub struct Key(Zeroizing<Vec<u8>>);
 
-    /// A pre-shared key.
-    pub struct Psk {
-        pub identity: Vec<u8>,
-        pub key: Key,
+    impl<T> From<T> for Key
+    where
+        T: AsRef<[u8]>,
+    {
+        fn from(value: T) -> Self {
+            Self(Vec::from(value.as_ref()).into())
+        }
     }
 
     /// Server configuration.
     pub struct ServerConfig {
         /// A list of allowed pre-shared keys.
-        pub psk: Vec<Psk>,
+        ///
+        /// The key is the identity and the value is the key.
+        pub psk: HashMap<Identity, Key>,
     }
 }
 
@@ -159,17 +179,19 @@ pub mod client {
 pub mod server {
     use crate::{
         buffer::{EncodingBuffer, ParseBuffer},
-        cipher_suites,
         handshake::{
-            extensions::{ExtensionType, NamedGroup, PskKeyExchangeMode, DTLS_13_VERSION},
+            extensions::{DtlsVersions, ExtensionType, NamedGroup, PskKeyExchangeMode},
             HandshakeHeader, HandshakeType, Random,
         },
-        record::{
-            ClientRecord, ContentType, DTlsPlaintextHeader, ProtocolVersion, LEGACY_DTLS_VERSION,
-        },
+        key_schedule::{self, KeySchedule},
+        record::{ContentType, DTlsPlaintextHeader, ProtocolVersion, LEGACY_DTLS_VERSION},
+        server_config::ServerConfig,
         Datagram, Error,
     };
+    use digest::{Digest, OutputSizeUser};
     use rand_core::{CryptoRng, RngCore};
+    use sha2::Sha256;
+    use zeroize::Zeroizing;
 
     // TODO: How to select between server and client? Typestate, flag or two separate structs?
     /// A DTLS 1.3 connection.
@@ -193,10 +215,13 @@ pub mod server {
             rng: &mut Rng,
             buf: &mut [u8],
             socket: Socket,
+            server_config: &ServerConfig,
         ) -> Result<Self, Error<Socket>>
         where
             Rng: RngCore + CryptoRng,
         {
+            // TODO: If any part fails with error, make sure to send the correct ALERT.
+
             let mut ser_buf = EncodingBuffer::new(buf);
             // let mut key_schedule = KeySchedule::new();
             // let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
@@ -206,14 +231,85 @@ pub mod server {
 
             let client_hello = parse_client_hello(resp).ok_or(Error::Parse)?;
 
-            if !client_hello.is_valid() {
+            // Find the first support cipher suite.
+            let (mut key_schedule, cipher_suite) = {
+                let mut r = None;
+                for cipher_suite in &client_hello.cipher_suites {
+                    // Check so we can support this cipher suite.
+                    if let Some(key_schedule) =
+                        ServerKeySchedule::try_from_cipher_suite(*cipher_suite)
+                    {
+                        r = Some((key_schedule, *cipher_suite));
+                    }
+                }
+
+                // TODO: This should generate an alert.
+                r.ok_or(Error::InvalidClientHello)?
+            };
+
+            // TODO: At this point we know the cipher suite, and hence also the hash function.
+            // Now we can generate transcript hashes for binders and the message in total.
+
+            if !client_hello.validate_and_initialize(&mut key_schedule, server_config) {
                 return Err(Error::InvalidClientHello);
             }
+
+            debug_assert!(!key_schedule.is_uninitialized());
 
             Ok(ServerConnection {
                 socket,
                 // key_schedule,
             })
+        }
+    }
+
+    enum ServerKeySchedule {
+        /// All cipher suites which use SHA256 as the hash function will use this key schedule.
+        Sha256(KeySchedule<Sha256>),
+    }
+
+    impl ServerKeySchedule {
+        fn is_uninitialized(&self) -> bool {
+            match self {
+                ServerKeySchedule::Sha256(v) => v.is_uninitialized(),
+            }
+        }
+
+        fn new_transcript_hasher(&self) -> TranscriptHasher {
+            match self {
+                ServerKeySchedule::Sha256(_) => TranscriptHasher::Sha256(Sha256::default()),
+            }
+        }
+
+        fn try_from_cipher_suite(cipher_suites: u16) -> Option<Self> {
+            Some(match cipher_suites {
+                // TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256
+                0xCCAC => ServerKeySchedule::Sha256(KeySchedule::new()),
+                _ => {
+                    l0g::error!("Detected unsupported cipher suite {cipher_suites:04x}");
+                    return None;
+                }
+            })
+        }
+    }
+
+    /// This is used to get the transcript hashes, it stems from the
+    #[derive(Clone, Debug)]
+    enum TranscriptHasher {
+        Sha256(Sha256),
+    }
+
+    impl TranscriptHasher {
+        pub fn update(&mut self, data: impl AsRef<[u8]>) {
+            match self {
+                TranscriptHasher::Sha256(h) => h.update(data),
+            }
+        }
+
+        pub fn finalize(self) -> Vec<u8> {
+            match self {
+                TranscriptHasher::Sha256(h) => Vec::from(h.finalize().as_slice()),
+            }
         }
     }
 
@@ -363,8 +459,15 @@ pub mod server {
             })
         }
 
-        /// Check a client hello if it is valid.
-        pub fn is_valid(&self) -> bool {
+        /// Check a client hello if it is valid, perform binder verification and setup the key
+        /// schedule.
+        fn validate_and_initialize(
+            &self,
+            key_schedule: &mut ServerKeySchedule,
+            server_config: &ServerConfig,
+        ) -> bool {
+            debug_assert!(key_schedule.is_uninitialized());
+
             if self.version != LEGACY_DTLS_VERSION {
                 l0g::error!(
                     "ClientHello version is not legacy DTLS version: {:02x?}",
@@ -373,7 +476,9 @@ pub mod server {
                 return false;
             }
 
-            // Are all the extensions there?
+            // Are all the expexted extensions there? By this we enforce that the PSK key exchange
+            // is ECDHE.
+            // Verify with RFC8446, section 9.2
             let (
                 Some(psk_key_exchange_modes),
                 Some(supported_versions),
@@ -391,13 +496,35 @@ pub mod server {
                 return false;
             };
 
+            if supported_versions.version != DtlsVersions::V1_3 {
+                // We only support DTLS 1.3.
+                l0g::error!("Not DTLS 1.3");
+                return false;
+            }
+
             if key_share.named_group != NamedGroup::X25519 {
                 l0g::error!(
-                    "ClientHello: The keyshare named group is unsupported {:?}",
+                    "ClientHello: The keyshare named group is unsupported: {:?}",
                     key_share.named_group
                 );
                 return false;
             }
+
+            if psk_key_exchange_modes.ke_modes != PskKeyExchangeMode::PskDheKe {
+                l0g::error!(
+                    "ClientHello: The PskKeyExchangeMode is unsupported: {:?}",
+                    key_share.named_group
+                );
+                return false;
+            }
+
+            // TODO: Perform PSK -> Early Secret with Key Schedule
+
+            // TODO: Get transcript hash for binders
+
+            // TODO: Verify binders with Early Secret
+
+            // TODO: Perform ECDHE -> Handshake Secret with Key Schedule
 
             todo!()
         }
@@ -515,7 +642,9 @@ pub mod server {
     }
 
     #[derive(Debug)]
-    struct SupportedVersions {}
+    struct SupportedVersions {
+        version: DtlsVersions,
+    }
 
     impl SupportedVersions {
         pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
@@ -526,15 +655,9 @@ pub mod server {
                 return None;
             }
 
-            let version = buf.pop_u16_be()?;
+            let version = buf.pop_u16_be()?.try_into().ok()?;
 
-            if version != DTLS_13_VERSION {
-                l0g::error!("Not DTLS 1.3");
-                // Only support DTLS 1.3 for now
-                return None;
-            }
-
-            Some(SupportedVersions {})
+            Some(SupportedVersions { version })
         }
     }
 
@@ -558,7 +681,7 @@ pub mod server {
     #[derive(Debug)]
     struct KeyShare {
         named_group: NamedGroup,
-        key: [u8; 32],
+        key: Zeroizing<Vec<u8>>,
     }
 
     impl KeyShare {
@@ -568,6 +691,7 @@ pub mod server {
             let key_length = buf.pop_u16_be()?;
 
             // TODO: We only support one key for now.
+            // This can be a list of supported keyshares in the future.
             let expected_size = key_length + 2 + 2;
             if expected_size != size {
                 l0g::error!("The keyshare size does not match only one key, expected {size} got {expected_size}");
@@ -576,10 +700,9 @@ pub mod server {
 
             let key = buf.pop_slice(key_length as usize)?;
 
-            // TODO: Only one key share for now and it's X25519
             Some(KeyShare {
                 named_group,
-                key: key.try_into().ok()?,
+                key: Vec::from(key).into(),
             })
         }
     }
@@ -612,7 +735,6 @@ pub mod server {
 
             // Binders part
             let binders_size = buf.pop_u16_be()?;
-            // TODO: We should check expected length based on code point
             let binder_length = buf.pop_u8()?;
 
             let expected_binders_size = binder_length as u16 + 1;
@@ -637,12 +759,13 @@ pub mod server {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
     use super::*;
     use crate::{
         cipher_suites::TlsEcdhePskWithChacha20Poly1305Sha256, client::ClientConnection,
         client_config::ClientConfig, handshake::extensions::Psk, server::ServerConnection,
+        server_config::ServerConfig,
     };
     use rand::{rngs::StdRng, SeedableRng};
     use tokio::sync::{
@@ -727,8 +850,15 @@ mod test {
         let s = tokio::spawn(async move {
             let server_buf = &mut [0; 1024];
             let mut rng: StdRng = SeedableRng::from_entropy();
+            let server_config = ServerConfig {
+                psk: HashMap::from([(
+                    server_config::Identity::from(b"hello world"),
+                    server_config::Key::from(b"1234567890qwertyuiopasdfghjklzxc"),
+                )]),
+            };
+
             let mut server_connection =
-                ServerConnection::open_server(&mut rng, server_buf, server_socket)
+                ServerConnection::open_server(&mut rng, server_buf, server_socket, &server_config)
                     .await
                     .unwrap();
 

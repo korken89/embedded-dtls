@@ -18,7 +18,17 @@ use crate::buffer::{AllocSliceHandle, EncodingBuffer};
 use heapless::Vec;
 use num_enum::TryFromPrimitive;
 
-pub const DTLS_13_VERSION: u16 = 0xfefc;
+#[repr(u16)]
+#[derive(Clone, Debug, PartialOrd, PartialEq, TryFromPrimitive)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum DtlsVersions {
+    /// DTLS v1.0
+    V1_0 = 0xfeff,
+    /// DTLS v1.2
+    V1_2 = 0xfefd,
+    /// DTLS v1.3
+    V1_3 = 0xfefc,
+}
 
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -128,7 +138,7 @@ impl SupportedVersions {
         buf.push_u8(2)?;
 
         // DTLS 1.3, RFC 9147, section 5.3
-        buf.push_u16_be(DTLS_13_VERSION)
+        buf.push_u16_be(DtlsVersions::V1_3 as u16)
     }
 }
 
