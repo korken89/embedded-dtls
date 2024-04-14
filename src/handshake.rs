@@ -38,7 +38,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
         key_schedule: &mut KeySchedule<<CipherSuite as TlsCipherSuite>::Hash>,
         transcript_hasher: &mut CipherSuite::Hash,
     ) -> Result<(), ()> {
-        // TODO: Encode client handshake.
+        // Encode client handshake.
         let header = HandshakeHeader {
             msg_type: self.handshake_type(),
             length: U24::new(0),          // To be filled later
@@ -75,7 +75,9 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
             transcript_hasher.update(binders.slice_up_until(buf));
 
             // Calculate the binder entry.
-            let binder_entry = key_schedule.create_binder(transcript_hasher);
+            let binder_entry = key_schedule
+                .create_binder(&transcript_hasher.clone().finalize())
+                .expect("Unable to generate binder");
 
             // Save the binder entry to the correct location.
             // TODO: For each binder.

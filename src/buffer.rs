@@ -10,6 +10,15 @@ mod parse_buffer {
     }
 
     impl<'a> ParseBuffer<'a> {
+        /// Get the current position without popping.
+        pub fn current_pos(&self) -> Option<&'a u8> {
+            self.data.first()
+        }
+
+        pub fn current_pos_ptr(&self) -> *const u8 {
+            self.data.as_ptr()
+        }
+
         /// Create a new parse buffer.
         pub fn new(data: &'a [u8]) -> Self {
             Self { data }

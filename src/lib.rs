@@ -38,7 +38,7 @@ pub mod server_config {
     use zeroize::Zeroizing;
 
     /// Pre-shared key identity.
-    #[derive(PartialEq, Eq, Hash)]
+    #[derive(PartialEq, Eq, Hash, Debug)]
     pub struct Identity(Vec<u8>);
 
     impl<T> From<T> for Identity
@@ -47,6 +47,12 @@ pub mod server_config {
     {
         fn from(value: T) -> Self {
             Self(Vec::from(value.as_ref()))
+        }
+    }
+
+    impl Identity {
+        pub(crate) fn as_slice(&self) -> &[u8] {
+            &self.0
         }
     }
 
@@ -59,6 +65,12 @@ pub mod server_config {
     {
         fn from(value: T) -> Self {
             Self(Vec::from(value.as_ref()).into())
+        }
+    }
+
+    impl Key {
+        pub(crate) fn as_slice(&self) -> &[u8] {
+            &self.0
         }
     }
 
@@ -180,17 +192,18 @@ pub mod server {
     use crate::{
         buffer::{EncodingBuffer, ParseBuffer},
         handshake::{
-            extensions::{DtlsVersions, ExtensionType, NamedGroup, PskKeyExchangeMode},
+            extensions::{DtlsVersions, ExtensionType, NamedGroup, Psk, PskKeyExchangeMode},
             HandshakeHeader, HandshakeType, Random,
         },
         key_schedule::{self, KeySchedule},
         record::{ContentType, DTlsPlaintextHeader, ProtocolVersion, LEGACY_DTLS_VERSION},
-        server_config::ServerConfig,
+        server_config::{self, Identity, Key, ServerConfig},
         Datagram, Error,
     };
     use digest::{Digest, OutputSizeUser};
     use rand_core::{CryptoRng, RngCore};
     use sha2::Sha256;
+    use x25519_dalek::{EphemeralSecret, PublicKey};
     use zeroize::Zeroizing;
 
     // TODO: How to select between server and client? Typestate, flag or two separate structs?
@@ -222,16 +235,12 @@ pub mod server {
         {
             // TODO: If any part fails with error, make sure to send the correct ALERT.
 
-            let mut ser_buf = EncodingBuffer::new(buf);
-            // let mut key_schedule = KeySchedule::new();
-            // let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
-
             let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
             l0g::trace!("Got datagram!");
 
-            let client_hello = parse_client_hello(resp).ok_or(Error::Parse)?;
+            let (client_hello, positions) = parse_client_hello(resp).ok_or(Error::Parse)?;
 
-            // Find the first support cipher suite.
+            // Find the first supported cipher suite.
             let (mut key_schedule, cipher_suite) = {
                 let mut r = None;
                 for cipher_suite in &client_hello.cipher_suites {
@@ -247,14 +256,34 @@ pub mod server {
                 r.ok_or(Error::InvalidClientHello)?
             };
 
-            // TODO: At this point we know the cipher suite, and hence also the hash function.
+            // At this point we know the selected cipher suite, and hence also the hash function.
             // Now we can generate transcript hashes for binders and the message in total.
+            let mut transcript_hasher = key_schedule.new_transcript_hasher();
+            let (up_to_binders, binders_and_rest) = positions
+                .to_sub_slices(
+                    resp,
+                    client_hello
+                        .binders_start
+                        .ok_or(Error::InvalidClientHello)?,
+                )
+                .ok_or(Error::InvalidClientHello)?;
 
-            if !client_hello.validate_and_initialize(&mut key_schedule, server_config) {
-                return Err(Error::InvalidClientHello);
-            }
+            transcript_hasher.update(up_to_binders);
+            let binders_transcript_hash = transcript_hasher.clone().finalize();
+            transcript_hasher.update(binders_and_rest);
 
-            debug_assert!(!key_schedule.is_uninitialized());
+            let their_public_key = client_hello
+                .validate_and_initialize(&mut key_schedule, server_config, &binders_transcript_hash)
+                .map_err(|_| Error::InvalidClientHello)?;
+
+            // Perform ECDHE -> Handshake Secret with Key Schedule
+            // TODO: For now we assume X25519.
+            let secret = EphemeralSecret::random();
+            let our_public_key = PublicKey::from(&secret);
+            let shared_secret = secret.diffie_hellman(&their_public_key);
+            key_schedule.initialize_handshake_secret(shared_secret.as_bytes());
+
+            // TODO: Send server hello
 
             Ok(ServerConnection {
                 socket,
@@ -286,10 +315,40 @@ pub mod server {
                 // TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256
                 0xCCAC => ServerKeySchedule::Sha256(KeySchedule::new()),
                 _ => {
-                    l0g::error!("Detected unsupported cipher suite {cipher_suites:04x}");
+                    l0g::trace!("Detected unsupported cipher suite {cipher_suites:04x}");
                     return None;
                 }
             })
+        }
+
+        fn initialize_early_secret(&mut self, psk: Option<(&Identity, &Key)>) {
+            match self {
+                ServerKeySchedule::Sha256(key_schedule) => {
+                    key_schedule.initialize_early_secret(psk.map(|p| Psk {
+                        identity: p.0.as_slice(),
+                        key: p.1.as_slice(),
+                    }))
+                }
+            }
+        }
+
+        fn create_binders(&self, transcript_hash: &[u8]) -> Vec<u8> {
+            match self {
+                ServerKeySchedule::Sha256(key_schedule) => Vec::from(
+                    key_schedule
+                        .create_binder(transcript_hash)
+                        .expect("Unable to generate binder")
+                        .as_slice(),
+                ),
+            }
+        }
+
+        fn initialize_handshake_secret(&mut self, ecdhe: &[u8]) {
+            match self {
+                ServerKeySchedule::Sha256(key_schedule) => {
+                    key_schedule.initialize_handshake_secret(ecdhe);
+                }
+            }
         }
     }
 
@@ -300,20 +359,20 @@ pub mod server {
     }
 
     impl TranscriptHasher {
-        pub fn update(&mut self, data: impl AsRef<[u8]>) {
+        fn update(&mut self, data: impl AsRef<[u8]>) {
             match self {
                 TranscriptHasher::Sha256(h) => h.update(data),
             }
         }
 
-        pub fn finalize(self) -> Vec<u8> {
+        fn finalize(self) -> Vec<u8> {
             match self {
                 TranscriptHasher::Sha256(h) => Vec::from(h.finalize().as_slice()),
             }
         }
     }
 
-    fn parse_client_hello(buf: &[u8]) -> Option<ClientHello> {
+    fn parse_client_hello(buf: &[u8]) -> Option<(ClientHello, RecordPayloadPositions)> {
         let mut buf = ParseBuffer::new(buf);
 
         let record = Record::parse(&mut buf)?;
@@ -321,54 +380,80 @@ pub mod server {
         if !buf.pop_rest().is_empty() {
             return None;
         }
-
-        if let Record::Handshake(ClientHandshake::ClientHello(hello)) = record {
-            return Some(hello);
+        if let (Record::Handshake(ClientHandshake::ClientHello(hello)), pos) = record {
+            return Some((hello, pos));
         }
 
         None
     }
 
-    enum Record {
-        Handshake(ClientHandshake),
+    enum Record<'a> {
+        Handshake(ClientHandshake<'a>),
         Alert(),
         Heartbeat(),
         Ack(),
         ApplicationData(),
     }
 
-    impl Record {
-        fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+    /// Holds positions of key positions in the payload data. Used for transcript hashing.
+    struct RecordPayloadPositions {
+        start: *const u8,
+        end: *const u8,
+    }
+
+    impl RecordPayloadPositions {
+        fn to_sub_slices<'a>(&self, buf: &'a [u8], split_at: &u8) -> Option<(&'a [u8], &'a [u8])> {
+            // Calculate indices
+            let start = self.start as *const _ as usize - buf.as_ptr() as usize;
+            let middle = split_at as *const _ as usize - buf.as_ptr() as usize;
+            let end = self.end as *const _ as usize - buf.as_ptr() as usize;
+
+            debug_assert!(start < middle);
+            debug_assert!(middle < end);
+
+            // Create the sub-slices around the middle element
+            Some((buf.get(start..middle)?, buf.get(middle..end)?))
+        }
+    }
+
+    impl<'a> Record<'a> {
+        fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, RecordPayloadPositions)> {
             // Parse record.
             let record_header = DTlsPlaintextHeader::parse(buf)?;
             let record_payload = buf.pop_slice(record_header.length.into())?;
             l0g::trace!("Got record: {:#?}", record_header);
 
             let mut buf = ParseBuffer::new(record_payload);
+            let start = buf.current_pos()?;
 
-            match record_header.type_ {
+            let ret = match record_header.type_ {
                 ContentType::Handshake => {
-                    return Some(Record::Handshake(ClientHandshake::parse(&mut buf)?));
+                    let handshake = ClientHandshake::parse(&mut buf)?;
+
+                    Record::Handshake(handshake)
                 }
                 ContentType::Ack => todo!(),
                 ContentType::Heartbeat => todo!(),
                 ContentType::Alert => todo!(),
                 ContentType::ApplicationData => todo!(),
                 ContentType::ChangeCipherSpec => todo!(),
-            }
-            // TODO
+            };
+
+            let end = buf.current_pos_ptr();
+
+            Some((ret, RecordPayloadPositions { start, end }))
         }
     }
 
-    enum ClientHandshake {
-        ClientHello(ClientHello),
+    enum ClientHandshake<'a> {
+        ClientHello(ClientHello<'a>),
         Finished(),
         KeyUpdate(),
     }
 
-    impl ClientHandshake {
+    impl<'a> ClientHandshake<'a> {
         /// Parse a handshake message.
-        pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
             let handshake_header = HandshakeHeader::parse(buf)?;
 
             if handshake_header.length != handshake_header.fragment_length {
@@ -384,9 +469,9 @@ pub mod server {
             match handshake_header.msg_type {
                 HandshakeType::ClientHello => {
                     let mut buf = ParseBuffer::new(handshake_payload);
-                    let client_hello = ClientHello::parse(&mut buf)?;
+                    let mut client_hello = ClientHello::parse(&mut buf)?;
 
-                    l0g::trace!("Got client hello: {:#02x?}", client_hello);
+                    l0g::trace!("Got client hello: {:02x?}", client_hello);
 
                     Some(Self::ClientHello(client_hello))
                 }
@@ -398,15 +483,18 @@ pub mod server {
     }
 
     #[derive(Debug)]
-    struct ClientHello {
+    struct ClientHello<'a> {
         version: ProtocolVersion,
         random: Random,
         cipher_suites: Vec<u16>,
         extensions: ClientExtensions,
+        // data_start: &'a u8,
+        // data_end: &'a u8,
+        binders_start: Option<&'a u8>,
     }
 
-    impl ClientHello {
-        pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+    impl<'a> ClientHello<'a> {
+        pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
             let version = buf.pop_u16_be()?.to_be_bytes();
             let random = buf.pop_slice(32)?.try_into().unwrap();
 
@@ -449,13 +537,14 @@ pub mod server {
                 return None;
             }
 
-            let extensions = ClientExtensions::parse(buf)?;
+            let (extensions, binders_start) = ClientExtensions::parse(buf)?;
 
             Some(Self {
                 version,
                 random,
                 cipher_suites,
                 extensions,
+                binders_start,
             })
         }
 
@@ -465,7 +554,8 @@ pub mod server {
             &self,
             key_schedule: &mut ServerKeySchedule,
             server_config: &ServerConfig,
-        ) -> bool {
+            binders_hash: &[u8],
+        ) -> Result<PublicKey, ()> {
             debug_assert!(key_schedule.is_uninitialized());
 
             if self.version != LEGACY_DTLS_VERSION {
@@ -473,7 +563,7 @@ pub mod server {
                     "ClientHello version is not legacy DTLS version: {:02x?}",
                     self.version
                 );
-                return false;
+                return Err(());
             }
 
             // Are all the expexted extensions there? By this we enforce that the PSK key exchange
@@ -493,13 +583,13 @@ pub mod server {
             else {
                 // TODO: For now we expect these specific extensions.
                 l0g::error!("ClientHello: Not all expected extensions are provided {self:02x?}");
-                return false;
+                return Err(());
             };
 
             if supported_versions.version != DtlsVersions::V1_3 {
                 // We only support DTLS 1.3.
                 l0g::error!("Not DTLS 1.3");
-                return false;
+                return Err(());
             }
 
             if key_share.named_group != NamedGroup::X25519 {
@@ -507,7 +597,7 @@ pub mod server {
                     "ClientHello: The keyshare named group is unsupported: {:?}",
                     key_share.named_group
                 );
-                return false;
+                return Err(());
             }
 
             if psk_key_exchange_modes.ke_modes != PskKeyExchangeMode::PskDheKe {
@@ -515,18 +605,32 @@ pub mod server {
                     "ClientHello: The PskKeyExchangeMode is unsupported: {:?}",
                     key_share.named_group
                 );
-                return false;
+                return Err(());
             }
 
-            // TODO: Perform PSK -> Early Secret with Key Schedule
+            // Find the PSK.
+            let psk_identity = Identity::from(&pre_shared_key.identity);
+            let Some(psk) = server_config.psk.get(&psk_identity) else {
+                l0g::error!("ClientHello: Psk unknown identity: {psk_identity:?}");
+                return Err(());
+            };
 
-            // TODO: Get transcript hash for binders
+            // Perform PSK -> Early Secret with Key Schedule
+            key_schedule.initialize_early_secret(Some((&psk_identity, psk)));
 
-            // TODO: Verify binders with Early Secret
+            // Verify binders with Early Secret
+            let binder = key_schedule.create_binders(binders_hash);
 
-            // TODO: Perform ECDHE -> Handshake Secret with Key Schedule
+            if binder != pre_shared_key.binder {
+                l0g::error!("ClientHello: Psk binder mismatch");
+                return Err(());
+            }
 
-            todo!()
+            let their_public_key = PublicKey::from(
+                TryInto::<[u8; 32]>::try_into(key_share.key.as_slice()).map_err(|_| ())?,
+            );
+
+            Ok(their_public_key)
         }
     }
 
@@ -539,8 +643,9 @@ pub mod server {
     }
 
     impl ClientExtensions {
-        pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        pub fn parse<'a>(buf: &mut ParseBuffer<'a>) -> Option<(Self, Option<&'a u8>)> {
             let mut ret = ClientExtensions::default();
+            let mut binders_start = None;
 
             let extensions_length = buf.pop_u16_be()?;
             let mut extensions = ParseBuffer::new(buf.pop_slice(extensions_length as usize)?);
@@ -598,7 +703,7 @@ pub mod server {
                         ret.key_share = Some(v);
                     }
                     ExtensionType::PreSharedKey => {
-                        let Some(v) =
+                        let Some((psk, binders_start_pos)) =
                             PreSharedKey::parse(&mut ParseBuffer::new(extension.extension_data))
                         else {
                             l0g::error!("Failed to parse PreSharedKey");
@@ -610,7 +715,8 @@ pub mod server {
                             return None;
                         }
 
-                        ret.pre_shared_key = Some(v);
+                        binders_start = Some(binders_start_pos);
+                        ret.pre_shared_key = Some(psk);
                     }
                     _ => {
                         l0g::error!("Got more extensions than what's supported!");
@@ -619,7 +725,7 @@ pub mod server {
                 }
             }
 
-            Some(ret)
+            Some((ret, binders_start))
         }
     }
 
@@ -711,11 +817,11 @@ pub mod server {
     struct PreSharedKey {
         identity: Vec<u8>,
         binder: Vec<u8>,
-        ticket_age: u32,
+        _ticket_age: u32,
     }
 
     impl PreSharedKey {
-        pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        pub fn parse<'a>(buf: &mut ParseBuffer<'a>) -> Option<(Self, &'a u8)> {
             // Identity part
             let identity_size = buf.pop_u16_be()?;
             let identity_length = buf.pop_u16_be()?;
@@ -735,6 +841,7 @@ pub mod server {
 
             // Binders part
             let binders_size = buf.pop_u16_be()?;
+            let binders_start_pos = buf.current_pos()?;
             let binder_length = buf.pop_u8()?;
 
             let expected_binders_size = binder_length as u16 + 1;
@@ -748,11 +855,14 @@ pub mod server {
 
             let binder = buf.pop_slice(binder_length as usize)?;
 
-            Some(PreSharedKey {
-                identity: identity.into(),
-                binder: binder.into(),
-                ticket_age,
-            })
+            Some((
+                PreSharedKey {
+                    identity: identity.into(),
+                    binder: binder.into(),
+                    _ticket_age: ticket_age,
+                },
+                binders_start_pos,
+            ))
         }
     }
 }

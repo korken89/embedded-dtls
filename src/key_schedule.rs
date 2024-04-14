@@ -97,8 +97,12 @@ where
         hkdf_make_expanded_label::<D>(hkdf, label)
     }
 
-    /// Calculate a binder.
-    pub fn create_binder(&self, transcript_hasher: &D) -> HashArray<D> {
+    /// Calculate a binder. The hash must be the same size as the output for the hash function.
+    pub fn create_binder(&self, transcript_hash: &[u8]) -> Option<HashArray<D>> {
+        if transcript_hash.len() != <D as Digest>::output_size() {
+            return None;
+        }
+
         let secret = match &self.keyschedule_state {
             KeyScheduleState::EarlySecret(secret) => secret,
             _ => {
@@ -116,9 +120,9 @@ where
         );
 
         let mut hmac = <SimpleHmac<D> as KeyInit>::new_from_slice(&binder_key).unwrap();
-        Mac::update(&mut hmac, &transcript_hasher.clone().finalize());
+        Mac::update(&mut hmac, &transcript_hash);
 
-        hmac.finalize().into_bytes()
+        Some(hmac.finalize().into_bytes())
     }
 
     /// Move to the next step in the secrets.

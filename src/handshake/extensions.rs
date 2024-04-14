@@ -18,6 +18,7 @@ use crate::buffer::{AllocSliceHandle, EncodingBuffer};
 use heapless::Vec;
 use num_enum::TryFromPrimitive;
 
+/// Version numbers.
 #[repr(u16)]
 #[derive(Clone, Debug, PartialOrd, PartialEq, TryFromPrimitive)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
