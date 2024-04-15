@@ -15,7 +15,6 @@
 //! All this is defined in RFC 8446 (TLS 1.3) at Page 37.
 
 use crate::buffer::{AllocSliceHandle, EncodingBuffer};
-use heapless::Vec;
 use num_enum::TryFromPrimitive;
 
 /// Version numbers.
@@ -36,7 +35,7 @@ pub enum DtlsVersions {
 pub enum ClientExtensions<'a> {
     PskKeyExchangeModes(PskKeyExchangeModes),
     KeyShare(KeyShareEntry<'a>),
-    SupportedVersions(SupportedVersions),
+    SupportedVersions(ClientSupportedVersions),
     PreSharedKey(OfferedPsks<'a>),
     // ServerName { // Not sure we need this.
     //     server_name: &'a str,
@@ -91,6 +90,43 @@ impl<'a> ClientExtensions<'a> {
     }
 }
 
+#[derive(Clone, Debug, PartialOrd, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ServerExtensions<'a> {
+    KeyShare(KeyShareEntry<'a>),
+    SeletedSupportedVersion(ServerSupportedVersion),
+    PreSharedKey(SelectedPsk),
+}
+
+impl<'a> ServerExtensions<'a> {
+    /// Encode a server extension.
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+        buf.push_u8(self.extension_type() as u8)?;
+
+        let extension_length_allocation = buf.alloc_u16()?;
+        let content_start = buf.len();
+
+        match self {
+            ServerExtensions::KeyShare(key_share) => key_share.encode(buf)?,
+            ServerExtensions::SeletedSupportedVersion(versions) => versions.encode(buf)?,
+            ServerExtensions::PreSharedKey(offered) => offered.encode(buf)?,
+        };
+
+        // Fill in the length of this extension.
+        let content_length = (buf.len() - content_start) as u16;
+        extension_length_allocation.set(buf, content_length);
+
+        Ok(())
+    }
+
+    fn extension_type(&self) -> ExtensionType {
+        match self {
+            ServerExtensions::KeyShare(_) => ExtensionType::KeyShare,
+            ServerExtensions::SeletedSupportedVersion(_) => ExtensionType::SupportedVersions,
+            ServerExtensions::PreSharedKey(_) => ExtensionType::PreSharedKey,
+        }
+    }
+}
 /// Pre-Shared Key Exchange Modes.
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -131,14 +167,27 @@ impl<'a> KeyShareEntry<'a> {
 /// The supported_versions payload.
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct SupportedVersions {}
+pub struct ClientSupportedVersions {}
 
-impl SupportedVersions {
+impl ClientSupportedVersions {
     /// Encode a `supported_versions` extension. We only support DTLS 1.3.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
         buf.push_u8(2)?;
 
         // DTLS 1.3, RFC 9147, section 5.3
+        buf.push_u16_be(DtlsVersions::V1_3 as u16)
+    }
+}
+
+/// The supported_versions payload, the one selected by the server.
+#[derive(Clone, Debug, PartialOrd, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ServerSupportedVersion {}
+
+impl ServerSupportedVersion {
+    /// Encode a `supported_versions` extension. We only support DTLS 1.3.
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+        // DTLS 1.3, RFC 8446, section 4.2.1 (pointed to from RFC 9147, section 5.4)
         buf.push_u16_be(DtlsVersions::V1_3 as u16)
     }
 }
@@ -201,6 +250,21 @@ impl<'a> Psk<'a> {
 
         // Encode ticket age.
         buf.push_u32_be(0)
+    }
+}
+
+/// The pre-shared keys the server has selected.
+#[derive(Clone, Debug, PartialOrd, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SelectedPsk {
+    /// List of identities that can be used. Ticket age is set to 0.
+    pub selected_identity: u16,
+}
+
+impl SelectedPsk {
+    /// Encode the selected pre-shared key.
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+        buf.push_u16_be(self.selected_identity)
     }
 }
 

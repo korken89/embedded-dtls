@@ -5,7 +5,7 @@ use crate::{
     buffer::{AllocU16Handle, EncodingBuffer, ParseBuffer},
     cipher_suites::TlsCipherSuite,
     client_config::ClientConfig,
-    handshake::{ClientHandshake, ClientHello},
+    handshake::{ClientHandshake, ClientHello, ServerHandshake, ServerHello},
     integers::U48,
     key_schedule::KeySchedule,
 };
@@ -81,8 +81,6 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
         Ok(&*buf)
     }
 
-    pub fn parse(buf: &mut ParseBuffer) {}
-
     fn content_type(&self) -> ContentType {
         match self {
             ClientRecord::Handshake(_) => ContentType::Handshake,
@@ -94,6 +92,77 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
             ClientRecord::Heartbeat(_, Encryption::Enabled) => ContentType::ApplicationData,
             ClientRecord::Ack(_, Encryption::Enabled) => ContentType::ApplicationData,
             ClientRecord::ApplicationData() => ContentType::ApplicationData,
+        }
+    }
+}
+
+/// Supported client records.
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ServerRecord {
+    Handshake(ServerHandshake),
+    Alert(/* Alert, */ (), Encryption),
+    Heartbeat((), Encryption),
+    Ack((), Encryption),
+    ApplicationData(/* &'a [u8] */),
+}
+
+impl ServerRecord {
+    /// Create a client hello handshake.
+    pub fn server_hello() -> Self {
+        ServerRecord::Handshake(ServerHandshake::ServerHello(ServerHello::new()))
+    }
+
+    /// Encode the record into a buffer.
+    pub fn encode<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<&'buf [u8], ()> {
+        let header = DTlsPlaintextHeader {
+            type_: self.content_type(),
+            epoch: 0,
+            sequence_number: 0.into(),
+            length: 0, // To be encoded later.
+        };
+
+        // ------ Start record
+
+        // Create record header.
+        let length_allocation = header.encode(buf)?;
+
+        buf.forward_start();
+        let content_start = buf.len();
+
+        // ------ Encode payload
+
+        match self {
+            // NOTE: Each record encoder needs to update the transcript hash at their end.
+            ServerRecord::Handshake(handshake) => {
+                handshake.encode(buf)?;
+            }
+            ServerRecord::Alert(_, _) => todo!(),
+            ServerRecord::Heartbeat(_, _) => todo!(),
+            ServerRecord::Ack(_, _) => todo!(),
+            ServerRecord::ApplicationData() => todo!(),
+        }
+
+        let content_length = (buf.len() - content_start) as u16;
+        length_allocation.set(buf, content_length);
+
+        // ------ Finish record
+        buf.reset_start();
+
+        Ok(&*buf)
+    }
+
+    fn content_type(&self) -> ContentType {
+        match self {
+            ServerRecord::Handshake(_) => ContentType::Handshake,
+            ServerRecord::Alert(_, Encryption::Disabled) => ContentType::Alert,
+            ServerRecord::Heartbeat(_, Encryption::Disabled) => ContentType::Heartbeat,
+            ServerRecord::Ack(_, Encryption::Disabled) => ContentType::Ack,
+            // All encrypted communication is marked as `ApplicationData`.
+            ServerRecord::Alert(_, Encryption::Enabled) => ContentType::ApplicationData,
+            ServerRecord::Heartbeat(_, Encryption::Enabled) => ContentType::ApplicationData,
+            ServerRecord::Ack(_, Encryption::Enabled) => ContentType::ApplicationData,
+            ServerRecord::ApplicationData() => ContentType::ApplicationData,
         }
     }
 }

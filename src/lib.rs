@@ -38,7 +38,7 @@ pub mod server_config {
     use zeroize::Zeroizing;
 
     /// Pre-shared key identity.
-    #[derive(PartialEq, Eq, Hash, Debug)]
+    #[derive(PartialEq, Eq, Hash)]
     pub struct Identity(Vec<u8>);
 
     impl<T> From<T> for Identity
@@ -53,6 +53,22 @@ pub mod server_config {
     impl Identity {
         pub(crate) fn as_slice(&self) -> &[u8] {
             &self.0
+        }
+    }
+
+    impl core::fmt::Debug for Identity {
+        fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+            match std::str::from_utf8(&self.0) {
+                Ok(string) => f.write_str(string),
+                Err(_) => f.write_str(
+                    &self
+                        .0
+                        .iter()
+                        .map(|byte| format!("{:02x}", byte))
+                        .collect::<Vec<String>>()
+                        .join(" "),
+                ),
+            }
         }
     }
 
@@ -273,7 +289,11 @@ pub mod server {
             transcript_hasher.update(binders_and_rest);
 
             let their_public_key = client_hello
-                .validate_and_initialize(&mut key_schedule, server_config, &binders_transcript_hash)
+                .validate_and_initialize_keyschedule(
+                    &mut key_schedule,
+                    server_config,
+                    &binders_transcript_hash,
+                )
                 .map_err(|_| Error::InvalidClientHello)?;
 
             // Perform ECDHE -> Handshake Secret with Key Schedule
@@ -485,7 +505,7 @@ pub mod server {
     #[derive(Debug)]
     struct ClientHello<'a> {
         version: ProtocolVersion,
-        random: Random,
+        legacy_session_id: Vec<u8>,
         cipher_suites: Vec<u16>,
         extensions: ClientExtensions,
         // data_start: &'a u8,
@@ -496,15 +516,12 @@ pub mod server {
     impl<'a> ClientHello<'a> {
         pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
             let version = buf.pop_u16_be()?.to_be_bytes();
-            let random = buf.pop_slice(32)?.try_into().unwrap();
+            let _random = buf.pop_slice(32)?;
 
             //     opaque legacy_session_id<0..32>;
             //     opaque legacy_cookie<0..2^8-1>;                  // DTLS
-            let legacy_session_id = buf.pop_u8()?;
-            if legacy_session_id != 0 {
-                l0g::trace!("Legacy session ID is non-zero");
-                return None;
-            }
+            let legacy_session_id_len = buf.pop_u8()?;
+            let legacy_session_id = Vec::from(buf.pop_slice(legacy_session_id_len as usize)?);
 
             let legacy_cookie = buf.pop_u8()?;
             if legacy_cookie != 0 {
@@ -541,7 +558,7 @@ pub mod server {
 
             Some(Self {
                 version,
-                random,
+                legacy_session_id,
                 cipher_suites,
                 extensions,
                 binders_start,
@@ -550,7 +567,7 @@ pub mod server {
 
         /// Check a client hello if it is valid, perform binder verification and setup the key
         /// schedule.
-        fn validate_and_initialize(
+        fn validate_and_initialize_keyschedule(
             &self,
             key_schedule: &mut ServerKeySchedule,
             server_config: &ServerConfig,
@@ -565,6 +582,8 @@ pub mod server {
                 );
                 return Err(());
             }
+
+            l0g::debug!("DTLS legacy version OK");
 
             // Are all the expexted extensions there? By this we enforce that the PSK key exchange
             // is ECDHE.
@@ -586,19 +605,24 @@ pub mod server {
                 return Err(());
             };
 
+            l0g::debug!("All required extensions are present");
+
             if supported_versions.version != DtlsVersions::V1_3 {
                 // We only support DTLS 1.3.
                 l0g::error!("Not DTLS 1.3");
                 return Err(());
             }
+            l0g::debug!("DTLS version OK: {:?}", supported_versions.version);
 
-            if key_share.named_group != NamedGroup::X25519 {
+            if key_share.named_group != NamedGroup::X25519 && key_share.key.len() == 32 {
                 l0g::error!(
-                    "ClientHello: The keyshare named group is unsupported: {:?}",
-                    key_share.named_group
+                    "ClientHello: The keyshare named group is unsupported or wrong key length: {:?}, len = {}",
+                    key_share.named_group,
+                    key_share.key.len()
                 );
                 return Err(());
             }
+            l0g::debug!("Keyshare is OK: {:?}", key_share.named_group);
 
             if psk_key_exchange_modes.ke_modes != PskKeyExchangeMode::PskDheKe {
                 l0g::error!(
@@ -607,6 +631,10 @@ pub mod server {
                 );
                 return Err(());
             }
+            l0g::debug!(
+                "Psk key exchange mode is OK: {:?}",
+                psk_key_exchange_modes.ke_modes
+            );
 
             // Find the PSK.
             let psk_identity = Identity::from(&pre_shared_key.identity);
@@ -614,6 +642,7 @@ pub mod server {
                 l0g::error!("ClientHello: Psk unknown identity: {psk_identity:?}");
                 return Err(());
             };
+            l0g::debug!("Psk identity '{:?}' is AVAILABLE", psk_identity);
 
             // Perform PSK -> Early Secret with Key Schedule
             key_schedule.initialize_early_secret(Some((&psk_identity, psk)));
@@ -625,10 +654,12 @@ pub mod server {
                 l0g::error!("ClientHello: Psk binder mismatch");
                 return Err(());
             }
+            l0g::debug!("Psk binders MATCH");
 
-            let their_public_key = PublicKey::from(
-                TryInto::<[u8; 32]>::try_into(key_share.key.as_slice()).map_err(|_| ())?,
-            );
+            let their_public_key =
+                PublicKey::from(TryInto::<[u8; 32]>::try_into(key_share.key.as_slice()).unwrap());
+
+            l0g::debug!("ClientHello VALID");
 
             Ok(their_public_key)
         }
@@ -863,6 +894,38 @@ pub mod server {
                 },
                 binders_start_pos,
             ))
+        }
+    }
+
+    struct ServerHello {}
+
+    impl ServerHello {
+        pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+            let header = DTlsPlaintextHeader {
+                type_: ContentType::Handshake,
+                epoch: 0,
+                sequence_number: 0.into(),
+                length: 0, // To be encoded later.
+            };
+
+            // Create record header.
+            let length_allocation = header.encode(buf)?;
+
+            buf.forward_start();
+            let content_start = buf.len();
+
+            // ------ Encode payload
+            todo!();
+
+            let content_length = (buf.len() - content_start) as u16;
+            length_allocation.set(buf, content_length);
+
+            // ------ Finish record
+            buf.reset_start();
+            // Create record header.
+            let length_allocation = header.encode(buf)?;
+
+            Err(())
         }
     }
 }
