@@ -242,15 +242,11 @@ pub mod server {
         ///
         /// NOTE: This does not do timeout, it's up to the caller to give up.
         // TODO: Should this be some kind of iterator that gives out new DTLS connections?
-        pub async fn open_server<Rng>(
-            rng: &mut Rng,
+        pub async fn open_server(
             buf: &mut [u8],
             socket: Socket,
             server_config: &ServerConfig,
-        ) -> Result<Self, Error<Socket>>
-        where
-            Rng: RngCore + CryptoRng,
-        {
+        ) -> Result<Self, Error<Socket>> {
             // TODO: If any part fails with error, make sure to send the correct ALERT.
 
             let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
@@ -319,7 +315,7 @@ pub mod server {
                 .encode(&mut buf)
                 .map_err(|_| Error::InsufficientSpace)?;
 
-            l0g::debug!("Sending server hello: {server_hello:02x?} = {to_send:02x?}");
+            l0g::debug!("Sending server hello: {server_hello:02x?}");
 
             socket.send(to_send).await.map_err(|e| Error::Send(e))?;
 
@@ -1005,8 +1001,7 @@ mod test {
 
         // Server
         let s = tokio::spawn(async move {
-            let server_buf = &mut [0; 1024];
-            let mut rng: StdRng = SeedableRng::from_entropy();
+            let server_buf = &mut vec![0; 1024];
             let server_config = ServerConfig {
                 psk: HashMap::from([(
                     server_config::Identity::from(b"hello world"),
@@ -1015,7 +1010,7 @@ mod test {
             };
 
             let mut server_connection =
-                ServerConnection::open_server(&mut rng, server_buf, server_socket, &server_config)
+                ServerConnection::open_server(server_buf, server_socket, &server_config)
                     .await
                     .unwrap();
 
