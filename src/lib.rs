@@ -212,7 +212,9 @@ pub mod server {
             HandshakeHeader, HandshakeType, Random,
         },
         key_schedule::{self, KeySchedule},
-        record::{ContentType, DTlsPlaintextHeader, ProtocolVersion, LEGACY_DTLS_VERSION},
+        record::{
+            ContentType, DTlsPlaintextHeader, ProtocolVersion, ServerRecord, LEGACY_DTLS_VERSION,
+        },
         server_config::{self, Identity, Key, ServerConfig},
         Datagram, Error,
     };
@@ -257,7 +259,7 @@ pub mod server {
             let (client_hello, positions) = parse_client_hello(resp).ok_or(Error::Parse)?;
 
             // Find the first supported cipher suite.
-            let (mut key_schedule, cipher_suite) = {
+            let (mut key_schedule, selected_cipher_suite) = {
                 let mut r = None;
                 for cipher_suite in &client_hello.cipher_suites {
                     // Check so we can support this cipher suite.
@@ -276,7 +278,7 @@ pub mod server {
             // Now we can generate transcript hashes for binders and the message in total.
             let mut transcript_hasher = key_schedule.new_transcript_hasher();
             let (up_to_binders, binders_and_rest) = positions
-                .to_sub_slices(
+                .into_sub_slices(
                     resp,
                     client_hello
                         .binders_start
@@ -303,7 +305,23 @@ pub mod server {
             let shared_secret = secret.diffie_hellman(&their_public_key);
             key_schedule.initialize_handshake_secret(shared_secret.as_bytes());
 
-            // TODO: Send server hello
+            // Send server hello.
+            // TODO: We hardcode the selected PSK as the first one for now.
+            let server_hello = ServerRecord::server_hello(
+                client_hello.legacy_session_id,
+                our_public_key,
+                selected_cipher_suite,
+                0,
+            );
+
+            let mut buf = EncodingBuffer::new(buf);
+            let to_send = server_hello
+                .encode(&mut buf)
+                .map_err(|_| Error::InsufficientSpace)?;
+
+            l0g::debug!("Sending server hello: {server_hello:02x?} = {to_send:02x?}");
+
+            socket.send(to_send).await.map_err(|e| Error::Send(e))?;
 
             Ok(ServerConnection {
                 socket,
@@ -407,8 +425,8 @@ pub mod server {
         None
     }
 
-    enum Record<'a> {
-        Handshake(ClientHandshake<'a>),
+    enum Record {
+        Handshake(ClientHandshake),
         Alert(),
         Heartbeat(),
         Ack(),
@@ -417,16 +435,16 @@ pub mod server {
 
     /// Holds positions of key positions in the payload data. Used for transcript hashing.
     struct RecordPayloadPositions {
-        start: *const u8,
-        end: *const u8,
+        start: usize,
+        end: usize,
     }
 
     impl RecordPayloadPositions {
-        fn to_sub_slices<'a>(&self, buf: &'a [u8], split_at: &u8) -> Option<(&'a [u8], &'a [u8])> {
+        fn into_sub_slices(self, buf: &[u8], split_at: usize) -> Option<(&[u8], &[u8])> {
             // Calculate indices
-            let start = self.start as *const _ as usize - buf.as_ptr() as usize;
-            let middle = split_at as *const _ as usize - buf.as_ptr() as usize;
-            let end = self.end as *const _ as usize - buf.as_ptr() as usize;
+            let start = self.start.checked_sub(buf.as_ptr() as usize)?;
+            let middle = split_at.checked_sub(buf.as_ptr() as usize)?;
+            let end = self.end.checked_sub(buf.as_ptr() as usize)?;
 
             debug_assert!(start < middle);
             debug_assert!(middle < end);
@@ -436,15 +454,15 @@ pub mod server {
         }
     }
 
-    impl<'a> Record<'a> {
-        fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, RecordPayloadPositions)> {
+    impl Record {
+        fn parse(buf: &mut ParseBuffer) -> Option<(Self, RecordPayloadPositions)> {
             // Parse record.
             let record_header = DTlsPlaintextHeader::parse(buf)?;
             let record_payload = buf.pop_slice(record_header.length.into())?;
             l0g::trace!("Got record: {:#?}", record_header);
 
             let mut buf = ParseBuffer::new(record_payload);
-            let start = buf.current_pos()?;
+            let start = buf.current_pos_ptr();
 
             let ret = match record_header.type_ {
                 ContentType::Handshake => {
@@ -465,15 +483,15 @@ pub mod server {
         }
     }
 
-    enum ClientHandshake<'a> {
-        ClientHello(ClientHello<'a>),
+    enum ClientHandshake {
+        ClientHello(ClientHello),
         Finished(),
         KeyUpdate(),
     }
 
-    impl<'a> ClientHandshake<'a> {
+    impl ClientHandshake {
         /// Parse a handshake message.
-        pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+        pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
             let handshake_header = HandshakeHeader::parse(buf)?;
 
             if handshake_header.length != handshake_header.fragment_length {
@@ -503,18 +521,16 @@ pub mod server {
     }
 
     #[derive(Debug)]
-    struct ClientHello<'a> {
+    struct ClientHello {
         version: ProtocolVersion,
         legacy_session_id: Vec<u8>,
         cipher_suites: Vec<u16>,
         extensions: ClientExtensions,
-        // data_start: &'a u8,
-        // data_end: &'a u8,
-        binders_start: Option<&'a u8>,
+        binders_start: Option<usize>,
     }
 
-    impl<'a> ClientHello<'a> {
-        pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+    impl ClientHello {
+        pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
             let version = buf.pop_u16_be()?.to_be_bytes();
             let _random = buf.pop_slice(32)?;
 
@@ -674,7 +690,7 @@ pub mod server {
     }
 
     impl ClientExtensions {
-        pub fn parse<'a>(buf: &mut ParseBuffer<'a>) -> Option<(Self, Option<&'a u8>)> {
+        pub fn parse(buf: &mut ParseBuffer) -> Option<(Self, Option<usize>)> {
             let mut ret = ClientExtensions::default();
             let mut binders_start = None;
 
@@ -852,7 +868,7 @@ pub mod server {
     }
 
     impl PreSharedKey {
-        pub fn parse<'a>(buf: &mut ParseBuffer<'a>) -> Option<(Self, &'a u8)> {
+        pub fn parse<'a>(buf: &mut ParseBuffer<'a>) -> Option<(Self, usize)> {
             // Identity part
             let identity_size = buf.pop_u16_be()?;
             let identity_length = buf.pop_u16_be()?;
@@ -872,7 +888,7 @@ pub mod server {
 
             // Binders part
             let binders_size = buf.pop_u16_be()?;
-            let binders_start_pos = buf.current_pos()?;
+            let binders_start_pos = buf.current_pos_ptr();
             let binder_length = buf.pop_u8()?;
 
             let expected_binders_size = binder_length as u16 + 1;
@@ -894,38 +910,6 @@ pub mod server {
                 },
                 binders_start_pos,
             ))
-        }
-    }
-
-    struct ServerHello {}
-
-    impl ServerHello {
-        pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
-            let header = DTlsPlaintextHeader {
-                type_: ContentType::Handshake,
-                epoch: 0,
-                sequence_number: 0.into(),
-                length: 0, // To be encoded later.
-            };
-
-            // Create record header.
-            let length_allocation = header.encode(buf)?;
-
-            buf.forward_start();
-            let content_start = buf.len();
-
-            // ------ Encode payload
-            todo!();
-
-            let content_length = (buf.len() - content_start) as u16;
-            length_allocation.set(buf, content_length);
-
-            // ------ Finish record
-            buf.reset_start();
-            // Create record header.
-            let length_allocation = header.encode(buf)?;
-
-            Err(())
         }
     }
 }

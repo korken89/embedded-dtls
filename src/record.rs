@@ -1,5 +1,6 @@
 use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
+use x25519_dalek::PublicKey;
 
 use crate::{
     buffer::{AllocU16Handle, EncodingBuffer, ParseBuffer},
@@ -109,8 +110,18 @@ pub enum ServerRecord {
 
 impl ServerRecord {
     /// Create a client hello handshake.
-    pub fn server_hello() -> Self {
-        ServerRecord::Handshake(ServerHandshake::ServerHello(ServerHello::new()))
+    pub fn server_hello(
+        legacy_session_id: Vec<u8>,
+        public_key: PublicKey,
+        selected_cipher_suite: u16,
+        selected_psk_identity: u16,
+    ) -> Self {
+        ServerRecord::Handshake(ServerHandshake::ServerHello(ServerHello::new(
+            legacy_session_id,
+            public_key,
+            selected_cipher_suite,
+            selected_psk_identity,
+        )))
     }
 
     /// Encode the record into a buffer.

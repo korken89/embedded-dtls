@@ -367,7 +367,6 @@ impl defmt::Format for ClientHello {
 
 #[derive(Debug)]
 pub struct ServerHello {
-    random: Random,
     legacy_session_id: Vec<u8>,
     public_key: PublicKey,
     cipher_suite: u16,
@@ -375,19 +374,18 @@ pub struct ServerHello {
 }
 
 impl ServerHello {
-    pub fn new() -> Self {
-        todo!()
-        // let mut random = [0; 32];
-        // rng.fill_bytes(&mut random);
-
-        // let key = EphemeralSecret::random_from_rng(rng);
-
-        // Self {
-        //     random,
-        //     secret: key,
-        //     config,
-        //     _c: PhantomData,
-        // }
+    pub fn new(
+        legacy_session_id: Vec<u8>,
+        public_key: PublicKey,
+        selected_cipher_suite: u16,
+        selected_psk_identity: u16,
+    ) -> Self {
+        Self {
+            legacy_session_id,
+            public_key,
+            cipher_suite: selected_cipher_suite,
+            selected_psk_identity,
+        }
     }
 
     /// Encode a server hello payload in a Handshake. RFC 8446 section 4.1.3.
