@@ -18,6 +18,37 @@ pub enum Encryption {
     Disabled,
 }
 
+/// Holds positions of key positions in the payload data. Used for transcript hashing.
+pub struct RecordPayloadPositions {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl RecordPayloadPositions {
+    pub fn into_sub_slices(self, buf: &[u8], split_at: usize) -> Option<(&[u8], &[u8])> {
+        // Calculate indices
+        let start = self.start.checked_sub(buf.as_ptr() as usize)?;
+        let middle = split_at.checked_sub(buf.as_ptr() as usize)?;
+        let end = self.end.checked_sub(buf.as_ptr() as usize)?;
+
+        debug_assert!(start < middle);
+        debug_assert!(middle < end);
+
+        // Create the sub-slices around the middle element
+        Some((buf.get(start..middle)?, buf.get(middle..end)?))
+    }
+
+    pub fn into_slice(self, buf: &[u8]) -> Option<&[u8]> {
+        // Calculate indices
+        let start = self.start.checked_sub(buf.as_ptr() as usize)?;
+        let end = self.end.checked_sub(buf.as_ptr() as usize)?;
+
+        debug_assert!(start < end);
+
+        buf.get(start..end)
+    }
+}
+
 /// Supported client records.
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -124,8 +155,11 @@ impl ServerRecord {
         )))
     }
 
-    /// Encode the record into a buffer.
-    pub fn encode<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<&'buf [u8], ()> {
+    /// Encode the record into a buffer. Returns (packet to send, content to hash).
+    pub fn encode<'buf>(
+        &self,
+        buf: &'buf mut EncodingBuffer,
+    ) -> Result<(&'buf [u8], &'buf [u8]), ()> {
         let header = DTlsPlaintextHeader {
             type_: self.content_type(),
             epoch: 0,
@@ -160,7 +194,10 @@ impl ServerRecord {
         // ------ Finish record
         buf.reset_start();
 
-        Ok(&*buf)
+        let r = &*buf;
+        let start = buf.len() - content_length as usize;
+
+        Ok((r, &r[start..]))
     }
 
     fn content_type(&self) -> ContentType {
