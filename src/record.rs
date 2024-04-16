@@ -160,10 +160,7 @@ impl ServerRecord {
     }
 
     /// Encode the record into a buffer. Returns (packet to send, content to hash).
-    pub fn encode<'buf>(
-        &self,
-        buf: &'buf mut EncodingBuffer,
-    ) -> Result<(&'buf [u8], &'buf [u8]), ()> {
+    pub fn encode<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<(&'buf [u8]), ()> {
         let header = DTlsPlaintextHeader {
             type_: self.content_type(),
             epoch: 0,
@@ -201,7 +198,7 @@ impl ServerRecord {
         let r = &*buf;
         let start = buf.len() - content_length as usize;
 
-        Ok((r, &r[start..]))
+        Ok(&r[start..])
     }
 
     fn content_type(&self) -> ContentType {

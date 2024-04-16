@@ -151,12 +151,8 @@ pub trait Datagram {
 // Lives in no_std land.
 pub mod client {
     use crate::{
-        buffer::{EncodingBuffer, ParseBuffer},
-        cipher_suites::TlsCipherSuite,
-        client_config::ClientConfig,
-        key_schedule::KeySchedule,
-        record::ClientRecord,
-        Datagram, Error,
+        buffer::EncodingBuffer, cipher_suites::TlsCipherSuite, client_config::ClientConfig,
+        key_schedule::KeySchedule, record::ClientRecord, Datagram, Error,
     };
     use digest::Digest;
     use rand_core::{CryptoRng, RngCore};
@@ -213,6 +209,20 @@ pub mod client {
                 .ok_or(Error::InvalidServerHello)?;
             transcript_hasher.update(to_hash);
 
+            let their_public_key = server_hello
+                .validate(CipherSuite::CODE_POINT)
+                .map_err(|_| Error::InvalidServerHello)?;
+
+            // TODO: Update key schedule to Handshake Secret using public keys.
+
+            todo!();
+
+            // TODO: Send finished.
+
+            // TODO: Update key schedule to Master Secret using public keys.
+
+            // TODO: Wait for server ACK.
+
             Ok(ClientConnection {
                 socket,
                 key_schedule,
@@ -221,6 +231,8 @@ pub mod client {
     }
 
     mod parse {
+        use x25519_dalek::PublicKey;
+
         use crate::{
             buffer::ParseBuffer,
             handshake::{
@@ -230,7 +242,10 @@ pub mod client {
                 },
                 HandshakeHeader, HandshakeType,
             },
-            record::{ContentType, DTlsPlaintextHeader, ProtocolVersion, RecordPayloadPositions},
+            record::{
+                ContentType, DTlsPlaintextHeader, ProtocolVersion, RecordPayloadPositions,
+                LEGACY_DTLS_VERSION,
+            },
         };
 
         pub fn parse_server_hello(buf: &[u8]) -> Option<(ServerHello, RecordPayloadPositions)> {
@@ -351,6 +366,28 @@ pub mod client {
                     extensions,
                 })
             }
+
+            pub fn validate(&self, our_cipher_suite: u16) -> Result<PublicKey, ()> {
+                if self.version != LEGACY_DTLS_VERSION {
+                    l0g::error!(
+                        "ServerHello version is not legacy DTLS version: {:02x?}",
+                        self.version
+                    );
+                    return Err(());
+                }
+
+                if !self.legacy_session_id_echo.is_empty() {
+                    l0g::error!("ServerHello legacy session id echo is not empty");
+                    return Err(());
+                }
+
+                if self.cipher_suite != our_cipher_suite {
+                    l0g::error!("ServerHello cipher suite mismatch");
+                    return Err(());
+                }
+
+                todo!()
+            }
         }
     }
 }
@@ -458,24 +495,27 @@ pub mod server {
             );
 
             let mut enc_buf = EncodingBuffer::new(buf);
-            let (to_send, to_hash) = server_hello
+            let to_hash = server_hello
                 .encode(&mut enc_buf)
                 .map_err(|_| Error::InsufficientSpace)?;
             transcript_hasher.update(to_hash);
 
             // TODO: Can we do without this `Vec`? The lifetime of `enc_buf` makes it hard now.
-            let mut server_hello_and_finished = Vec::from(to_send);
+            // let mut server_hello_and_finished = Vec::from(to_send);
 
             l0g::debug!("Sending server hello: {server_hello:02x?}");
 
-            // TODO: Update key schedule.
-
             // TODO: Add the Finished message to this datagram.
 
-            socket
-                .send(&server_hello_and_finished)
-                .await
-                .map_err(|e| Error::Send(e))?;
+            socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
+
+            // TODO: Finished from client
+
+            // TODO: Update key schedule to Master Secret.
+
+            // TODO: Send ACK.
+
+            todo!();
 
             Ok(ServerConnection {
                 socket,
