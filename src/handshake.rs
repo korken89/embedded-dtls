@@ -15,8 +15,8 @@ use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use self::extensions::{
-    ClientSupportedVersions, KeyShareEntry, NamedGroup, OfferedPsks, PskKeyExchangeMode,
-    SelectedPsk, ServerExtensions, ServerSupportedVersion,
+    ClientSupportedVersions, DtlsVersions, KeyShareEntry, NamedGroup, OfferedPsks,
+    PskKeyExchangeMode, SelectedPsk, ServerExtensions, ServerSupportedVersion,
 };
 
 pub mod extensions;
@@ -324,7 +324,10 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
         let extensions_length_allocation = buf.alloc_u16()?;
         let content_start = buf.len();
 
-        ClientExtensions::SupportedVersions(ClientSupportedVersions {}).encode(buf)?;
+        ClientExtensions::SupportedVersions(ClientSupportedVersions {
+            version: DtlsVersions::V1_3,
+        })
+        .encode(buf)?;
 
         ClientExtensions::PskKeyExchangeModes(PskKeyExchangeModes {
             ke_modes: PskKeyExchangeMode::PskDheKe,
@@ -368,6 +371,7 @@ impl defmt::Format for ClientHello {
 #[derive(Debug)]
 pub struct ServerHello {
     legacy_session_id: Vec<u8>,
+    supported_version: DtlsVersions,
     public_key: PublicKey,
     cipher_suite: u16,
     selected_psk_identity: u16,
@@ -376,12 +380,14 @@ pub struct ServerHello {
 impl ServerHello {
     pub fn new(
         legacy_session_id: Vec<u8>,
+        supported_version: DtlsVersions,
         public_key: PublicKey,
         selected_cipher_suite: u16,
         selected_psk_identity: u16,
     ) -> Self {
         Self {
             legacy_session_id,
+            supported_version,
             public_key,
             cipher_suite: selected_cipher_suite,
             selected_psk_identity,
@@ -419,7 +425,10 @@ impl ServerHello {
         let extensions_length_allocation = buf.alloc_u16()?;
         let content_start = buf.len();
 
-        ServerExtensions::SeletedSupportedVersion(ServerSupportedVersion {}).encode(buf)?;
+        ServerExtensions::SeletedSupportedVersion(ServerSupportedVersion {
+            version: self.supported_version,
+        })
+        .encode(buf)?;
 
         ServerExtensions::KeyShare(KeyShareEntry {
             group: NamedGroup::X25519,

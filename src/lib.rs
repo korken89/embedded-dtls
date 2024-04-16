@@ -223,8 +223,8 @@ pub mod client {
     mod parse {
         use crate::{
             buffer::ParseBuffer,
-            handshake::{HandshakeHeader, HandshakeType},
-            record::{ContentType, DTlsPlaintextHeader, RecordPayloadPositions},
+            handshake::{extensions::ParseExtension, HandshakeHeader, HandshakeType},
+            record::{ContentType, DTlsPlaintextHeader, ProtocolVersion, RecordPayloadPositions},
         };
 
         pub fn parse_server_hello(buf: &[u8]) -> Option<(ServerHello, RecordPayloadPositions)> {
@@ -242,16 +242,16 @@ pub mod client {
             None
         }
 
-        pub enum ServerRecord {
-            Handshake(ServerHandshake),
+        pub enum ServerRecord<'a> {
+            Handshake(ServerHandshake<'a>),
             Alert(),
             Heartbeat(),
             Ack(),
             ApplicationData(),
         }
 
-        impl ServerRecord {
-            fn parse(buf: &mut ParseBuffer) -> Option<(Self, RecordPayloadPositions)> {
+        impl<'a> ServerRecord<'a> {
+            fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, RecordPayloadPositions)> {
                 // Parse record.
                 let record_header = DTlsPlaintextHeader::parse(buf)?;
                 let record_payload = buf.pop_slice(record_header.length.into())?;
@@ -279,15 +279,15 @@ pub mod client {
             }
         }
 
-        enum ServerHandshake {
-            ServerHello(ServerHello),
+        enum ServerHandshake<'a> {
+            ServerHello(ServerHello<'a>),
             Finished(),
             KeyUpdate(),
         }
 
-        impl ServerHandshake {
+        impl<'a> ServerHandshake<'a> {
             /// Parse a handshake message.
-            pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+            pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
                 let handshake_header = HandshakeHeader::parse(buf)?;
 
                 if handshake_header.length != handshake_header.fragment_length {
@@ -303,11 +303,11 @@ pub mod client {
                 match handshake_header.msg_type {
                     HandshakeType::ServerHello => {
                         let mut buf = ParseBuffer::new(handshake_payload);
-                        let mut client_hello = ServerHello::parse(&mut buf)?;
+                        let mut server_hello = ServerHello::parse(&mut buf)?;
 
-                        l0g::trace!("Got server hello: {:02x?}", client_hello);
+                        l0g::trace!("Got server hello: {:02x?}", server_hello);
 
-                        Some(Self::ServerHello(client_hello))
+                        Some(Self::ServerHello(server_hello))
                     }
                     HandshakeType::Finished => todo!(),
                     HandshakeType::KeyUpdate => todo!(),
@@ -317,25 +317,35 @@ pub mod client {
         }
 
         #[derive(Debug)]
-        pub struct ServerHello {
-            // pub version: ProtocolVersion,
-            // pub legacy_session_id: Vec<u8>,
-            // pub cipher_suites: Vec<u16>,
-            // pub extensions: ServerExtensions,
-            // pub binders_start: Option<usize>,
+        pub struct ServerHello<'a> {
+            pub version: ProtocolVersion,
+            pub legacy_session_id_echo: &'a [u8],
+            pub cipher_suite: u16,
+            pub extensions: ServerExtensions,
         }
 
-        impl ServerHello {
-            pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
-                todo!()
-
-                // let version = buf.pop_u16_be()?.to_be_bytes();
-                // let _random = buf.pop_slice(32)?;
+        impl<'a> ServerHello<'a> {
+            pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+                let version = buf.pop_u16_be()?.to_be_bytes();
+                let _random = buf.pop_slice(32)?;
 
                 // //     opaque legacy_session_id<0..32>;
                 // //     opaque legacy_cookie<0..2^8-1>;                  // DTLS
-                // let legacy_session_id_len = buf.pop_u8()?;
-                // let legacy_session_id = Vec::from(buf.pop_slice(legacy_session_id_len as usize)?);
+                let legacy_session_id_len = buf.pop_u8()?;
+                let legacy_session_id_echo = buf.pop_slice(legacy_session_id_len as usize)?;
+
+                let cipher_suite = buf.pop_u16_be()?;
+
+                let _legacy_compression_method = buf.pop_u8()?;
+
+                // Extensions
+
+                Some(Self {
+                    version,
+                    legacy_session_id_echo,
+                    cipher_suite,
+                    extensions: todo!(),
+                })
 
                 // let legacy_cookie = buf.pop_u8()?;
                 // if legacy_cookie != 0 {
@@ -379,6 +389,29 @@ pub mod client {
                 // })
             }
         }
+
+        #[derive(Debug, Default)]
+        struct ServerExtensions {
+            // pub psk_key_exchange_modes: Option<PskKeyExchangeModes>,
+            // pub supported_versions: Option<SupportedVersions>,
+            // pub key_share: Option<KeyShare>,
+            // pub pre_shared_key: Option<PreSharedKey>,
+        }
+
+        impl ServerExtensions {
+            pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+                let mut ret = ServerExtensions::default();
+
+                let extensions_length = buf.pop_u16_be()?;
+                let mut extensions = ParseBuffer::new(buf.pop_slice(extensions_length as usize)?);
+
+                while let Some(extension) = ParseExtension::parse(&mut extensions) {
+                    // todo!()
+                }
+
+                todo!()
+            }
+        }
     }
 }
 
@@ -386,7 +419,7 @@ pub mod client {
 pub mod server {
     use crate::{
         buffer::EncodingBuffer,
-        handshake::extensions::Psk,
+        handshake::extensions::{DtlsVersions, Psk},
         key_schedule::KeySchedule,
         record::ServerRecord,
         server_config::{Identity, Key, ServerConfig},
@@ -478,6 +511,7 @@ pub mod server {
             // TODO: We hardcode the selected PSK as the first one for now.
             let server_hello = ServerRecord::server_hello(
                 client_hello.legacy_session_id,
+                DtlsVersions::V1_3,
                 our_public_key,
                 selected_cipher_suite,
                 0,
@@ -591,10 +625,15 @@ pub mod server {
     }
 
     mod parse {
+        use super::ServerKeySchedule;
         use crate::{
             buffer::ParseBuffer,
             handshake::{
-                extensions::{DtlsVersions, ExtensionType, NamedGroup, PskKeyExchangeMode},
+                extensions::{
+                    ClientSupportedVersions, DtlsVersions, ExtensionType, KeyShareEntry,
+                    NamedGroup, OfferedPreSharedKey, ParseExtension, PskKeyExchangeMode,
+                    PskKeyExchangeModes,
+                },
                 HandshakeHeader, HandshakeType,
             },
             record::{
@@ -604,9 +643,6 @@ pub mod server {
             server_config::{Identity, ServerConfig},
         };
         use x25519_dalek::PublicKey;
-        use zeroize::Zeroizing;
-
-        use super::ServerKeySchedule;
 
         pub fn parse_client_hello(buf: &[u8]) -> Option<(ClientHello, RecordPayloadPositions)> {
             let mut buf = ParseBuffer::new(buf);
@@ -623,16 +659,16 @@ pub mod server {
             None
         }
 
-        enum ClientRecord {
-            Handshake(ClientHandshake),
+        enum ClientRecord<'a> {
+            Handshake(ClientHandshake<'a>),
             Alert(),
             Heartbeat(),
             Ack(),
             ApplicationData(),
         }
 
-        impl ClientRecord {
-            fn parse(buf: &mut ParseBuffer) -> Option<(Self, RecordPayloadPositions)> {
+        impl<'a> ClientRecord<'a> {
+            fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, RecordPayloadPositions)> {
                 // Parse record.
                 let record_header = DTlsPlaintextHeader::parse(buf)?;
                 let record_payload = buf.pop_slice(record_header.length.into())?;
@@ -660,15 +696,15 @@ pub mod server {
             }
         }
 
-        enum ClientHandshake {
-            ClientHello(ClientHello),
+        enum ClientHandshake<'a> {
+            ClientHello(ClientHello<'a>),
             Finished(),
             KeyUpdate(),
         }
 
-        impl ClientHandshake {
+        impl<'a> ClientHandshake<'a> {
             /// Parse a handshake message.
-            pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+            pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
                 let handshake_header = HandshakeHeader::parse(buf)?;
 
                 if handshake_header.length != handshake_header.fragment_length {
@@ -684,7 +720,7 @@ pub mod server {
                 match handshake_header.msg_type {
                     HandshakeType::ClientHello => {
                         let mut buf = ParseBuffer::new(handshake_payload);
-                        let mut client_hello = ClientHello::parse(&mut buf)?;
+                        let client_hello = ClientHello::parse(&mut buf)?;
 
                         l0g::trace!("Got client hello: {:02x?}", client_hello);
 
@@ -698,16 +734,16 @@ pub mod server {
         }
 
         #[derive(Debug)]
-        pub struct ClientHello {
+        pub struct ClientHello<'a> {
             pub version: ProtocolVersion,
             pub legacy_session_id: Vec<u8>,
             pub cipher_suites: Vec<u16>,
-            pub extensions: ClientExtensions,
+            pub extensions: ClientExtensions<'a>,
             pub binders_start: Option<usize>,
         }
 
-        impl ClientHello {
-            pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        impl<'a> ClientHello<'a> {
+            pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
                 let version = buf.pop_u16_be()?.to_be_bytes();
                 let _random = buf.pop_slice(32)?;
 
@@ -809,20 +845,20 @@ pub mod server {
                 }
                 l0g::trace!("DTLS version OK: {:?}", supported_versions.version);
 
-                if key_share.named_group != NamedGroup::X25519 && key_share.key.len() == 32 {
+                if key_share.group != NamedGroup::X25519 && key_share.opaque.len() == 32 {
                     l0g::error!(
                     "ClientHello: The keyshare named group is unsupported or wrong key length: {:?}, len = {}",
-                    key_share.named_group,
-                    key_share.key.len()
+                    key_share.group,
+                    key_share.opaque.len()
                 );
                     return Err(());
                 }
-                l0g::trace!("Keyshare is OK: {:?}", key_share.named_group);
+                l0g::trace!("Keyshare is OK: {:?}", key_share.group);
 
                 if psk_key_exchange_modes.ke_modes != PskKeyExchangeMode::PskDheKe {
                     l0g::error!(
                         "ClientHello: The PskKeyExchangeMode is unsupported: {:?}",
-                        key_share.named_group
+                        key_share.group
                     );
                     return Err(());
                 }
@@ -832,7 +868,7 @@ pub mod server {
                 );
 
                 // Find the PSK.
-                let psk_identity = Identity::from(&pre_shared_key.identity);
+                let psk_identity = Identity::from(pre_shared_key.identity);
                 let Some(psk) = server_config.psk.get(&psk_identity) else {
                     l0g::error!("ClientHello: Psk unknown identity: {psk_identity:?}");
                     return Err(());
@@ -851,9 +887,8 @@ pub mod server {
                 }
                 l0g::trace!("Psk binders MATCH");
 
-                let their_public_key = PublicKey::from(
-                    TryInto::<[u8; 32]>::try_into(key_share.key.as_slice()).unwrap(),
-                );
+                let their_public_key =
+                    PublicKey::from(TryInto::<[u8; 32]>::try_into(key_share.opaque).unwrap());
 
                 l0g::trace!("ClientHello VALID");
 
@@ -862,22 +897,22 @@ pub mod server {
         }
 
         #[derive(Debug, Default)]
-        struct ClientExtensions {
+        pub struct ClientExtensions<'a> {
             pub psk_key_exchange_modes: Option<PskKeyExchangeModes>,
-            pub supported_versions: Option<SupportedVersions>,
-            pub key_share: Option<KeyShare>,
-            pub pre_shared_key: Option<PreSharedKey>,
+            pub supported_versions: Option<ClientSupportedVersions>,
+            pub key_share: Option<KeyShareEntry<'a>>,
+            pub pre_shared_key: Option<OfferedPreSharedKey<'a>>,
         }
 
-        impl ClientExtensions {
-            pub fn parse(buf: &mut ParseBuffer) -> Option<(Self, Option<usize>)> {
+        impl<'a> ClientExtensions<'a> {
+            pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, Option<usize>)> {
                 let mut ret = ClientExtensions::default();
                 let mut binders_start = None;
 
                 let extensions_length = buf.pop_u16_be()?;
                 let mut extensions = ParseBuffer::new(buf.pop_slice(extensions_length as usize)?);
 
-                while let Some(extension) = Extension::parse(&mut extensions) {
+                while let Some(extension) = ParseExtension::parse(&mut extensions) {
                     if ret.pre_shared_key.is_some() {
                         l0g::error!("Got more extensions after PreSharedKey!");
                         return None;
@@ -885,7 +920,7 @@ pub mod server {
 
                     match extension.extension_type {
                         ExtensionType::SupportedVersions => {
-                            let Some(v) = SupportedVersions::parse(&mut ParseBuffer::new(
+                            let Some(v) = ClientSupportedVersions::parse(&mut ParseBuffer::new(
                                 extension.extension_data,
                             )) else {
                                 l0g::error!("Failed to parse supported version");
@@ -915,9 +950,9 @@ pub mod server {
                             ret.psk_key_exchange_modes = Some(v);
                         }
                         ExtensionType::KeyShare => {
-                            let Some(v) =
-                                KeyShare::parse(&mut ParseBuffer::new(extension.extension_data))
-                            else {
+                            let Some(v) = KeyShareEntry::parse(&mut ParseBuffer::new(
+                                extension.extension_data,
+                            )) else {
                                 l0g::error!("Failed to parse PskKeyExchange");
                                 return None;
                             };
@@ -930,7 +965,7 @@ pub mod server {
                             ret.key_share = Some(v);
                         }
                         ExtensionType::PreSharedKey => {
-                            let Some((psk, binders_start_pos)) = PreSharedKey::parse(
+                            let Some((psk, binders_start_pos)) = OfferedPreSharedKey::parse(
                                 &mut ParseBuffer::new(extension.extension_data),
                             ) else {
                                 l0g::error!("Failed to parse PreSharedKey");
@@ -953,143 +988,6 @@ pub mod server {
                 }
 
                 Some((ret, binders_start))
-            }
-        }
-
-        struct Extension<'a> {
-            extension_type: ExtensionType,
-            extension_data: &'a [u8],
-        }
-
-        impl<'a> Extension<'a> {
-            pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
-                let extension_type = ExtensionType::try_from(buf.pop_u8()?).ok()?;
-                let data_len = buf.pop_u16_be()?;
-                let extension_data = buf.pop_slice(data_len as usize)?;
-
-                Some(Self {
-                    extension_type,
-                    extension_data,
-                })
-            }
-        }
-
-        #[derive(Debug)]
-        struct SupportedVersions {
-            version: DtlsVersions,
-        }
-
-        impl SupportedVersions {
-            pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
-                let size = buf.pop_u8()?;
-
-                if size != 2 {
-                    // Only one version for now
-                    return None;
-                }
-
-                let version = buf.pop_u16_be()?.try_into().ok()?;
-
-                Some(SupportedVersions { version })
-            }
-        }
-
-        #[derive(Debug)]
-        struct PskKeyExchangeModes {
-            ke_modes: PskKeyExchangeMode,
-        }
-
-        impl PskKeyExchangeModes {
-            pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
-                if buf.pop_u8()? != 1 {
-                    return None;
-                }
-
-                let ke_modes = buf.pop_u8()?.try_into().ok()?;
-
-                Some(PskKeyExchangeModes { ke_modes })
-            }
-        }
-
-        #[derive(Debug)]
-        struct KeyShare {
-            named_group: NamedGroup,
-            key: Zeroizing<Vec<u8>>,
-        }
-
-        impl KeyShare {
-            pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
-                let size = buf.pop_u16_be()?;
-                let named_group = NamedGroup::try_from(buf.pop_u16_be()?).ok()?;
-                let key_length = buf.pop_u16_be()?;
-
-                // TODO: We only support one key for now.
-                // This can be a list of supported keyshares in the future.
-                let expected_size = key_length + 2 + 2;
-                if expected_size != size {
-                    l0g::error!("The keyshare size does not match only one key, expected {size} got {expected_size}");
-                    return None;
-                }
-
-                let key = buf.pop_slice(key_length as usize)?;
-
-                Some(KeyShare {
-                    named_group,
-                    key: Vec::from(key).into(),
-                })
-            }
-        }
-
-        #[derive(Debug)]
-        struct PreSharedKey {
-            identity: Vec<u8>,
-            binder: Vec<u8>,
-            _ticket_age: u32,
-        }
-
-        impl PreSharedKey {
-            pub fn parse<'a>(buf: &mut ParseBuffer<'a>) -> Option<(Self, usize)> {
-                // Identity part
-                let identity_size = buf.pop_u16_be()?;
-                let identity_length = buf.pop_u16_be()?;
-
-                // TODO: For now we only support one identity.
-                let expected_identity_size = identity_length + 4 + 2; // +4 for the ticket, +2 for size
-                if identity_size != expected_identity_size {
-                    l0g::error!(
-                    "Identity size failure, expected {expected_identity_size}, got {identity_size}"
-                );
-
-                    return None;
-                }
-
-                let identity = buf.pop_slice(identity_length as usize)?;
-                let ticket_age = buf.pop_u32_be()?;
-
-                // Binders part
-                let binders_size = buf.pop_u16_be()?;
-                let binders_start_pos = buf.current_pos_ptr();
-                let binder_length = buf.pop_u8()?;
-
-                let expected_binders_size = binder_length as u16 + 1;
-                if binders_size != expected_binders_size {
-                    l0g::error!(
-                    "Binders size failure, expected {expected_binders_size}, got {binders_size}"
-                );
-
-                    return None;
-                }
-
-                let binder = buf.pop_slice(binder_length as usize)?;
-
-                Some((
-                    PreSharedKey {
-                        identity: identity.into(),
-                        binder: binder.into(),
-                        _ticket_age: ticket_age,
-                    },
-                    binders_start_pos,
-                ))
             }
         }
     }

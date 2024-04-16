@@ -16,12 +16,9 @@
 
 use crate::{buffer::EncodingBuffer, handshake::extensions::Psk};
 use digest::{
-    core_api::BlockSizeUser,
-    generic_array::{ArrayLength, GenericArray},
-    Digest, KeyInit, Mac, OutputSizeUser,
+    core_api::BlockSizeUser, generic_array::GenericArray, Digest, KeyInit, Mac, OutputSizeUser,
 };
 use hkdf::{hmac::SimpleHmac, SimpleHkdf};
-use typenum::{Sum, U22};
 
 // /// Define the HDKF for a cipher suite, so it uses the hash function defined in the trait.
 // pub type Hkdf<D> = SimpleHkdf<<D as Digest>::Hash>;

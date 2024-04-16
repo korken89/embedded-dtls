@@ -14,12 +14,12 @@
 //!
 //! All this is defined in RFC 8446 (TLS 1.3) at Page 37.
 
-use crate::buffer::{AllocSliceHandle, EncodingBuffer};
+use crate::buffer::{AllocSliceHandle, EncodingBuffer, ParseBuffer};
 use num_enum::TryFromPrimitive;
 
 /// Version numbers.
 #[repr(u16)]
-#[derive(Clone, Debug, PartialOrd, PartialEq, TryFromPrimitive)]
+#[derive(Copy, Clone, Debug, PartialOrd, PartialEq, TryFromPrimitive)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum DtlsVersions {
     /// DTLS v1.0
@@ -28,6 +28,26 @@ pub enum DtlsVersions {
     V1_2 = 0xfefd,
     /// DTLS v1.3
     V1_3 = 0xfefc,
+}
+
+/// Helper to parse extensions.
+pub struct ParseExtension<'a> {
+    pub extension_type: ExtensionType,
+    pub extension_data: &'a [u8],
+}
+
+impl<'a> ParseExtension<'a> {
+    /// Parse an extension.
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+        let extension_type = ExtensionType::try_from(buf.pop_u8()?).ok()?;
+        let data_len = buf.pop_u16_be()?;
+        let extension_data = buf.pop_slice(data_len as usize)?;
+
+        Some(Self {
+            extension_type,
+            extension_data,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
@@ -142,6 +162,17 @@ impl PskKeyExchangeModes {
 
         Ok(())
     }
+
+    // Parse a `psk_key_exchange_modes` extension.
+    pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        if buf.pop_u8()? != 1 {
+            return None;
+        }
+
+        let ke_modes = buf.pop_u8()?.try_into().ok()?;
+
+        Some(PskKeyExchangeModes { ke_modes })
+    }
 }
 
 /// The `key_share` extension contains the endpoint’s cryptographic parameters.
@@ -162,12 +193,33 @@ impl<'a> KeyShareEntry<'a> {
         buf.push_u16_be(self.opaque.len() as u16)?;
         buf.extend_from_slice(self.opaque)
     }
+
+    /// Parse a keyshare entry.
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+        let size = buf.pop_u16_be()?;
+        let group = NamedGroup::try_from(buf.pop_u16_be()?).ok()?;
+        let key_length = buf.pop_u16_be()?;
+
+        // TODO: We only support one key for now.
+        // This can be a list of supported keyshares in the future.
+        let expected_size = key_length + 2 + 2;
+        if expected_size != size {
+            l0g::error!("The keyshare size does not match only one key, expected {size} got {expected_size}");
+            return None;
+        }
+
+        let key = buf.pop_slice(key_length as usize)?;
+
+        Some(KeyShareEntry { group, opaque: key })
+    }
 }
 
 /// The supported_versions payload.
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct ClientSupportedVersions {}
+pub struct ClientSupportedVersions {
+    pub version: DtlsVersions,
+}
 
 impl ClientSupportedVersions {
     /// Encode a `supported_versions` extension. We only support DTLS 1.3.
@@ -175,20 +227,41 @@ impl ClientSupportedVersions {
         buf.push_u8(2)?;
 
         // DTLS 1.3, RFC 9147, section 5.3
-        buf.push_u16_be(DtlsVersions::V1_3 as u16)
+        buf.push_u16_be(self.version as u16)
+    }
+    pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        let size = buf.pop_u8()?;
+
+        if size != 2 {
+            // Only one version for now
+            return None;
+        }
+
+        let version = buf.pop_u16_be()?.try_into().ok()?;
+
+        Some(ClientSupportedVersions { version })
     }
 }
 
 /// The supported_versions payload, the one selected by the server.
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct ServerSupportedVersion {}
+pub struct ServerSupportedVersion {
+    pub version: DtlsVersions,
+}
 
 impl ServerSupportedVersion {
     /// Encode a `supported_versions` extension. We only support DTLS 1.3.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
         // DTLS 1.3, RFC 8446, section 4.2.1 (pointed to from RFC 9147, section 5.4)
-        buf.push_u16_be(DtlsVersions::V1_3 as u16)
+        buf.push_u16_be(self.version as u16)
+    }
+
+    /// Parse a selected supported version.
+    pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        Some(Self {
+            version: DtlsVersions::try_from(buf.pop_u16_be()?).ok()?,
+        })
     }
 }
 
@@ -225,6 +298,60 @@ impl<'a> OfferedPsks<'a> {
         // Binders length.
         buf.push_u16_be(binders_len as u16)?;
         buf.alloc_slice(binders_len)
+    }
+}
+
+/// An offered pre-shared key that can be parsed.
+#[derive(Debug)]
+pub struct OfferedPreSharedKey<'a> {
+    pub identity: &'a [u8],
+    pub binder: &'a [u8],
+    pub _ticket_age: u32,
+}
+
+impl<'a> OfferedPreSharedKey<'a> {
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, usize)> {
+        // Identity part
+        let identity_size = buf.pop_u16_be()?;
+        let identity_length = buf.pop_u16_be()?;
+
+        // TODO: For now we only support one identity.
+        let expected_identity_size = identity_length + 4 + 2; // +4 for the ticket, +2 for size
+        if identity_size != expected_identity_size {
+            l0g::error!(
+                "Identity size failure, expected {expected_identity_size}, got {identity_size}"
+            );
+
+            return None;
+        }
+
+        let identity = buf.pop_slice(identity_length as usize)?;
+        let ticket_age = buf.pop_u32_be()?;
+
+        // Binders part
+        let binders_size = buf.pop_u16_be()?;
+        let binders_start_pos = buf.current_pos_ptr();
+        let binder_length = buf.pop_u8()?;
+
+        let expected_binders_size = binder_length as u16 + 1;
+        if binders_size != expected_binders_size {
+            l0g::error!(
+                "Binders size failure, expected {expected_binders_size}, got {binders_size}"
+            );
+
+            return None;
+        }
+
+        let binder = buf.pop_slice(binder_length as usize)?;
+
+        Some((
+            OfferedPreSharedKey {
+                identity: identity,
+                binder: binder,
+                _ticket_age: ticket_age,
+            },
+            binders_start_pos,
+        ))
     }
 }
 
@@ -265,6 +392,13 @@ impl SelectedPsk {
     /// Encode the selected pre-shared key.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
         buf.push_u16_be(self.selected_identity)
+    }
+
+    /// Parse a selected pre-shared key identity.
+    pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        Some(Self {
+            selected_identity: buf.pop_u16_be()?,
+        })
     }
 }
 

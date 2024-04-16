@@ -6,7 +6,9 @@ use crate::{
     buffer::{AllocU16Handle, EncodingBuffer, ParseBuffer},
     cipher_suites::TlsCipherSuite,
     client_config::ClientConfig,
-    handshake::{ClientHandshake, ClientHello, ServerHandshake, ServerHello},
+    handshake::{
+        extensions::DtlsVersions, ClientHandshake, ClientHello, ServerHandshake, ServerHello,
+    },
     integers::U48,
     key_schedule::KeySchedule,
 };
@@ -143,12 +145,14 @@ impl ServerRecord {
     /// Create a client hello handshake.
     pub fn server_hello(
         legacy_session_id: Vec<u8>,
+        supported_version: DtlsVersions,
         public_key: PublicKey,
         selected_cipher_suite: u16,
         selected_psk_identity: u16,
     ) -> Self {
         ServerRecord::Handshake(ServerHandshake::ServerHello(ServerHello::new(
             legacy_session_id,
+            supported_version,
             public_key,
             selected_cipher_suite,
             selected_psk_identity,
