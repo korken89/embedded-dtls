@@ -223,7 +223,13 @@ pub mod client {
     mod parse {
         use crate::{
             buffer::ParseBuffer,
-            handshake::{extensions::ParseExtension, HandshakeHeader, HandshakeType},
+            handshake::{
+                extensions::{
+                    ExtensionType, KeyShareEntry, ParseExtension, ParseServerExtensions,
+                    SelectedPsk, ServerSupportedVersion,
+                },
+                HandshakeHeader, HandshakeType,
+            },
             record::{ContentType, DTlsPlaintextHeader, ProtocolVersion, RecordPayloadPositions},
         };
 
@@ -321,16 +327,13 @@ pub mod client {
             pub version: ProtocolVersion,
             pub legacy_session_id_echo: &'a [u8],
             pub cipher_suite: u16,
-            pub extensions: ServerExtensions,
+            pub extensions: ParseServerExtensions<'a>,
         }
 
         impl<'a> ServerHello<'a> {
             pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
                 let version = buf.pop_u16_be()?.to_be_bytes();
                 let _random = buf.pop_slice(32)?;
-
-                // //     opaque legacy_session_id<0..32>;
-                // //     opaque legacy_cookie<0..2^8-1>;                  // DTLS
                 let legacy_session_id_len = buf.pop_u8()?;
                 let legacy_session_id_echo = buf.pop_slice(legacy_session_id_len as usize)?;
 
@@ -339,77 +342,14 @@ pub mod client {
                 let _legacy_compression_method = buf.pop_u8()?;
 
                 // Extensions
+                let extensions = ParseServerExtensions::parse(buf)?;
 
                 Some(Self {
                     version,
                     legacy_session_id_echo,
                     cipher_suite,
-                    extensions: todo!(),
+                    extensions,
                 })
-
-                // let legacy_cookie = buf.pop_u8()?;
-                // if legacy_cookie != 0 {
-                //     l0g::trace!("Legacy cookie is non-zero");
-                //     return None;
-                // }
-
-                // let cipher_suites = {
-                //     let mut v = Vec::new();
-                //     let num_cipher_suites_bytes = buf.pop_u16_be()?;
-
-                //     if num_cipher_suites_bytes % 2 != 0 {
-                //         // Not an even amount of bytes (each cipher suite needs 2 bytes)
-                //         return None;
-                //     }
-
-                //     let num_cipher_suites = num_cipher_suites_bytes / 2;
-
-                //     for _ in 0..num_cipher_suites {
-                //         v.push(buf.pop_u16_be()?);
-                //     }
-
-                //     v
-                // };
-
-                // let legacy_compression_methods_len = buf.pop_u8()?;
-                // let legacy_compression_methods = buf.pop_u8()?;
-                // if legacy_compression_methods_len != 1 || legacy_compression_methods != 0 {
-                //     l0g::trace!("Legacy compression methods is non-zero");
-                //     return None;
-                // }
-
-                // let (extensions, binders_start) = ServerExtensions::parse(buf)?;
-
-                // Some(Self {
-                //     version,
-                //     legacy_session_id,
-                //     cipher_suites,
-                //     extensions,
-                //     binders_start,
-                // })
-            }
-        }
-
-        #[derive(Debug, Default)]
-        struct ServerExtensions {
-            // pub psk_key_exchange_modes: Option<PskKeyExchangeModes>,
-            // pub supported_versions: Option<SupportedVersions>,
-            // pub key_share: Option<KeyShare>,
-            // pub pre_shared_key: Option<PreSharedKey>,
-        }
-
-        impl ServerExtensions {
-            pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
-                let mut ret = ServerExtensions::default();
-
-                let extensions_length = buf.pop_u16_be()?;
-                let mut extensions = ParseBuffer::new(buf.pop_slice(extensions_length as usize)?);
-
-                while let Some(extension) = ParseExtension::parse(&mut extensions) {
-                    // todo!()
-                }
-
-                todo!()
             }
         }
     }

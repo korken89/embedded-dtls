@@ -425,7 +425,7 @@ impl ServerHello {
         let extensions_length_allocation = buf.alloc_u16()?;
         let content_start = buf.len();
 
-        ServerExtensions::SeletedSupportedVersion(ServerSupportedVersion {
+        ServerExtensions::SelectedSupportedVersion(ServerSupportedVersion {
             version: self.supported_version,
         })
         .encode(buf)?;

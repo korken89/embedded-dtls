@@ -114,7 +114,7 @@ impl<'a> ClientExtensions<'a> {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ServerExtensions<'a> {
     KeyShare(KeyShareEntry<'a>),
-    SeletedSupportedVersion(ServerSupportedVersion),
+    SelectedSupportedVersion(ServerSupportedVersion),
     PreSharedKey(SelectedPsk),
 }
 
@@ -128,7 +128,7 @@ impl<'a> ServerExtensions<'a> {
 
         match self {
             ServerExtensions::KeyShare(key_share) => key_share.encode(buf)?,
-            ServerExtensions::SeletedSupportedVersion(versions) => versions.encode(buf)?,
+            ServerExtensions::SelectedSupportedVersion(versions) => versions.encode(buf)?,
             ServerExtensions::PreSharedKey(offered) => offered.encode(buf)?,
         };
 
@@ -142,11 +142,85 @@ impl<'a> ServerExtensions<'a> {
     fn extension_type(&self) -> ExtensionType {
         match self {
             ServerExtensions::KeyShare(_) => ExtensionType::KeyShare,
-            ServerExtensions::SeletedSupportedVersion(_) => ExtensionType::SupportedVersions,
+            ServerExtensions::SelectedSupportedVersion(_) => ExtensionType::SupportedVersions,
             ServerExtensions::PreSharedKey(_) => ExtensionType::PreSharedKey,
         }
     }
 }
+
+/// Helper to parse server extensions.
+#[derive(Debug, Default)]
+pub struct ParseServerExtensions<'a> {
+    pub selected_supported_version: Option<ServerSupportedVersion>,
+    pub key_share: Option<KeyShareEntry<'a>>,
+    pub pre_shared_key: Option<SelectedPsk>,
+}
+
+impl<'a> ParseServerExtensions<'a> {
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+        let mut ret = ParseServerExtensions::default();
+
+        let extensions_length = buf.pop_u16_be()?;
+        let mut extensions = ParseBuffer::new(buf.pop_slice(extensions_length as usize)?);
+
+        while let Some(extension) = ParseExtension::parse(&mut extensions) {
+            match extension.extension_type {
+                ExtensionType::KeyShare => {
+                    let Some(v) =
+                        KeyShareEntry::parse(&mut ParseBuffer::new(extension.extension_data))
+                    else {
+                        l0g::error!("Failed to parse PskKeyExchange");
+                        return None;
+                    };
+
+                    if ret.key_share.is_some() {
+                        l0g::error!("Keyshare extension already parsed!");
+                        return None;
+                    }
+
+                    ret.key_share = Some(v);
+                }
+                ExtensionType::SupportedVersions => {
+                    let Some(v) = ServerSupportedVersion::parse(&mut ParseBuffer::new(
+                        extension.extension_data,
+                    )) else {
+                        l0g::error!("Failed to parse ServerSelectedVersion");
+                        return None;
+                    };
+
+                    if ret.selected_supported_version.is_some() {
+                        l0g::error!("Keyshare extension already parsed!");
+                        return None;
+                    }
+
+                    ret.selected_supported_version = Some(v);
+                }
+                ExtensionType::PreSharedKey => {
+                    let Some(v) =
+                        SelectedPsk::parse(&mut ParseBuffer::new(extension.extension_data))
+                    else {
+                        l0g::error!("Failed to parse SelectedPsk");
+                        return None;
+                    };
+
+                    if ret.pre_shared_key.is_some() {
+                        l0g::error!("Keyshare extension already parsed!");
+                        return None;
+                    }
+
+                    ret.pre_shared_key = Some(v);
+                }
+                _ => {
+                    l0g::error!("Got more extensions than what's supported!");
+                    return None;
+                }
+            }
+        }
+
+        Some(ret)
+    }
+}
+
 /// Pre-Shared Key Exchange Modes.
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
