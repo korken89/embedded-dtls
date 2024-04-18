@@ -253,7 +253,7 @@ impl HandshakeHeader {
 /// ClientHello payload in an Handshake.
 pub struct ClientHello<'a, CipherSuite> {
     random: Random,
-    secret: EphemeralSecret,
+    public_key: PublicKey,
     config: &'a ClientConfig<'a>,
     _c: PhantomData<CipherSuite>,
 }
@@ -269,18 +269,16 @@ impl<'a, CipherSuite> core::fmt::Debug for ClientHello<'a, CipherSuite> {
 }
 
 impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
-    pub fn new<Rng>(config: &'a ClientConfig, rng: &mut Rng) -> Self
+    pub fn new<Rng>(config: &'a ClientConfig, public_key: PublicKey, rng: &mut Rng) -> Self
     where
         Rng: RngCore + CryptoRng,
     {
         let mut random = [0; 32];
         rng.fill_bytes(&mut random);
 
-        let key = EphemeralSecret::random_from_rng(rng);
-
         Self {
             random,
-            secret: key,
+            public_key,
             config,
             _c: PhantomData,
         }
@@ -336,7 +334,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
 
         ClientExtensions::KeyShare(KeyShareEntry {
             group: NamedGroup::X25519,
-            opaque: PublicKey::from(&self.secret).as_bytes(),
+            opaque: self.public_key.as_bytes(),
         })
         .encode(buf)?;
 

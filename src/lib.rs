@@ -154,8 +154,10 @@ pub mod client {
         buffer::EncodingBuffer, cipher_suites::TlsCipherSuite, client_config::ClientConfig,
         key_schedule::KeySchedule, record::ClientRecord, Datagram, Error,
     };
-    use digest::Digest;
+    use chacha20poly1305::KeySizeUser;
+    use digest::{Digest, OutputSizeUser};
     use rand_core::{CryptoRng, RngCore};
+    use x25519_dalek::{EphemeralSecret, PublicKey};
 
     // TODO: How to select between server and client? Typestate, flag or two separate structs?
     /// A DTLS 1.3 connection.
@@ -183,14 +185,23 @@ pub mod client {
         ) -> Result<Self, Error<Socket>>
         where
             Rng: RngCore + CryptoRng,
+            <CipherSuite as TlsCipherSuite>::Hash: std::fmt::Debug,
+            <<CipherSuite as TlsCipherSuite>::Hash as OutputSizeUser>::OutputSize: std::fmt::Debug,
+            <<CipherSuite as TlsCipherSuite>::Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
         {
             let mut ser_buf = EncodingBuffer::new(buf);
             let mut key_schedule = KeySchedule::new();
             let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
 
-            // TODO: In the future, implement support for more than 1 PSK.
+            // Initialize key-schedule for generating binders.
             key_schedule.initialize_early_secret(Some(config.psk.clone()));
-            let hello = ClientRecord::<'_, CipherSuite>::client_hello(config, rng);
+
+            // Generate our ephemeral key for key exchange.
+            let secret_key = EphemeralSecret::random_from_rng(&mut *rng);
+            let our_public_key = PublicKey::from(&secret_key);
+
+            // Send ClientHello.
+            let hello = ClientRecord::<'_, CipherSuite>::client_hello(config, our_public_key, rng);
             let send_buf = hello
                 .encode(&mut ser_buf, &mut key_schedule, &mut transcript_hasher)
                 .map_err(|_| Error::InsufficientSpace)?;
@@ -202,6 +213,7 @@ pub mod client {
             let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
             l0g::trace!("Got datagram!");
 
+            // Pars and validate ServerHello.
             let (server_hello, positions) =
                 parse::parse_server_hello(resp).ok_or(Error::InvalidServerHello)?;
             let to_hash = positions
@@ -209,19 +221,25 @@ pub mod client {
                 .ok_or(Error::InvalidServerHello)?;
             transcript_hasher.update(to_hash);
 
+            // Update key schedule to Handshake Secret using public keys.
             let their_public_key = server_hello
                 .validate(CipherSuite::CODE_POINT)
                 .map_err(|_| Error::InvalidServerHello)?;
+            let shared_secret = secret_key.diffie_hellman(&their_public_key);
+            key_schedule.initialize_handshake_secret(shared_secret.as_bytes());
 
-            // TODO: Update key schedule to Handshake Secret using public keys.
+            let handshake_traffic_secrets = key_schedule
+                .create_handshake_traffic_secrets::<<CipherSuite::Cipher as KeySizeUser>::KeySize, <CipherSuite::Hash as OutputSizeUser>::OutputSize>(&transcript_hasher.clone().finalize());
 
-            todo!();
+            l0g::error!("Handshake traffic secrets: {handshake_traffic_secrets:02x?}");
 
             // TODO: Send finished.
 
             // TODO: Update key schedule to Master Secret using public keys.
 
             // TODO: Wait for server ACK.
+
+            todo!();
 
             Ok(ClientConnection {
                 socket,
@@ -237,8 +255,8 @@ pub mod client {
             buffer::ParseBuffer,
             handshake::{
                 extensions::{
-                    ExtensionType, KeyShareEntry, ParseExtension, ParseServerExtensions,
-                    SelectedPsk, ServerSupportedVersion,
+                    DtlsVersions, ExtensionType, KeyShareEntry, NamedGroup, ParseExtension,
+                    ParseServerExtensions, SelectedPsk, ServerSupportedVersion,
                 },
                 HandshakeHeader, HandshakeType,
             },
@@ -276,7 +294,7 @@ pub mod client {
                 // Parse record.
                 let record_header = DTlsPlaintextHeader::parse(buf)?;
                 let record_payload = buf.pop_slice(record_header.length.into())?;
-                l0g::trace!("Got record: {:#?}", record_header);
+                l0g::trace!("Got record: {:?}", record_header);
 
                 let mut buf = ParseBuffer::new(record_payload);
                 let start = buf.current_pos_ptr();
@@ -319,7 +337,7 @@ pub mod client {
                 let handshake_payload =
                     buf.pop_slice(handshake_header.fragment_length.get() as usize)?;
 
-                l0g::trace!("Got handshake: {:#?}", handshake_header);
+                l0g::trace!("Got handshake: {:?}", handshake_header);
 
                 match handshake_header.msg_type {
                     HandshakeType::ServerHello => {
@@ -367,6 +385,7 @@ pub mod client {
                 })
             }
 
+            /// Validate the server hello.
             pub fn validate(&self, our_cipher_suite: u16) -> Result<PublicKey, ()> {
                 if self.version != LEGACY_DTLS_VERSION {
                     l0g::error!(
@@ -386,7 +405,51 @@ pub mod client {
                     return Err(());
                 }
 
-                todo!()
+                // Are all the expexted extensions there? By this we enforce that the PSK key exchange
+                // is ECDHE.
+                // Verify with RFC8446, section 9.2
+                let (Some(selected_supported_version), Some(key_share), Some(selected_psk)) = (
+                    &self.extensions.selected_supported_version,
+                    &self.extensions.key_share,
+                    &self.extensions.pre_shared_key,
+                ) else {
+                    // TODO: For now we expect these specific extensions.
+                    l0g::error!(
+                        "ServerHello: Not all expected extensions are provided {self:02x?}"
+                    );
+                    return Err(());
+                };
+
+                if selected_supported_version.version != DtlsVersions::V1_3 {
+                    // We only support DTLS 1.3.
+                    l0g::error!("Not DTLS 1.3");
+                    return Err(());
+                }
+                l0g::trace!("DTLS version OK: {:?}", selected_supported_version);
+
+                if key_share.group != NamedGroup::X25519 && key_share.opaque.len() == 32 {
+                    l0g::error!(
+                    "ClientHello: The keyshare named group is unsupported or wrong key length: {:?}, len = {}",
+                    key_share.group,
+                    key_share.opaque.len()
+                );
+                    return Err(());
+                }
+                l0g::trace!("Keyshare is OK: {:?}", key_share.group);
+
+                // TODO: We currently use the assumption that there is one PSK by looking for idx 0.
+                if selected_psk.selected_identity != 0 {
+                    l0g::error!("ServerHello: Unknown selected Psk: {selected_psk:?}");
+                    return Err(());
+                };
+                l0g::trace!("Selected Psk identity OK");
+
+                let their_public_key =
+                    PublicKey::from(TryInto::<[u8; 32]>::try_into(key_share.opaque).unwrap());
+
+                l0g::trace!("ServerHello VALID");
+
+                Ok(their_public_key)
             }
         }
     }
@@ -397,13 +460,14 @@ pub mod server {
     use crate::{
         buffer::EncodingBuffer,
         handshake::extensions::{DtlsVersions, Psk},
-        key_schedule::KeySchedule,
+        key_schedule::{self, KeySchedule},
         record::ServerRecord,
         server_config::{Identity, Key, ServerConfig},
         Datagram, Error,
     };
-    use digest::Digest;
+    use digest::{Digest, OutputSizeUser};
     use sha2::Sha256;
+    use typenum::U32;
     use x25519_dalek::{EphemeralSecret, PublicKey};
 
     // TODO: How to select between server and client? Typestate, flag or two separate structs?
@@ -482,7 +546,6 @@ pub mod server {
             let secret = EphemeralSecret::random();
             let our_public_key = PublicKey::from(&secret);
             let shared_secret = secret.diffie_hellman(&their_public_key);
-            key_schedule.initialize_handshake_secret(shared_secret.as_bytes());
 
             // Send server hello.
             // TODO: We hardcode the selected PSK as the first one for now.
@@ -499,6 +562,12 @@ pub mod server {
                 .encode(&mut enc_buf)
                 .map_err(|_| Error::InsufficientSpace)?;
             transcript_hasher.update(to_hash);
+
+            key_schedule.initialize_handshake_secret(shared_secret.as_bytes());
+            let handshake_traffic_secrets = key_schedule
+                .create_handshake_traffic_secrets(&transcript_hasher.clone().finalize());
+
+            l0g::error!("Handshake traffic secrets: {handshake_traffic_secrets:02x?}");
 
             // TODO: Can we do without this `Vec`? The lifetime of `enc_buf` makes it hard now.
             // let mut server_hello_and_finished = Vec::from(to_send);
@@ -526,26 +595,26 @@ pub mod server {
 
     enum ServerKeySchedule {
         /// All cipher suites which use SHA256 as the hash function will use this key schedule.
-        Sha256(KeySchedule<Sha256>),
+        Keylen32Sha256(KeySchedule<Sha256>),
     }
 
     impl ServerKeySchedule {
         fn is_uninitialized(&self) -> bool {
             match self {
-                ServerKeySchedule::Sha256(v) => v.is_uninitialized(),
+                ServerKeySchedule::Keylen32Sha256(v) => v.is_uninitialized(),
             }
         }
 
         fn new_transcript_hasher(&self) -> TranscriptHasher {
             match self {
-                ServerKeySchedule::Sha256(_) => TranscriptHasher::Sha256(Sha256::default()),
+                ServerKeySchedule::Keylen32Sha256(_) => TranscriptHasher::Sha256(Sha256::default()),
             }
         }
 
         fn try_from_cipher_suite(cipher_suites: u16) -> Option<Self> {
             Some(match cipher_suites {
                 // TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256
-                0xCCAC => ServerKeySchedule::Sha256(KeySchedule::new()),
+                0xCCAC => ServerKeySchedule::Keylen32Sha256(KeySchedule::new()),
                 _ => {
                     l0g::trace!("Detected unsupported cipher suite {cipher_suites:04x}");
                     return None;
@@ -555,18 +624,17 @@ pub mod server {
 
         fn initialize_early_secret(&mut self, psk: Option<(&Identity, &Key)>) {
             match self {
-                ServerKeySchedule::Sha256(key_schedule) => {
-                    key_schedule.initialize_early_secret(psk.map(|p| Psk {
+                ServerKeySchedule::Keylen32Sha256(key_schedule) => key_schedule
+                    .initialize_early_secret(psk.map(|p| Psk {
                         identity: p.0.as_slice(),
                         key: p.1.as_slice(),
-                    }))
-                }
+                    })),
             }
         }
 
         fn create_binders(&self, transcript_hash: &[u8]) -> Vec<u8> {
             match self {
-                ServerKeySchedule::Sha256(key_schedule) => Vec::from(
+                ServerKeySchedule::Keylen32Sha256(key_schedule) => Vec::from(
                     key_schedule
                         .create_binder(transcript_hash)
                         .expect("Unable to generate binder")
@@ -577,11 +645,25 @@ pub mod server {
 
         fn initialize_handshake_secret(&mut self, ecdhe: &[u8]) {
             match self {
-                ServerKeySchedule::Sha256(key_schedule) => {
+                ServerKeySchedule::Keylen32Sha256(key_schedule) => {
                     key_schedule.initialize_handshake_secret(ecdhe);
                 }
             }
         }
+
+        fn create_handshake_traffic_secrets(&mut self, transcript_hash: &[u8]) -> TrafficSecrets {
+            match self {
+                ServerKeySchedule::Keylen32Sha256(key_schedule) => TrafficSecrets::Keylen32Sha256(
+                    key_schedule.create_handshake_traffic_secrets(transcript_hash),
+                ),
+            }
+        }
+    }
+
+    /// Wrapper for traffic keys based on the hasher.
+    #[derive(Debug)]
+    enum TrafficSecrets {
+        Keylen32Sha256(key_schedule::TrafficSecrets<U32, <Sha256 as OutputSizeUser>::OutputSize>),
     }
 
     /// This is used to get the transcript hashes, it stems from the
@@ -652,7 +734,7 @@ pub mod server {
                 // Parse record.
                 let record_header = DTlsPlaintextHeader::parse(buf)?;
                 let record_payload = buf.pop_slice(record_header.length.into())?;
-                l0g::trace!("Got record: {:#?}", record_header);
+                l0g::trace!("Got record: {:?}", record_header);
 
                 let mut buf = ParseBuffer::new(record_payload);
                 let start = buf.current_pos_ptr();
@@ -695,7 +777,7 @@ pub mod server {
                 let handshake_payload =
                     buf.pop_slice(handshake_header.fragment_length.get() as usize)?;
 
-                l0g::trace!("Got handshake: {:#?}", handshake_header);
+                l0g::trace!("Got handshake: {:?}", handshake_header);
 
                 match handshake_header.msg_type {
                     HandshakeType::ClientHello => {

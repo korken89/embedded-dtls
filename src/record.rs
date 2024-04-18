@@ -64,11 +64,17 @@ pub enum ClientRecord<'a, CipherSuite> {
 
 impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
     /// Create a client hello handshake.
-    pub fn client_hello<Rng>(config: &'a ClientConfig<'a>, rng: &mut Rng) -> Self
+    pub fn client_hello<Rng>(
+        config: &'a ClientConfig<'a>,
+        public_key: PublicKey,
+        rng: &mut Rng,
+    ) -> Self
     where
         Rng: RngCore + CryptoRng,
     {
-        ClientRecord::Handshake(ClientHandshake::ClientHello(ClientHello::new(config, rng)))
+        ClientRecord::Handshake(ClientHandshake::ClientHello(ClientHello::new(
+            config, public_key, rng,
+        )))
     }
 
     /// Encode the record into a buffer.
