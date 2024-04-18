@@ -186,7 +186,7 @@ pub mod client {
         where
             Rng: RngCore + CryptoRng,
             <CipherSuite as TlsCipherSuite>::Hash: std::fmt::Debug,
-            <<CipherSuite as TlsCipherSuite>::Hash as OutputSizeUser>::OutputSize: std::fmt::Debug,
+            <CipherSuite as TlsCipherSuite>::CipherIvSize: std::fmt::Debug,
             <<CipherSuite as TlsCipherSuite>::Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
         {
             let mut ser_buf = EncodingBuffer::new(buf);
@@ -229,7 +229,7 @@ pub mod client {
             key_schedule.initialize_handshake_secret(shared_secret.as_bytes());
 
             let handshake_traffic_secrets = key_schedule
-                .create_handshake_traffic_secrets::<<CipherSuite::Cipher as KeySizeUser>::KeySize, <CipherSuite::Hash as OutputSizeUser>::OutputSize>(&transcript_hasher.clone().finalize());
+                .create_handshake_traffic_secrets::<<CipherSuite::Cipher as KeySizeUser>::KeySize, CipherSuite::CipherIvSize>(&transcript_hasher.clone().finalize());
 
             l0g::error!("Handshake traffic secrets: {handshake_traffic_secrets:02x?}");
 
@@ -467,7 +467,7 @@ pub mod server {
     };
     use digest::{Digest, OutputSizeUser};
     use sha2::Sha256;
-    use typenum::U32;
+    use typenum::{U12, U32};
     use x25519_dalek::{EphemeralSecret, PublicKey};
 
     // TODO: How to select between server and client? Typestate, flag or two separate structs?
@@ -594,27 +594,30 @@ pub mod server {
     }
 
     enum ServerKeySchedule {
-        /// All cipher suites which use SHA256 as the hash function will use this key schedule.
-        Keylen32Sha256(KeySchedule<Sha256>),
+        // TODO: Maybe generalize over key length, iv length and hash function?
+        /// Key schedule for the Chacha20Poly1305 cipher suite.
+        Chacha20Poly1305Sha256(KeySchedule<Sha256>),
     }
 
     impl ServerKeySchedule {
         fn is_uninitialized(&self) -> bool {
             match self {
-                ServerKeySchedule::Keylen32Sha256(v) => v.is_uninitialized(),
+                ServerKeySchedule::Chacha20Poly1305Sha256(v) => v.is_uninitialized(),
             }
         }
 
         fn new_transcript_hasher(&self) -> TranscriptHasher {
             match self {
-                ServerKeySchedule::Keylen32Sha256(_) => TranscriptHasher::Sha256(Sha256::default()),
+                ServerKeySchedule::Chacha20Poly1305Sha256(_) => {
+                    TranscriptHasher::Sha256(Sha256::default())
+                }
             }
         }
 
         fn try_from_cipher_suite(cipher_suites: u16) -> Option<Self> {
             Some(match cipher_suites {
                 // TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256
-                0xCCAC => ServerKeySchedule::Keylen32Sha256(KeySchedule::new()),
+                0xCCAC => ServerKeySchedule::Chacha20Poly1305Sha256(KeySchedule::new()),
                 _ => {
                     l0g::trace!("Detected unsupported cipher suite {cipher_suites:04x}");
                     return None;
@@ -624,7 +627,7 @@ pub mod server {
 
         fn initialize_early_secret(&mut self, psk: Option<(&Identity, &Key)>) {
             match self {
-                ServerKeySchedule::Keylen32Sha256(key_schedule) => key_schedule
+                ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => key_schedule
                     .initialize_early_secret(psk.map(|p| Psk {
                         identity: p.0.as_slice(),
                         key: p.1.as_slice(),
@@ -634,7 +637,7 @@ pub mod server {
 
         fn create_binders(&self, transcript_hash: &[u8]) -> Vec<u8> {
             match self {
-                ServerKeySchedule::Keylen32Sha256(key_schedule) => Vec::from(
+                ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => Vec::from(
                     key_schedule
                         .create_binder(transcript_hash)
                         .expect("Unable to generate binder")
@@ -645,7 +648,7 @@ pub mod server {
 
         fn initialize_handshake_secret(&mut self, ecdhe: &[u8]) {
             match self {
-                ServerKeySchedule::Keylen32Sha256(key_schedule) => {
+                ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => {
                     key_schedule.initialize_handshake_secret(ecdhe);
                 }
             }
@@ -653,17 +656,19 @@ pub mod server {
 
         fn create_handshake_traffic_secrets(&mut self, transcript_hash: &[u8]) -> TrafficSecrets {
             match self {
-                ServerKeySchedule::Keylen32Sha256(key_schedule) => TrafficSecrets::Keylen32Sha256(
-                    key_schedule.create_handshake_traffic_secrets(transcript_hash),
-                ),
+                ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => {
+                    TrafficSecrets::Keylen32Ivlen12(
+                        key_schedule.create_handshake_traffic_secrets(transcript_hash),
+                    )
+                }
             }
         }
     }
 
-    /// Wrapper for traffic keys based on the hasher.
+    /// Wrapper for traffic keys based on key length and IV length.
     #[derive(Debug)]
     enum TrafficSecrets {
-        Keylen32Sha256(key_schedule::TrafficSecrets<U32, <Sha256 as OutputSizeUser>::OutputSize>),
+        Keylen32Ivlen12(key_schedule::TrafficSecrets<U32, U12>),
     }
 
     /// This is used to get the transcript hashes, it stems from the

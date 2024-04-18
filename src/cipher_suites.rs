@@ -2,8 +2,11 @@ use chacha20poly1305::{
     aead::{AeadMutInPlace, KeySizeUser},
     ChaCha20Poly1305,
 };
-use digest::{core_api::BlockSizeUser, Digest, FixedOutput, OutputSizeUser, Reset};
+use digest::{
+    core_api::BlockSizeUser, generic_array::ArrayLength, Digest, FixedOutput, OutputSizeUser, Reset,
+};
 use sha2::Sha256;
+use typenum::U12;
 
 /// Represents a TLS 1.3 cipher suite
 #[repr(u16)]
@@ -26,6 +29,9 @@ pub trait TlsCipherSuite {
     /// Cipher to use with this cipher suite.
     type Cipher: AeadMutInPlace + KeySizeUser;
 
+    /// Size of the initialization vector.
+    type CipherIvSize: ArrayLength<u8>;
+
     /// The hash to use with this cipher suite.
     type Hash: Digest + Reset + Clone + OutputSizeUser + BlockSizeUser + FixedOutput;
 }
@@ -38,5 +44,6 @@ impl TlsCipherSuite for TlsEcdhePskWithChacha20Poly1305Sha256 {
     const CODE_POINT: u16 = CipherSuite::TlsEcdhePskWithChacha20Poly1305Sha256 as u16;
 
     type Cipher = ChaCha20Poly1305;
+    type CipherIvSize = U12;
     type Hash = Sha256;
 }

@@ -54,6 +54,21 @@ pub struct TrafficKeyingMaterial<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u
     pub iv: GenericArray<u8, IvSize>,
 }
 
+impl<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>> TrafficKeyingMaterial<KeySize, IvSize> {
+    /// Create the initialization vector given the record sequence number.
+    pub fn create_iv(&self, record_sequence_number: u64) -> GenericArray<u8, IvSize> {
+        // Defined in Section 5.3, RFC8446.
+        let mut iv = self.iv.clone();
+        let seq = record_sequence_number.to_be_bytes();
+
+        for (iv, seq) in iv.iter_mut().zip(seq.iter().copied()) {
+            *iv ^= seq;
+        }
+
+        iv
+    }
+}
+
 /// Initialization vector that will clear the IV on drop.
 #[derive(Zeroize, Debug)]
 pub struct Iv<N: ArrayLength<u8>> {
