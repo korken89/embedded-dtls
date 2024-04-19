@@ -1,3 +1,5 @@
+use std::ops::{DerefMut, Range};
+
 use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::PublicKey;
@@ -7,7 +9,8 @@ use crate::{
     cipher_suites::TlsCipherSuite,
     client_config::ClientConfig,
     handshake::{
-        extensions::DtlsVersions, ClientHandshake, ClientHello, ServerHandshake, ServerHello,
+        extensions::DtlsVersions, ClientHandshake, ClientHello, Finished, ServerHandshake,
+        ServerHello,
     },
     integers::U48,
     key_schedule::KeySchedule,
@@ -55,10 +58,10 @@ impl RecordPayloadPositions {
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ClientRecord<'a, CipherSuite> {
-    Handshake(ClientHandshake<'a, CipherSuite>),
+    Handshake(ClientHandshake<'a, CipherSuite>, Encryption),
     Alert(/* Alert, */ (), Encryption),
-    Heartbeat((), Encryption),
     Ack((), Encryption),
+    Heartbeat(()),
     ApplicationData(/* &'a [u8] */),
 }
 
@@ -72,82 +75,110 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
     where
         Rng: RngCore + CryptoRng,
     {
-        ClientRecord::Handshake(ClientHandshake::ClientHello(ClientHello::new(
-            config, public_key, rng,
-        )))
+        ClientRecord::Handshake(
+            ClientHandshake::ClientHello(ClientHello::new(config, public_key, rng)),
+            Encryption::Disabled,
+        )
     }
 
     /// Encode the record into a buffer.
     pub fn encode<'buf>(
         &self,
         buf: &'buf mut EncodingBuffer,
-        key_schedule: &mut KeySchedule<<CipherSuite as TlsCipherSuite>::Hash>,
+        key_schedule: &mut KeySchedule<
+            <CipherSuite as TlsCipherSuite>::Hash,
+            <CipherSuite as TlsCipherSuite>::Cipher,
+        >,
         transcript_hasher: &mut CipherSuite::Hash,
     ) -> Result<&'buf [u8], ()> {
-        let header = DTlsPlaintextHeader {
-            type_: self.content_type(),
-            epoch: 0,
-            sequence_number: 0.into(),
-            length: 0, // To be encoded later.
-        };
+        if !self.is_encrypted() {
+            let header = DTlsPlaintextHeader {
+                type_: self.content_type(),
+                epoch: 0,
+                sequence_number: 0.into(),
+                length: 0, // To be encoded later.
+            };
 
-        // ------ Start record
+            // ------ Start record
 
-        // Create record header.
-        let length_allocation = header.encode(buf)?;
+            // Create record header.
+            let length_allocation = header.encode(buf)?;
 
-        buf.forward_start();
-        let content_start = buf.len();
+            buf.forward_start();
+            let content_start = buf.len();
 
-        // ------ Encode payload
+            // ------ Encode payload
 
-        match self {
-            // NOTE: Each record encoder needs to update the transcript hash at their end.
-            ClientRecord::Handshake(handshake) => {
-                handshake.encode(buf, key_schedule, transcript_hasher)?;
+            match self {
+                // NOTE: Each record encoder needs to update the transcript hash at their end.
+                ClientRecord::Handshake(handshake, _) => {
+                    handshake.encode(buf, key_schedule, transcript_hasher)?;
+                }
+                ClientRecord::Alert(_, _) => todo!(),
+                ClientRecord::Ack(_, _) => todo!(),
+                ClientRecord::Heartbeat(_) => todo!(),
+                ClientRecord::ApplicationData() => todo!(),
             }
-            ClientRecord::Alert(_, _) => todo!(),
-            ClientRecord::Heartbeat(_, _) => todo!(),
-            ClientRecord::Ack(_, _) => todo!(),
-            ClientRecord::ApplicationData() => todo!(),
+
+            let content_length = (buf.len() - content_start) as u16;
+            length_allocation.set(buf, content_length);
+
+            // ------ Finish record
+            buf.reset_start();
+
+            Ok(&*buf)
+        } else {
+            todo!()
         }
+    }
 
-        let content_length = (buf.len() - content_start) as u16;
-        length_allocation.set(buf, content_length);
-
-        // ------ Finish record
-        buf.reset_start();
-
-        Ok(&*buf)
+    fn is_encrypted(&self) -> bool {
+        match self {
+            ClientRecord::Handshake(_, Encryption::Disabled) => false,
+            ClientRecord::Alert(_, Encryption::Disabled) => false,
+            ClientRecord::Ack(_, Encryption::Disabled) => false,
+            _ => true,
+        }
     }
 
     fn content_type(&self) -> ContentType {
         match self {
-            ClientRecord::Handshake(_) => ContentType::Handshake,
-            ClientRecord::Alert(_, Encryption::Disabled) => ContentType::Alert,
-            ClientRecord::Heartbeat(_, Encryption::Disabled) => ContentType::Heartbeat,
-            ClientRecord::Ack(_, Encryption::Disabled) => ContentType::Ack,
-            // All encrypted communication is marked as `ApplicationData`.
-            ClientRecord::Alert(_, Encryption::Enabled) => ContentType::ApplicationData,
-            ClientRecord::Heartbeat(_, Encryption::Enabled) => ContentType::ApplicationData,
-            ClientRecord::Ack(_, Encryption::Enabled) => ContentType::ApplicationData,
+            ClientRecord::Handshake(_, _) => ContentType::Handshake,
+            ClientRecord::Alert(_, _) => ContentType::Alert,
+            ClientRecord::Ack(_, _) => ContentType::Ack,
+            ClientRecord::Heartbeat(_) => ContentType::Heartbeat,
             ClientRecord::ApplicationData() => ContentType::ApplicationData,
         }
     }
 }
 
+// encryption_function: impl FnOnce(
+//     sequence_number: &mut [u8],
+//     plaintext: &mut [u8],
+//     tag_space: &mut [u8],
+// ),
+
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct EncryptionFunctionArguments<'a> {
+    /// The encoded sequence number.
+    pub sequence_number: &'a mut [u8],
+    /// The location of the plaintext with space for the tag at the end.
+    pub plaintext_with_tag: &'a mut [u8],
+}
+
 /// Supported client records.
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum ServerRecord {
-    Handshake(ServerHandshake),
+pub enum ServerRecord<'a> {
+    Handshake(ServerHandshake<'a>, Encryption),
     Alert(/* Alert, */ (), Encryption),
-    Heartbeat((), Encryption),
     Ack((), Encryption),
+    Heartbeat(()),
     ApplicationData(/* &'a [u8] */),
 }
 
-impl ServerRecord {
+impl<'a> ServerRecord<'a> {
     /// Create a client hello handshake.
     pub fn server_hello(
         legacy_session_id: Vec<u8>,
@@ -156,44 +187,59 @@ impl ServerRecord {
         selected_cipher_suite: u16,
         selected_psk_identity: u16,
     ) -> Self {
-        ServerRecord::Handshake(ServerHandshake::ServerHello(ServerHello::new(
-            legacy_session_id,
-            supported_version,
-            public_key,
-            selected_cipher_suite,
-            selected_psk_identity,
-        )))
+        ServerRecord::Handshake(
+            ServerHandshake::ServerHello(ServerHello::new(
+                legacy_session_id,
+                supported_version,
+                public_key,
+                selected_cipher_suite,
+                selected_psk_identity,
+            )),
+            Encryption::Disabled,
+        )
+    }
+
+    /// Create a server's finished message.
+    pub fn finished(transcript_hash: &'a [u8]) -> Self {
+        ServerRecord::Handshake(
+            ServerHandshake::ServerFinished(Finished {
+                verify: transcript_hash,
+            }),
+            Encryption::Enabled,
+        )
     }
 
     /// Encode the record into a buffer. Returns (packet to send, content to hash).
-    pub fn encode<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<(&'buf [u8]), ()> {
+    pub fn encode<'buf>(
+        &self,
+        buf: &'buf mut EncodingBuffer,
+        encryption_function: impl FnOnce(EncryptionFunctionArguments),
+    ) -> Result<&'buf [u8], ()> {
+        if self.is_encrypted() {
+            self.encode_encrypted(buf, encryption_function)
+        } else {
+            self.encode_unencrypted(buf)
+        }
+    }
+
+    /// Unencrypted path for the encoding.
+    fn encode_unencrypted<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<&'buf [u8], ()> {
         let header = DTlsPlaintextHeader {
             type_: self.content_type(),
-            epoch: 0,
-            sequence_number: 0.into(),
-            length: 0, // To be encoded later.
+            epoch: 0,                  // TODO: Fix
+            sequence_number: 0.into(), // TODO: Fix
+            length: 0,                 // To be encoded later.
         };
-
-        // ------ Start record
-
         // Create record header.
         let length_allocation = header.encode(buf)?;
+
+        // ------ Start record
 
         buf.forward_start();
         let content_start = buf.len();
 
         // ------ Encode payload
-
-        match self {
-            // NOTE: Each record encoder needs to update the transcript hash at their end.
-            ServerRecord::Handshake(handshake) => {
-                handshake.encode(buf)?;
-            }
-            ServerRecord::Alert(_, _) => todo!(),
-            ServerRecord::Heartbeat(_, _) => todo!(),
-            ServerRecord::Ack(_, _) => todo!(),
-            ServerRecord::ApplicationData() => todo!(),
-        }
+        self.encode_content(buf)?;
 
         let content_length = (buf.len() - content_start) as u16;
         length_allocation.set(buf, content_length);
@@ -207,19 +253,159 @@ impl ServerRecord {
         Ok(&r[start..])
     }
 
+    /// Encrypted path for the encoding.
+    fn encode_encrypted<'buf>(
+        &self,
+        buf: &'buf mut EncodingBuffer,
+        encryption_function: impl FnOnce(EncryptionFunctionArguments),
+    ) -> Result<&'buf [u8], ()> {
+        // buf.forward_start();
+        let record_start = buf.len();
+
+        let aead_tag_size = 16;
+
+        let header = DTlsCiphertextHeader {
+            epoch: 0,                                           // TODO: Fix
+            sequence_number: CiphertextSequenceNumber::Long(0), // TODO: Fix
+            length: Some(0),
+            connection_id: None,
+        };
+
+        // Create record header.
+        let (sequence_number_position, length_allocation) = header.encode(buf)?;
+
+        // ------ Start record
+
+        let content_start = buf.len();
+
+        // ------ Encode payload
+        self.encode_content(buf)?;
+
+        // Encode the tail of the DTLSInnerPlaintext.
+        DtlsInnerPlaintext {
+            content: &[],
+            type_: self.content_type(),
+        }
+        .encode(buf, (buf.len() - content_start) as usize, aead_tag_size)?;
+
+        let content_length = buf.len() - content_start;
+
+        // TODO: Pipe AEAD tag size here
+        let aead_tag_allocation = buf.alloc_slice(aead_tag_size)?;
+        let tag_position = aead_tag_allocation.at(buf).unwrap();
+        aead_tag_allocation.fill(buf, 0);
+
+        let ciphertext_length = (buf.len() - content_start) as u16;
+        if let Some(length_allocation) = length_allocation {
+            l0g::debug!("ciphertext length: {ciphertext_length}, {ciphertext_length:02x}, {length_allocation:?}");
+            length_allocation.set(buf, ciphertext_length);
+        }
+
+        // ------ Encrypt payload
+
+        let (sequence_number, plaintext_with_tag) = {
+            let encoded_content: &mut [u8] = &mut *buf;
+            let plaintext_position = content_start..content_start + content_length as usize;
+
+            // Split the buffer into the 2 slices.
+            to_sequence_number_and_plaintext_with_tag(
+                encoded_content,
+                sequence_number_position,
+                plaintext_position,
+                tag_position,
+            )
+        };
+
+        encryption_function(EncryptionFunctionArguments {
+            sequence_number,
+            plaintext_with_tag,
+        });
+
+        // plaintextodo!();
+
+        // ------ Finish record
+        // buf.reset_start();
+
+        Ok(&buf[record_start..])
+    }
+
+    fn encode_content<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<(), ()> {
+        match self {
+            // NOTE: Each record encoder needs to update the transcript hash at their end.
+            ServerRecord::Handshake(handshake, _) => handshake.encode(buf),
+            ServerRecord::Alert(_, _) => todo!(),
+            ServerRecord::Heartbeat(_) => todo!(),
+            ServerRecord::Ack(_, _) => todo!(),
+            ServerRecord::ApplicationData() => todo!(),
+        }
+    }
+
+    fn is_encrypted(&self) -> bool {
+        match self {
+            ServerRecord::Handshake(_, Encryption::Disabled)
+            | ServerRecord::Alert(_, Encryption::Disabled)
+            | ServerRecord::Ack(_, Encryption::Disabled) => false,
+            _ => true,
+        }
+    }
+
     fn content_type(&self) -> ContentType {
         match self {
-            ServerRecord::Handshake(_) => ContentType::Handshake,
-            ServerRecord::Alert(_, Encryption::Disabled) => ContentType::Alert,
-            ServerRecord::Heartbeat(_, Encryption::Disabled) => ContentType::Heartbeat,
-            ServerRecord::Ack(_, Encryption::Disabled) => ContentType::Ack,
-            // All encrypted communication is marked as `ApplicationData`.
-            ServerRecord::Alert(_, Encryption::Enabled) => ContentType::ApplicationData,
-            ServerRecord::Heartbeat(_, Encryption::Enabled) => ContentType::ApplicationData,
-            ServerRecord::Ack(_, Encryption::Enabled) => ContentType::ApplicationData,
+            ServerRecord::Handshake(_, _) => ContentType::Handshake,
+            ServerRecord::Alert(_, _) => ContentType::Alert,
+            ServerRecord::Ack(_, _) => ContentType::Ack,
+            ServerRecord::Heartbeat(_) => ContentType::Heartbeat,
             ServerRecord::ApplicationData() => ContentType::ApplicationData,
         }
     }
+}
+
+fn to_sequence_number_and_plaintext_with_tag(
+    buf: &mut [u8],
+    sequence_number_position: Range<usize>,
+    plaintext_position: Range<usize>,
+    tag_position: Range<usize>,
+) -> (&mut [u8], &mut [u8]) {
+    // l0g::trace!(
+    //         "snp: {sequence_number_position:?}, pp: {plaintext_position:?}, tp: {tag_position:?}, bl: {}", buf.len()
+    // );
+
+    // Enforce the ordering.
+    if !(sequence_number_position.start <= sequence_number_position.end
+        && sequence_number_position.end <= plaintext_position.start
+        && plaintext_position.start <= plaintext_position.end
+        && plaintext_position.end <= tag_position.start
+        && tag_position.start <= tag_position.end
+        && plaintext_position.end == tag_position.start
+        && tag_position.end <= buf.len())
+    {
+        panic!(
+            "The order of data in the encryption is wrong or longer than the buffer they stem from: snp: {sequence_number_position:?}, pp: {plaintext_position:?}, tp: {tag_position:?}, bl: {}", buf.len()
+        );
+    }
+
+    // We want to do this, but we can't due to the borrow checker:
+    // (
+    //     &mut buf[sequence_number_position],
+    //     &mut buf[plaintext_position.start..tag_position.end],
+    // )
+
+    let mut curr_start = 0;
+
+    // Extract sequence number slice.
+    let (_, r) = buf.split_at_mut(sequence_number_position.start);
+    curr_start += sequence_number_position.start;
+
+    let (sequence_number, r) = r.split_at_mut(sequence_number_position.end - curr_start);
+    curr_start += sequence_number_position.end - curr_start;
+
+    // Extract plaintext slice compounded with the tag slice.
+    let (_, r) = r.split_at_mut(plaintext_position.start - curr_start);
+    curr_start += plaintext_position.start - curr_start;
+
+    let (plaintext_with_tag, _) = r.split_at_mut(tag_position.end - curr_start);
+
+    (sequence_number, plaintext_with_tag)
 }
 
 /// Protocol version definition.
@@ -275,6 +461,200 @@ impl DTlsPlaintextHeader {
             length,
         })
     }
+}
+
+/// DTlsCiphertext unified header.
+#[derive(Copy, Clone, Debug, PartialOrd, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DTlsCiphertextHeader<'a> {
+    /// The shortened epoch of this record.
+    pub epoch: u8,
+    /// The shortened sequence number of this record.
+    pub sequence_number: CiphertextSequenceNumber,
+    /// The optional length of this record. If it's not provided then the size is extracted from
+    /// the datagram. If there are many records in a single datagram then the length is required.
+    /// See section 4.2 in RFC9147 for details.
+    pub length: Option<u16>,
+    /// The optional connection ID.
+    pub connection_id: Option<&'a [u8]>,
+}
+
+impl<'a> DTlsCiphertextHeader<'a> {
+    //
+    //  0 1 2 3 4 5 6 7
+    // +-+-+-+-+-+-+-+-+
+    // |0|0|1|C|S|L|E E|
+    // +-+-+-+-+-+-+-+-+
+    // | Connection ID |   Legend:
+    // | (if any,      |
+    // /  length as    /   C   - Connection ID (CID) present
+    // |  negotiated)  |   S   - Sequence number length
+    // +-+-+-+-+-+-+-+-+   L   - Length present
+    // |  8 or 16 bit  |   E   - Epoch
+    // |Sequence Number|
+    // +-+-+-+-+-+-+-+-+
+    // | 16 bit Length |
+    // | (if present)  |
+    // +-+-+-+-+-+-+-+-+
+    //
+    // struct {
+    //     opaque unified_hdr[variable];
+    //     opaque encrypted_record[length];
+    // } DTLSCiphertext;
+
+    /// Encode a DTlsCiphertext unified header, return the allocation for the length field in
+    /// case the length is not `None`.
+    ///
+    /// Follows section 4 in RFC9147.
+    pub fn encode(
+        &self,
+        buf: &mut EncodingBuffer,
+    ) -> Result<(Range<usize>, Option<AllocU16Handle>), ()> {
+        let header = {
+            let epoch = self.epoch & 0b11;
+            let length = match self.length {
+                Some(_) => 1 << 2,
+                None => 0,
+            };
+            let seq_num = match self.sequence_number {
+                CiphertextSequenceNumber::Short(_) => 0,
+                CiphertextSequenceNumber::Long(_) => 1 << 3,
+            };
+            let cid = match self.connection_id {
+                Some(_) => 1 << 4,
+                None => 0,
+            };
+            0b00100000 | epoch | length | seq_num | cid
+        };
+
+        buf.push_u8(header)?;
+
+        if let Some(cid) = self.connection_id {
+            buf.extend_from_slice(cid)?;
+        }
+
+        let sequence_number_start = buf.len();
+        match self.sequence_number {
+            CiphertextSequenceNumber::Short(s) => buf.push_u8(s)?,
+            CiphertextSequenceNumber::Long(l) => buf.push_u16_be(l)?,
+        }
+        let sequence_number_position = sequence_number_start..buf.len();
+
+        if self.length.is_some() {
+            Ok((sequence_number_position, Some(buf.alloc_u16()?)))
+        } else {
+            Ok((sequence_number_position, None))
+        }
+    }
+
+    /// Parse a ciphertext header.
+    pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        let header = buf.pop_u8()?;
+
+        // Check the header bits that this is actually a ciphertext.
+        if header >> 5 != 0b001 {
+            l0g::error!("Not a ciphertext, header = {header:02x}");
+            return None;
+        }
+
+        let epoch = header & 0b11;
+        let connection_id = if (header >> 4) & 1 != 0 {
+            // TODO: No support for CID for now.
+            l0g::error!("Ciphertext specified CID, we don't support that");
+            return None;
+        } else {
+            None
+        };
+        let sequence_number = if (header >> 3) & 1 != 0 {
+            CiphertextSequenceNumber::Long(buf.pop_u16_be()?)
+        } else {
+            CiphertextSequenceNumber::Short(buf.pop_u8()?)
+        };
+        let length = if (header >> 2) & 1 != 0 {
+            Some(buf.pop_u16_be()?)
+        } else {
+            None
+        };
+
+        Some(Self {
+            epoch,
+            sequence_number,
+            length,
+            connection_id,
+        })
+    }
+}
+
+// struct {
+//      opaque content[DTLSPlaintext.length];
+//      ContentType type;
+//      uint8 zeros[length_of_padding];
+// } DTLSInnerPlaintext;
+
+/// The payload within the `encrypted_record` in a DTLSCiphertext.
+pub struct DtlsInnerPlaintext<'a> {
+    pub content: &'a [u8], // Only filled on decode.
+    pub type_: ContentType,
+}
+
+impl<'a> DtlsInnerPlaintext<'a> {
+    /// Encode a DTlsInnerPlaintext.
+    ///
+    /// Follows section 4 in RFC9147.
+    pub fn encode(
+        &self,
+        buf: &mut EncodingBuffer,
+        content_size: usize,
+        aead_tag_size: usize,
+    ) -> Result<(), ()> {
+        buf.push_u8(self.type_ as u8)?;
+
+        // In accordance with Section 4.2.3 in RFC9147 we need that the cipher text, including tag,
+        // to have a minimum of 16 bytes length. Else we must pad the packet. Usually the tag is
+        // large enough to not need any padding.
+        let padding_size = 16usize.saturating_sub(aead_tag_size + self.content.len() + 1);
+        for _ in 0..padding_size {
+            buf.push_u8(0)?;
+        }
+
+        Ok(())
+    }
+
+    /// Parse a DtlsInnerPlaintext.
+    pub fn parse(buf: &mut ParseBuffer<'a>, length: usize) -> Option<Self> {
+        let payload = buf.pop_slice(length)?;
+
+        // Remove padding.
+        let no_padding = Self::remove_trailing_zeros(payload);
+
+        if no_padding.is_empty() {
+            return None;
+        }
+        let (last, content) = no_padding.split_last().unwrap();
+
+        Some(Self {
+            content,
+            type_: ContentType::try_from(*last).ok()?,
+        })
+    }
+
+    fn remove_trailing_zeros(slice: &[u8]) -> &[u8] {
+        if let Some(last_non_zero_pos) = slice.iter().rposition(|&x| x != 0) {
+            &slice[..=last_non_zero_pos]
+        } else {
+            &[]
+        }
+    }
+}
+
+/// The two types of sequence numbers supported by the DTls ciphertext unified header.
+#[derive(Copy, Clone, Debug, PartialOrd, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum CiphertextSequenceNumber {
+    /// Short single byte sequence number.
+    Short(u8),
+    /// Long two byte sequence number.
+    Long(u16),
 }
 
 /// TLS content type. RFC 9147 - Appendix A.1

@@ -12,7 +12,7 @@ use digest::{Digest, OutputSizeUser};
 use extensions::{ClientExtensions, PskKeyExchangeModes};
 use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
-use x25519_dalek::{EphemeralSecret, PublicKey};
+use x25519_dalek::PublicKey;
 
 use self::extensions::{
     ClientSupportedVersions, DtlsVersions, KeyShareEntry, NamedGroup, OfferedPsks,
@@ -28,14 +28,17 @@ pub type Random = [u8; 32];
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ClientHandshake<'a, CipherSuite> {
     ClientHello(ClientHello<'a, CipherSuite>),
-    Finished(Finished<64>), // TODO: 64 should not be hardcoded.
+    ClientFinished(Finished<'a>),
 }
 
 impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
     pub fn encode(
         &self,
         buf: &mut EncodingBuffer,
-        key_schedule: &mut KeySchedule<<CipherSuite as TlsCipherSuite>::Hash>,
+        key_schedule: &mut KeySchedule<
+            <CipherSuite as TlsCipherSuite>::Hash,
+            <CipherSuite as TlsCipherSuite>::Cipher,
+        >,
         transcript_hasher: &mut CipherSuite::Hash,
     ) -> Result<(), ()> {
         // Encode client handshake.
@@ -56,7 +59,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
 
         let binders = match self {
             ClientHandshake::ClientHello(hello) => Some(hello.encode(buf)?),
-            ClientHandshake::Finished(finnished) => {
+            ClientHandshake::ClientFinished(finnished) => {
                 finnished.encode(buf)?;
                 None
             }
@@ -97,18 +100,18 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
     fn handshake_type(&self) -> HandshakeType {
         match self {
             ClientHandshake::ClientHello(_) => HandshakeType::ClientHello,
-            ClientHandshake::Finished(_) => HandshakeType::Finished,
+            ClientHandshake::ClientFinished(_) => HandshakeType::Finished,
         }
     }
 }
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum ServerHandshake {
+pub enum ServerHandshake<'a> {
     ServerHello(ServerHello),
-    Finished(Finished<64>), // TODO: 64 should not be hardcoded.
+    ServerFinished(Finished<'a>), // TODO: 64 should not be hardcoded.
 }
 
-impl ServerHandshake {
+impl<'a> ServerHandshake<'a> {
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
         // Encode client handshake.
         let header = HandshakeHeader {
@@ -128,8 +131,8 @@ impl ServerHandshake {
 
         let binders = match self {
             ServerHandshake::ServerHello(hello) => Some(hello.encode(buf)?),
-            ServerHandshake::Finished(finnished) => {
-                finnished.encode(buf)?;
+            ServerHandshake::ServerFinished(finished) => {
+                finished.encode(buf)?;
                 None
             }
         };
@@ -169,7 +172,7 @@ impl ServerHandshake {
     fn handshake_type(&self) -> HandshakeType {
         match self {
             ServerHandshake::ServerHello(_) => HandshakeType::ServerHello,
-            ServerHandshake::Finished(_) => HandshakeType::Finished,
+            ServerHandshake::ServerFinished(_) => HandshakeType::Finished,
         }
     }
 }
@@ -312,7 +315,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
 
         // Cipher suites, we only support the one selected by the trait.
         buf.push_u16_be(2)?;
-        buf.push_u16_be(CipherSuite::CODE_POINT)?;
+        buf.push_u16_be(CipherSuite::CODE_POINT as u16)?;
 
         // Compression methods, select none.
         buf.push_u8(1)?;
@@ -450,12 +453,11 @@ impl ServerHello {
 /// Finished payload in an Handshake.
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct Finished<const HASH_LEN: usize> {
-    pub verify: [u8; HASH_LEN],
-    // pub hash: Option<[u8; 1]>,
+pub struct Finished<'a> {
+    pub verify: &'a [u8],
 }
 
-impl<const HASH_LEN: usize> Finished<HASH_LEN> {
+impl<'a> Finished<'a> {
     /// Encode a Finished payload in an Handshake.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
         buf.extend_from_slice(&self.verify)

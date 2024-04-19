@@ -100,6 +100,7 @@ mod encoding_buffer {
         fmt,
         ops::{Deref, DerefMut},
     };
+    use std::ops::Range;
 
     /// A buffer handler wrapping a mutable slice.
     pub struct EncodingBuffer<'a> {
@@ -173,6 +174,11 @@ mod encoding_buffer {
         /// Reset start to 0.
         pub fn reset_start(&mut self) {
             self.start = 0;
+        }
+
+        /// Read the start value.
+        pub fn start(&self) -> usize {
+            self.start
         }
 
         /// Push a u16 in big-endian.
@@ -272,6 +278,13 @@ mod encoding_buffer {
             buf.buf[self.index] = val;
             core::mem::forget(self);
         }
+
+        /// The position of the data in the encoding buffer. These indexes are relative to `start`.
+        /// If the index is not in the current buffer (i.e before start) nothing is returned.
+        pub fn at(&self, buf: &EncodingBuffer) -> Option<Range<usize>> {
+            let start = self.index.checked_sub(buf.start)?;
+            Some(start..start + 1)
+        }
     }
 
     impl Drop for AllocU8Handle {
@@ -292,6 +305,13 @@ mod encoding_buffer {
         pub fn set(self, buf: &mut EncodingBuffer, val: u16) {
             buf.buf[self.index..self.index + 2].copy_from_slice(&val.to_be_bytes());
             core::mem::forget(self);
+        }
+
+        /// The position of the data in the encoding buffer. These indexes are relative to `start`.
+        /// If the index is not in the current buffer (i.e before start) nothing is returned.
+        pub fn at(&self, buf: &EncodingBuffer) -> Option<Range<usize>> {
+            let start = self.index.checked_sub(buf.start)?;
+            Some(start..start + 2)
         }
     }
 
@@ -314,6 +334,13 @@ mod encoding_buffer {
             buf.buf[self.index..self.index + 3].copy_from_slice(&val.to_be_bytes());
             core::mem::forget(self);
         }
+
+        /// The position of the data in the encoding buffer. These indexes are relative to `start`.
+        /// If the index is not in the current buffer (i.e before start) nothing is returned.
+        pub fn at(&self, buf: &EncodingBuffer) -> Option<Range<usize>> {
+            let start = self.index.checked_sub(buf.start)?;
+            Some(start..start + 3)
+        }
     }
 
     impl Drop for AllocU24Handle {
@@ -334,6 +361,13 @@ mod encoding_buffer {
         pub fn set(self, buf: &mut EncodingBuffer, val: U48) {
             buf.buf[self.index..self.index + 6].copy_from_slice(&val.to_be_bytes());
             core::mem::forget(self);
+        }
+
+        /// The position of the data in the encoding buffer. These indexes are relative to `start`.
+        /// If the index is not in the current buffer (i.e before start) nothing is returned.
+        pub fn at(&self, buf: &EncodingBuffer) -> Option<Range<usize>> {
+            let start = self.index.checked_sub(buf.start)?;
+            Some(start..start + 6)
         }
     }
 
@@ -366,6 +400,15 @@ mod encoding_buffer {
             core::mem::forget(self);
         }
 
+        /// Fill the slice with the value.
+        pub fn fill(self, buf: &mut EncodingBuffer, val: u8) {
+            buf.buf
+                .get_mut(self.index..self.index + self.len)
+                .unwrap_or(&mut [])
+                .fill(val);
+            core::mem::forget(self);
+        }
+
         /// Get the underlying buffer and manually set it.
         pub fn into_buffer<'a>(self, buf: &'a mut EncodingBuffer) -> &'a mut [u8] {
             let r = buf
@@ -375,6 +418,13 @@ mod encoding_buffer {
             core::mem::forget(self);
 
             r
+        }
+
+        /// The position of the data in the encoding buffer. These indexes are relative to `start`.
+        /// If the index is not in the current buffer (i.e before start) nothing is returned.
+        pub fn at(&self, buf: &EncodingBuffer) -> Option<Range<usize>> {
+            let start = self.index.checked_sub(buf.start)?;
+            Some(start..start + self.len)
         }
     }
 

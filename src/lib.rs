@@ -154,8 +154,8 @@ pub mod client {
         buffer::EncodingBuffer, cipher_suites::TlsCipherSuite, client_config::ClientConfig,
         key_schedule::KeySchedule, record::ClientRecord, Datagram, Error,
     };
-    use chacha20poly1305::KeySizeUser;
-    use digest::{Digest, OutputSizeUser};
+    use chacha20poly1305::{AeadCore, KeySizeUser};
+    use digest::Digest;
     use rand_core::{CryptoRng, RngCore};
     use x25519_dalek::{EphemeralSecret, PublicKey};
 
@@ -165,7 +165,10 @@ pub mod client {
         /// Sender/receiver of data.
         socket: Socket,
         /// TODO: Keys for client->server and server->client. Also called "key schedule".
-        key_schedule: KeySchedule<<CipherSuite as TlsCipherSuite>::Hash>,
+        key_schedule: KeySchedule<
+            <CipherSuite as TlsCipherSuite>::Hash,
+            <CipherSuite as TlsCipherSuite>::Cipher,
+        >,
     }
 
     impl<Socket, CipherSuite> ClientConnection<Socket, CipherSuite>
@@ -186,7 +189,7 @@ pub mod client {
         where
             Rng: RngCore + CryptoRng,
             <CipherSuite as TlsCipherSuite>::Hash: std::fmt::Debug,
-            <CipherSuite as TlsCipherSuite>::CipherIvSize: std::fmt::Debug,
+            <<CipherSuite as TlsCipherSuite>::Cipher as AeadCore>::NonceSize: std::fmt::Debug,
             <<CipherSuite as TlsCipherSuite>::Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
         {
             let mut ser_buf = EncodingBuffer::new(buf);
@@ -226,12 +229,17 @@ pub mod client {
                 .validate(CipherSuite::CODE_POINT)
                 .map_err(|_| Error::InvalidServerHello)?;
             let shared_secret = secret_key.diffie_hellman(&their_public_key);
-            key_schedule.initialize_handshake_secret(shared_secret.as_bytes());
+            key_schedule.initialize_handshake_secret(
+                shared_secret.as_bytes(),
+                &transcript_hasher.clone().finalize(),
+            );
 
-            let handshake_traffic_secrets = key_schedule
-                .create_handshake_traffic_secrets::<<CipherSuite::Cipher as KeySizeUser>::KeySize, CipherSuite::CipherIvSize>(&transcript_hasher.clone().finalize());
+            // let handshake_traffic_secrets = key_schedule
+            //     .create_handshake_traffic_secrets::<CipherSuite::Cipher>(
+            //         &transcript_hasher.clone().finalize(),
+            //     );
 
-            l0g::error!("Handshake traffic secrets: {handshake_traffic_secrets:02x?}");
+            // l0g::error!("Client handshake traffic secrets: {handshake_traffic_secrets:02x?}");
 
             // TODO: Send finished.
 
@@ -253,11 +261,9 @@ pub mod client {
 
         use crate::{
             buffer::ParseBuffer,
+            cipher_suites::CipherSuite,
             handshake::{
-                extensions::{
-                    DtlsVersions, ExtensionType, KeyShareEntry, NamedGroup, ParseExtension,
-                    ParseServerExtensions, SelectedPsk, ServerSupportedVersion,
-                },
+                extensions::{DtlsVersions, NamedGroup, ParseServerExtensions},
                 HandshakeHeader, HandshakeType,
             },
             record::{
@@ -386,7 +392,7 @@ pub mod client {
             }
 
             /// Validate the server hello.
-            pub fn validate(&self, our_cipher_suite: u16) -> Result<PublicKey, ()> {
+            pub fn validate(&self, our_cipher_suite: CipherSuite) -> Result<PublicKey, ()> {
                 if self.version != LEGACY_DTLS_VERSION {
                     l0g::error!(
                         "ServerHello version is not legacy DTLS version: {:02x?}",
@@ -400,7 +406,7 @@ pub mod client {
                     return Err(());
                 }
 
-                if self.cipher_suite != our_cipher_suite {
+                if self.cipher_suite != our_cipher_suite as u16 {
                     l0g::error!("ServerHello cipher suite mismatch");
                     return Err(());
                 }
@@ -465,9 +471,9 @@ pub mod server {
         server_config::{Identity, Key, ServerConfig},
         Datagram, Error,
     };
-    use digest::{Digest, OutputSizeUser};
+    use chacha20poly1305::ChaCha20Poly1305;
+    use digest::Digest;
     use sha2::Sha256;
-    use typenum::{U12, U32};
     use x25519_dalek::{EphemeralSecret, PublicKey};
 
     // TODO: How to select between server and client? Typestate, flag or two separate structs?
@@ -559,22 +565,29 @@ pub mod server {
 
             let mut enc_buf = EncodingBuffer::new(buf);
             let to_hash = server_hello
-                .encode(&mut enc_buf)
+                .encode(&mut enc_buf, |_| unreachable!())
                 .map_err(|_| Error::InsufficientSpace)?;
             transcript_hasher.update(to_hash);
 
-            key_schedule.initialize_handshake_secret(shared_secret.as_bytes());
-            let handshake_traffic_secrets = key_schedule
-                .create_handshake_traffic_secrets(&transcript_hasher.clone().finalize());
+            key_schedule.initialize_handshake_secret(
+                shared_secret.as_bytes(),
+                &transcript_hasher.clone().finalize(),
+            );
 
-            l0g::error!("Handshake traffic secrets: {handshake_traffic_secrets:02x?}");
-
-            // TODO: Can we do without this `Vec`? The lifetime of `enc_buf` makes it hard now.
-            // let mut server_hello_and_finished = Vec::from(to_send);
+            // l0g::error!("Server handshake traffic secrets: {handshake_traffic_secrets:02x?}");
 
             l0g::debug!("Sending server hello: {server_hello:02x?}");
 
             // TODO: Add the Finished message to this datagram.
+
+            let transcript = transcript_hasher.clone().finalize();
+            let server_finished = ServerRecord::finished(&transcript);
+
+            l0g::debug!("Sending server finished: {server_finished:02x?}");
+
+            server_finished
+                .encode(&mut enc_buf, |_| todo!())
+                .map_err(|_| Error::InsufficientSpace)?;
 
             socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
 
@@ -594,9 +607,8 @@ pub mod server {
     }
 
     enum ServerKeySchedule {
-        // TODO: Maybe generalize over key length, iv length and hash function?
         /// Key schedule for the Chacha20Poly1305 cipher suite.
-        Chacha20Poly1305Sha256(KeySchedule<Sha256>),
+        Chacha20Poly1305Sha256(KeySchedule<Sha256, ChaCha20Poly1305>),
     }
 
     impl ServerKeySchedule {
@@ -646,29 +658,13 @@ pub mod server {
             }
         }
 
-        fn initialize_handshake_secret(&mut self, ecdhe: &[u8]) {
+        fn initialize_handshake_secret(&mut self, ecdhe: &[u8], transcript: &[u8]) {
             match self {
                 ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => {
-                    key_schedule.initialize_handshake_secret(ecdhe);
+                    key_schedule.initialize_handshake_secret(ecdhe, transcript);
                 }
             }
         }
-
-        fn create_handshake_traffic_secrets(&mut self, transcript_hash: &[u8]) -> TrafficSecrets {
-            match self {
-                ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => {
-                    TrafficSecrets::Keylen32Ivlen12(
-                        key_schedule.create_handshake_traffic_secrets(transcript_hash),
-                    )
-                }
-            }
-        }
-    }
-
-    /// Wrapper for traffic keys based on key length and IV length.
-    #[derive(Debug)]
-    enum TrafficSecrets {
-        Keylen32Ivlen12(key_schedule::TrafficSecrets<U32, U12>),
     }
 
     /// This is used to get the transcript hashes, it stems from the

@@ -15,6 +15,7 @@
 //                        Transcript-Hash(Messages), Hash.length)
 
 use crate::{buffer::EncodingBuffer, handshake::extensions::Psk};
+use chacha20poly1305::{AeadCore, KeySizeUser};
 use digest::{
     core_api::BlockSizeUser,
     generic_array::{ArrayLength, GenericArray},
@@ -23,42 +24,63 @@ use digest::{
 use hkdf::{hmac::SimpleHmac, SimpleHkdf};
 use zeroize::Zeroize;
 
-type HashArray<D> = GenericArray<u8, <D as OutputSizeUser>::OutputSize>;
+type HashArray<Hash> = GenericArray<u8, <Hash as OutputSizeUser>::OutputSize>;
 
-struct EarlySecret<D: Digest + OutputSizeUser + BlockSizeUser + Clone> {
+struct EarlySecret<Hash: Digest + OutputSizeUser + BlockSizeUser + Clone> {
     // TODO: This is not used as the `secret` is stored in the hkdf. One could instead store the
     // `secret` and create the HDKF from `SimpleHkdf::<D>::from_prk(secret)`. Not sure what makes
     // most sense. The use will show what we need.
     // /// Extract secret.
     // secret: HashArray<D>,
     /// Binder key.
-    binder_key: HashArray<D>,
+    binder_key: HashArray<Hash>,
     /// HKDF to derive secrets from.
-    hkdf: SimpleHkdf<D>,
+    hkdf: SimpleHkdf<Hash>,
 }
 
 /// A pair of traffic secrets.
-#[derive(Zeroize, Debug)]
-pub struct TrafficSecrets<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>> {
+#[derive(Zeroize)]
+pub struct TrafficSecrets<Cipher>
+where
+    Cipher: AeadCore + KeySizeUser,
+{
     /// Client traffic keying material.
-    pub client: TrafficKeyingMaterial<KeySize, IvSize>,
+    pub client:
+        TrafficKeyingMaterial<<Cipher as KeySizeUser>::KeySize, <Cipher as AeadCore>::NonceSize>,
     /// Server traffic keying material.
-    pub server: TrafficKeyingMaterial<KeySize, IvSize>,
+    pub server:
+        TrafficKeyingMaterial<<Cipher as KeySizeUser>::KeySize, <Cipher as AeadCore>::NonceSize>,
+}
+
+impl<Cipher> core::fmt::Debug for TrafficSecrets<Cipher>
+where
+    Cipher: AeadCore + KeySizeUser,
+    <Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
+    <Cipher as AeadCore>::NonceSize: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "TrafficSecrets {{ client: {:02x?}, server: {:02x?} }}",
+            self.client, self.server
+        )
+    }
 }
 
 /// A single direction keying material. Holds the symmetric encryption key and the initialization
 /// vector.
 #[derive(Zeroize, Debug)]
 pub struct TrafficKeyingMaterial<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>> {
-    pub key: GenericArray<u8, KeySize>,
-    pub iv: GenericArray<u8, IvSize>,
+    pub write_key: GenericArray<u8, KeySize>,
+    pub write_iv: GenericArray<u8, IvSize>,
+    pub sn_key: GenericArray<u8, KeySize>,
 }
 
 impl<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>> TrafficKeyingMaterial<KeySize, IvSize> {
     /// Create the initialization vector given the record sequence number.
     pub fn create_iv(&self, record_sequence_number: u64) -> GenericArray<u8, IvSize> {
         // Defined in Section 5.3, RFC8446.
-        let mut iv = self.iv.clone();
+        let mut iv = self.write_iv.clone();
         let seq = record_sequence_number.to_be_bytes();
 
         for (iv, seq) in iv.iter_mut().zip(seq.iter().copied()) {
@@ -75,27 +97,31 @@ pub struct Iv<N: ArrayLength<u8>> {
     key: GenericArray<u8, N>,
 }
 
-struct Secret<D: Digest + OutputSizeUser + BlockSizeUser + Clone> {
+struct Secret<Hash: Digest + OutputSizeUser + BlockSizeUser + Clone, Cipher: AeadCore + KeySizeUser>
+{
     // TODO: This is not used as the `secret` is stored in the hkdf.
     // /// Extract secret.
     // secret: HashArray<D>,
     /// HKDF to derive secrets from.
-    hkdf: SimpleHkdf<D>,
-    // /// Client handshake traffic secret.
-    // client_handshake_traffic_secret: Key<D>,
+    hkdf: SimpleHkdf<Hash>,
+    /// Traffic secret.
+    traffic_secrets: TrafficSecrets<Cipher>,
     // /// Server handshake traffic secret.
     // server_handshake_traffic_secret: Key<D>,
 }
 
-enum KeyScheduleState<D: Digest + OutputSizeUser + BlockSizeUser + Clone> {
+enum KeyScheduleState<
+    Hash: Digest + OutputSizeUser + BlockSizeUser + Clone,
+    Cipher: AeadCore + KeySizeUser,
+> {
     /// Not initialized.
     Uninitialized,
     /// Optional PSK initialization is done.
-    EarlySecret(EarlySecret<D>),
+    EarlySecret(EarlySecret<Hash>),
     /// Handshake secret is created.
-    HandshakeSecret(Secret<D>),
+    HandshakeSecret(Secret<Hash, Cipher>),
     /// Master secret is created.
-    MasterSecret(Secret<D>),
+    MasterSecret(Secret<Hash, Cipher>),
 }
 
 /// This tracks the state of the shared secrets.
@@ -103,15 +129,19 @@ enum KeyScheduleState<D: Digest + OutputSizeUser + BlockSizeUser + Clone> {
 // Check the flow-chart in RFC8446 section 7.1, page 93 to see the entire flow.
 // This means that the HKDF needs to be tracked as continous state for the entire lifetime of the
 // connection.
-pub struct KeySchedule<D: Digest + OutputSizeUser + BlockSizeUser + Clone> {
-    keyschedule_state: KeyScheduleState<D>,
+pub struct KeySchedule<
+    Hash: Digest + OutputSizeUser + BlockSizeUser + Clone,
+    Cipher: AeadCore + KeySizeUser,
+> {
+    keyschedule_state: KeyScheduleState<Hash, Cipher>,
     // server_state: ServerKeySchedule<D>,
     // client_state: ClientKeySchedule<D>,
 }
 
-impl<D> KeySchedule<D>
+impl<Hash, Cipher> KeySchedule<Hash, Cipher>
 where
-    D: Digest + OutputSizeUser + BlockSizeUser + Clone,
+    Hash: Digest + OutputSizeUser + BlockSizeUser + Clone,
+    Cipher: AeadCore + KeySizeUser,
 {
     /// Create a new key schedule.
     pub fn new() -> Self {
@@ -129,7 +159,7 @@ where
     }
 
     /// Derive a secret for the current state in the key schedule.
-    pub fn derive_secret(&self, label: HkdfLabelContext) -> HashArray<D> {
+    fn derive_secret(&self, label: HkdfLabelContext) -> HashArray<Hash> {
         let hkdf = match &self.keyschedule_state {
             KeyScheduleState::Uninitialized => unreachable!("Internal error! `derive_secret` was called before the key schedule was initialized"),
             KeyScheduleState::EarlySecret(secret) =>  &secret.hkdf,
@@ -137,14 +167,14 @@ where
             KeyScheduleState::MasterSecret(secret) => &secret.hkdf,
         };
 
-        let mut secret = HashArray::<D>::default();
-        hkdf_make_expanded_label::<D>(hkdf, label, &mut secret);
+        let mut secret = HashArray::<Hash>::default();
+        hkdf_make_expanded_label::<Hash>(hkdf, label, &mut secret);
         secret
     }
 
     /// Calculate a binder. The hash must be the same size as the output for the hash function.
-    pub fn create_binder(&self, transcript_hash: &[u8]) -> Option<HashArray<D>> {
-        if transcript_hash.len() != <D as Digest>::output_size() {
+    pub fn create_binder(&self, transcript_hash: &[u8]) -> Option<HashArray<Hash>> {
+        if transcript_hash.len() != <Hash as Digest>::output_size() {
             return None;
         }
 
@@ -155,9 +185,9 @@ where
             }
         };
 
-        let binder_hkdf = SimpleHkdf::<D>::from_prk(&secret.binder_key).unwrap();
-        let mut binder_key = HashArray::<D>::default();
-        hkdf_make_expanded_label::<D>(
+        let binder_hkdf = SimpleHkdf::<Hash>::from_prk(&secret.binder_key).unwrap();
+        let mut binder_key = HashArray::<Hash>::default();
+        hkdf_make_expanded_label::<Hash>(
             &binder_hkdf,
             HkdfLabelContext {
                 label: b"finished",
@@ -166,7 +196,7 @@ where
             &mut binder_key,
         );
 
-        let mut hmac = <SimpleHmac<D> as KeyInit>::new_from_slice(&binder_key).unwrap();
+        let mut hmac = <SimpleHmac<Hash> as KeyInit>::new_from_slice(&binder_key).unwrap();
         Mac::update(&mut hmac, &transcript_hash);
 
         Some(hmac.finalize().into_bytes())
@@ -175,7 +205,7 @@ where
     /// Move to the next step in the secrets.
     ///
     /// Note that the next state needs to be initialized with new input key material.
-    fn derived(&mut self) -> HashArray<D> {
+    fn derived(&self) -> HashArray<Hash> {
         self.derive_secret(HkdfLabelContext {
             label: b"derived",
             context: &[],
@@ -192,16 +222,16 @@ where
         }
 
         // When there is no PSK, input 0s as IKM.
-        let no_psk_ikm = HashArray::<D>::default();
-        let (_secret, hkdf) = SimpleHkdf::<D>::extract(
-            Some(&HashArray::<D>::default()),
+        let no_psk_ikm = HashArray::<Hash>::default();
+        let (_secret, hkdf) = SimpleHkdf::<Hash>::extract(
+            Some(&HashArray::<Hash>::default()),
             psk.map(|psk| psk.key).unwrap_or(&no_psk_ikm),
         );
 
         // binder_key derivation, not using `derive_secret` due to the `keyschedule_state` being
         // wrong here. We update it below.
-        let mut binder_key = HashArray::<D>::default();
-        hkdf_make_expanded_label::<D>(
+        let mut binder_key = HashArray::<Hash>::default();
+        hkdf_make_expanded_label::<Hash>(
             &hkdf,
             HkdfLabelContext {
                 label: b"ext binder",
@@ -214,7 +244,8 @@ where
     }
 
     /// Initialize the handshake secret using the (EC)DHE shared secret as input key material.
-    pub fn initialize_handshake_secret(&mut self, ecdhe_secret: &[u8]) {
+    /// The transcript hash is over the ClientHello and ServerHello.
+    pub fn initialize_handshake_secret(&mut self, ecdhe_secret: &[u8], transcript: &[u8]) {
         match self.keyschedule_state {
             KeyScheduleState::EarlySecret(_) => {}
             _ => unreachable!(
@@ -223,29 +254,25 @@ where
         }
 
         // Prepare the previous secret for use in the next stage.
-        let (_secret, hkdf) = SimpleHkdf::<D>::extract(Some(&self.derived()), ecdhe_secret);
+        let (_secret, hkdf) = SimpleHkdf::<Hash>::extract(Some(&self.derived()), ecdhe_secret);
 
-        // TODO: Create handshake traffic secrets
+        let traffic_secrets = Self::create_handshake_traffic_secrets(&hkdf, transcript);
 
-        self.keyschedule_state = KeyScheduleState::HandshakeSecret(Secret { hkdf });
+        self.keyschedule_state = KeyScheduleState::HandshakeSecret(Secret {
+            hkdf,
+            traffic_secrets,
+        });
     }
 
     /// Get the handshake traffic secrets.
     /// The transcript hash is over the ClientHello and ServerHello.
-    pub fn create_handshake_traffic_secrets<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>>(
-        &self,
+    fn create_handshake_traffic_secrets(
+        hkdf: &SimpleHkdf<Hash>,
         transcript_hash: &[u8],
-    ) -> TrafficSecrets<KeySize, IvSize> {
-        let hkdf = match &self.keyschedule_state {
-            KeyScheduleState::HandshakeSecret(h) => &h.hkdf,
-            _ => unreachable!(
-                "Internal error! Not in early secret stage, cannot initialize handshake secret"
-            ),
-        };
-
+    ) -> TrafficSecrets<Cipher> {
         // This follows Section 7.3. Traffic Key Calculation in RFC8446.
-        let mut client = HashArray::<D>::default();
-        hkdf_make_expanded_label::<D>(
+        let mut client = HashArray::<Hash>::default();
+        hkdf_make_expanded_label::<Hash>(
             hkdf,
             HkdfLabelContext {
                 label: b"c hs traffic",
@@ -254,8 +281,8 @@ where
             &mut client,
         );
 
-        let mut server = HashArray::<D>::default();
-        hkdf_make_expanded_label::<D>(
+        let mut server = HashArray::<Hash>::default();
+        hkdf_make_expanded_label::<Hash>(
             hkdf,
             HkdfLabelContext {
                 label: b"s hs traffic",
@@ -264,38 +291,12 @@ where
             &mut server,
         );
 
+        // TODO: Create sn_key for record number encryption (section 4.2.3, RFC9147)
+
         TrafficSecrets {
             client: Self::create_traffic_keying_material(&client),
             server: Self::create_traffic_keying_material(&server),
         }
-    }
-
-    fn create_traffic_keying_material<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>>(
-        secret: &HashArray<D>,
-    ) -> TrafficKeyingMaterial<KeySize, IvSize> {
-        let hkdf = SimpleHkdf::from_prk(&secret).unwrap();
-
-        let mut key = GenericArray::default();
-        hkdf_make_expanded_label::<D>(
-            &hkdf,
-            HkdfLabelContext {
-                label: b"key",
-                context: &[],
-            },
-            &mut key,
-        );
-
-        let mut iv = GenericArray::default();
-        hkdf_make_expanded_label::<D>(
-            &hkdf,
-            HkdfLabelContext {
-                label: b"iv",
-                context: &[],
-            },
-            &mut iv,
-        );
-
-        TrafficKeyingMaterial { key, iv }
     }
 
     /// Initialize the master secret.
@@ -308,24 +309,72 @@ where
         }
 
         // Prepare the previous secret for use in the next stage.
-        let (_secret, hkdf) = SimpleHkdf::<D>::extract(
+        let (_secret, hkdf) = SimpleHkdf::<Hash>::extract(
             Some(&self.derived()),
-            &HashArray::<D>::default(), // The input key material is the "0" string
+            &HashArray::<Hash>::default(), // The input key material is the "0" string
         );
-        self.keyschedule_state = KeyScheduleState::MasterSecret(Secret { hkdf });
+        let traffic_secrets = todo!();
+        self.keyschedule_state = KeyScheduleState::MasterSecret(Secret {
+            hkdf,
+            traffic_secrets,
+        });
 
         // TODO: Create application traffic secrets
+
+        // TODO: Create sn_key for record number encryption (section 4.2.3, RFC9147)
+    }
+
+    fn create_traffic_keying_material<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>>(
+        secret: &HashArray<Hash>,
+    ) -> TrafficKeyingMaterial<KeySize, IvSize> {
+        let hkdf = SimpleHkdf::from_prk(&secret).unwrap();
+
+        let mut write_key = GenericArray::default();
+        hkdf_make_expanded_label::<Hash>(
+            &hkdf,
+            HkdfLabelContext {
+                label: b"key",
+                context: &[],
+            },
+            &mut write_key,
+        );
+
+        let mut write_iv = GenericArray::default();
+        hkdf_make_expanded_label::<Hash>(
+            &hkdf,
+            HkdfLabelContext {
+                label: b"iv",
+                context: &[],
+            },
+            &mut write_iv,
+        );
+
+        let mut sn_key = GenericArray::default();
+        hkdf_make_expanded_label::<Hash>(
+            &hkdf,
+            HkdfLabelContext {
+                label: b"sn",
+                context: &[],
+            },
+            &mut sn_key,
+        );
+
+        TrafficKeyingMaterial {
+            write_key,
+            write_iv,
+            sn_key,
+        }
     }
 }
 
-pub struct HkdfLabelContext<'a, 'b> {
+struct HkdfLabelContext<'a, 'b> {
     label: &'a [u8],
     context: &'b [u8],
 }
 
-fn hkdf_make_expanded_label<D>(hkdf: &SimpleHkdf<D>, label: HkdfLabelContext, okm: &mut [u8])
+fn hkdf_make_expanded_label<Hash>(hkdf: &SimpleHkdf<Hash>, label: HkdfLabelContext, okm: &mut [u8])
 where
-    D: Digest + BlockSizeUser + Clone,
+    Hash: Digest + BlockSizeUser + Clone,
 {
     // Max length of a label is:
     // - length: 2
