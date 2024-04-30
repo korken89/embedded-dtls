@@ -20,6 +20,11 @@ mod parse_buffer {
             Self { data }
         }
 
+        /// Check if the parse buffer is empty.
+        pub fn is_empty(&self) -> bool {
+            self.data.is_empty()
+        }
+
         /// Pop the rest of the buffer.
         pub fn pop_rest(&mut self) -> &[u8] {
             let r = self.data;

@@ -178,8 +178,12 @@ pub trait Datagram {
 // Lives in no_std land.
 pub mod client {
     use crate::{
-        buffer::EncodingBuffer, cipher_suites::TlsCipherSuite, client_config::ClientConfig,
-        key_schedule::KeySchedule, record::ClientRecord, Datagram, Error,
+        buffer::{EncodingBuffer, ParseBuffer},
+        cipher_suites::TlsCipherSuite,
+        client_config::ClientConfig,
+        key_schedule::KeySchedule,
+        record::ClientRecord,
+        Datagram, Error,
     };
     use chacha20poly1305::{AeadCore, KeySizeUser};
     use digest::Digest;
@@ -230,7 +234,6 @@ pub mod client {
             let our_public_key = PublicKey::from(&secret_key);
 
             // Send ClientHello.
-
             {
                 let hello =
                     ClientRecord::<'_, CipherSuite>::client_hello(config, our_public_key, rng);
@@ -243,27 +246,40 @@ pub mod client {
                 socket.send(&ser_buf).await.map_err(|e| Error::Send(e))?;
             }
 
-            // Wait for response.
-            let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
-            l0g::trace!("Got datagram!");
+            // Wait for response (ServerHello and Finished).
+            {
+                let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+                l0g::trace!("Got datagram!");
 
-            // Pars and validate ServerHello.
-            let (server_hello, positions) =
-                parse::parse_server_hello(resp).ok_or(Error::InvalidServerHello)?;
-            let to_hash = positions
-                .into_slice(resp)
-                .ok_or(Error::InvalidServerHello)?;
-            transcript_hasher.update(to_hash);
+                // Parse and validate ServerHello.
+                let parse_buffer = &mut ParseBuffer::new(resp);
+                let (server_hello, positions) =
+                    parse::parse_server_hello(parse_buffer).ok_or(Error::InvalidServerHello)?;
+                let to_hash = positions
+                    .into_slice(resp)
+                    .ok_or(Error::InvalidServerHello)?;
+                transcript_hasher.update(to_hash);
 
-            // Update key schedule to Handshake Secret using public keys.
-            let their_public_key = server_hello
-                .validate(CipherSuite::CODE_POINT)
-                .map_err(|_| Error::InvalidServerHello)?;
-            let shared_secret = secret_key.diffie_hellman(&their_public_key);
-            key_schedule.initialize_handshake_secret(
-                shared_secret.as_bytes(),
-                &transcript_hasher.clone().finalize(),
-            );
+                // Update key schedule to Handshake Secret using public keys.
+                let their_public_key = server_hello
+                    .validate(CipherSuite::CODE_POINT)
+                    .map_err(|_| Error::InvalidServerHello)?;
+                let shared_secret = secret_key.diffie_hellman(&their_public_key);
+                key_schedule.initialize_handshake_secret(
+                    shared_secret.as_bytes(),
+                    &transcript_hasher.clone().finalize(),
+                );
+
+                // Check if we got more datagrams, we're expecting a finished.
+                if !parse_buffer.is_empty() {
+                    l0g::error!("More!");
+
+                    todo!();
+                } else {
+                    // Wait for finished.
+                    todo!();
+                }
+            }
 
             // let handshake_traffic_secrets = key_schedule
             //     .create_handshake_traffic_secrets::<CipherSuite::Cipher>(
@@ -303,14 +319,11 @@ pub mod client {
             },
         };
 
-        pub fn parse_server_hello(buf: &[u8]) -> Option<(ServerHello, RecordPayloadPositions)> {
-            let mut buf = ParseBuffer::new(buf);
+        pub fn parse_server_hello<'a>(
+            buf: &mut ParseBuffer<'a>,
+        ) -> Option<(ServerHello<'a>, RecordPayloadPositions)> {
+            let record = ServerRecord::parse(buf)?;
 
-            let record = ServerRecord::parse(&mut buf)?;
-
-            if !buf.pop_rest().is_empty() {
-                return None;
-            }
             if let (ServerRecord::Handshake(ServerHandshake::ServerHello(hello)), pos) = record {
                 return Some((hello, pos));
             }
@@ -617,7 +630,9 @@ pub mod server {
             l0g::debug!("Sending server finished: {server_finished:02x?}");
 
             server_finished
-                .encode(&mut enc_buf, |_| todo!())
+                .encode(&mut enc_buf, |_| {
+                    // TODO: todo!()
+                })
                 .map_err(|_| Error::InsufficientSpace)?;
 
             socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
