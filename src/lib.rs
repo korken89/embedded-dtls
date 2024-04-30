@@ -20,6 +20,33 @@ pub(crate) mod integers;
 pub(crate) mod key_schedule;
 pub(crate) mod record;
 
+#[allow(unused)]
+struct FakeRandom {
+    val: u8,
+}
+
+impl rand::CryptoRng for FakeRandom {}
+
+impl rand::RngCore for FakeRandom {
+    fn next_u32(&mut self) -> u32 {
+        u32::from_be_bytes([self.val; 4])
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        u64::from_be_bytes([self.val; 8])
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        dest.fill(self.val);
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+        dest.fill(self.val);
+
+        Ok(())
+    }
+}
+
 pub mod client_config {
     use crate::handshake::extensions::Psk;
 
@@ -192,7 +219,6 @@ pub mod client {
             <<CipherSuite as TlsCipherSuite>::Cipher as AeadCore>::NonceSize: std::fmt::Debug,
             <<CipherSuite as TlsCipherSuite>::Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
         {
-            let mut ser_buf = EncodingBuffer::new(buf);
             let mut key_schedule = KeySchedule::new();
             let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
 
@@ -204,13 +230,18 @@ pub mod client {
             let our_public_key = PublicKey::from(&secret_key);
 
             // Send ClientHello.
-            let hello = ClientRecord::<'_, CipherSuite>::client_hello(config, our_public_key, rng);
-            let send_buf = hello
-                .encode(&mut ser_buf, &mut key_schedule, &mut transcript_hasher)
-                .map_err(|_| Error::InsufficientSpace)?;
 
-            l0g::debug!("Sending client hello: {:02x?}", hello);
-            socket.send(send_buf).await.map_err(|e| Error::Send(e))?;
+            {
+                let hello =
+                    ClientRecord::<'_, CipherSuite>::client_hello(config, our_public_key, rng);
+                let mut ser_buf = EncodingBuffer::new(buf);
+                hello
+                    .encode(&mut ser_buf, &mut key_schedule, &mut transcript_hasher)
+                    .map_err(|_| Error::InsufficientSpace)?;
+
+                l0g::debug!("Sending client hello: {:02x?}", hello);
+                socket.send(&ser_buf).await.map_err(|e| Error::Send(e))?;
+            }
 
             // Wait for response.
             let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
@@ -466,7 +497,7 @@ pub mod server {
     use crate::{
         buffer::EncodingBuffer,
         handshake::extensions::{DtlsVersions, Psk},
-        key_schedule::{self, KeySchedule},
+        key_schedule::KeySchedule,
         record::ServerRecord,
         server_config::{Identity, Key, ServerConfig},
         Datagram, Error,
@@ -564,10 +595,10 @@ pub mod server {
             );
 
             let mut enc_buf = EncodingBuffer::new(buf);
-            let to_hash = server_hello
+            server_hello
                 .encode(&mut enc_buf, |_| unreachable!())
                 .map_err(|_| Error::InsufficientSpace)?;
-            transcript_hasher.update(to_hash);
+            transcript_hasher.update(&enc_buf);
 
             key_schedule.initialize_handshake_secret(
                 shared_secret.as_bytes(),

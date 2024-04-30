@@ -1,9 +1,3 @@
-use std::ops::{DerefMut, Range};
-
-use num_enum::TryFromPrimitive;
-use rand_core::{CryptoRng, RngCore};
-use x25519_dalek::PublicKey;
-
 use crate::{
     buffer::{AllocU16Handle, EncodingBuffer, ParseBuffer},
     cipher_suites::TlsCipherSuite,
@@ -15,6 +9,10 @@ use crate::{
     integers::U48,
     key_schedule::KeySchedule,
 };
+use num_enum::TryFromPrimitive;
+use rand_core::{CryptoRng, RngCore};
+use std::ops::Range;
+use x25519_dalek::PublicKey;
 
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -90,7 +88,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
             <CipherSuite as TlsCipherSuite>::Cipher,
         >,
         transcript_hasher: &mut CipherSuite::Hash,
-    ) -> Result<&'buf [u8], ()> {
+    ) -> Result<(), ()> {
         if !self.is_encrypted() {
             let header = DTlsPlaintextHeader {
                 type_: self.content_type(),
@@ -103,30 +101,30 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
 
             // Create record header.
             let length_allocation = header.encode(buf)?;
+            let content_length = {
+                let mut inner_buf = buf.new_from_existing();
 
-            buf.forward_start();
-            let content_start = buf.len();
+                // ------ Encode payload
 
-            // ------ Encode payload
-
-            match self {
-                // NOTE: Each record encoder needs to update the transcript hash at their end.
-                ClientRecord::Handshake(handshake, _) => {
-                    handshake.encode(buf, key_schedule, transcript_hasher)?;
+                match self {
+                    // NOTE: Each record encoder needs to update the transcript hash at their end.
+                    ClientRecord::Handshake(handshake, _) => {
+                        handshake.encode(&mut inner_buf, key_schedule, transcript_hasher)?;
+                    }
+                    ClientRecord::Alert(_, _) => todo!(),
+                    ClientRecord::Ack(_, _) => todo!(),
+                    ClientRecord::Heartbeat(_) => todo!(),
+                    ClientRecord::ApplicationData() => todo!(),
                 }
-                ClientRecord::Alert(_, _) => todo!(),
-                ClientRecord::Ack(_, _) => todo!(),
-                ClientRecord::Heartbeat(_) => todo!(),
-                ClientRecord::ApplicationData() => todo!(),
-            }
 
-            let content_length = (buf.len() - content_start) as u16;
-            length_allocation.set(buf, content_length);
+                inner_buf.len()
+            };
+
+            length_allocation.set(buf, content_length as u16);
 
             // ------ Finish record
-            buf.reset_start();
 
-            Ok(&*buf)
+            Ok(())
         } else {
             todo!()
         }
@@ -214,7 +212,7 @@ impl<'a> ServerRecord<'a> {
         &self,
         buf: &'buf mut EncodingBuffer,
         encryption_function: impl FnOnce(EncryptionFunctionArguments),
-    ) -> Result<&'buf [u8], ()> {
+    ) -> Result<(), ()> {
         if self.is_encrypted() {
             self.encode_encrypted(buf, encryption_function)
         } else {
@@ -223,7 +221,7 @@ impl<'a> ServerRecord<'a> {
     }
 
     /// Unencrypted path for the encoding.
-    fn encode_unencrypted<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<&'buf [u8], ()> {
+    fn encode_unencrypted<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<(), ()> {
         let header = DTlsPlaintextHeader {
             type_: self.content_type(),
             epoch: 0,                  // TODO: Fix
@@ -235,22 +233,19 @@ impl<'a> ServerRecord<'a> {
 
         // ------ Start record
 
-        buf.forward_start();
-        let content_start = buf.len();
+        let content_length = {
+            let mut inner_buf = buf.new_from_existing();
 
-        // ------ Encode payload
-        self.encode_content(buf)?;
+            // ------ Encode payload
+            self.encode_content(&mut inner_buf)?;
 
-        let content_length = (buf.len() - content_start) as u16;
-        length_allocation.set(buf, content_length);
+            inner_buf.len()
+        };
+
+        length_allocation.set(buf, content_length as u16);
 
         // ------ Finish record
-        buf.reset_start();
-
-        let r = &*buf;
-        let start = buf.len() - content_length as usize;
-
-        Ok(&r[start..])
+        Ok(())
     }
 
     /// Encrypted path for the encoding.
@@ -258,10 +253,10 @@ impl<'a> ServerRecord<'a> {
         &self,
         buf: &'buf mut EncodingBuffer,
         encryption_function: impl FnOnce(EncryptionFunctionArguments),
-    ) -> Result<&'buf [u8], ()> {
-        // buf.forward_start();
-        let record_start = buf.len();
+    ) -> Result<(), ()> {
+        let buf = &mut buf.new_from_existing();
 
+        // TODO: Pipe AEAD tag size here
         let aead_tag_size = 16;
 
         let header = DTlsCiphertextHeader {
@@ -281,52 +276,47 @@ impl<'a> ServerRecord<'a> {
         // ------ Encode payload
         self.encode_content(buf)?;
 
-        // Encode the tail of the DTLSInnerPlaintext.
-        DtlsInnerPlaintext {
-            content: &[],
-            type_: self.content_type(),
-        }
-        .encode(buf, (buf.len() - content_start) as usize, aead_tag_size)?;
-
         let content_length = buf.len() - content_start;
 
-        // TODO: Pipe AEAD tag size here
+        // Encode the tail of the DTLSInnerPlaintext.
+        DtlsInnerPlaintext::encode(self.content_type(), buf, content_length, aead_tag_size)?;
+
+        let innerplaintext_end = buf.len();
+
+        // Allocate space for the AEAD tag.
         let aead_tag_allocation = buf.alloc_slice(aead_tag_size)?;
-        let tag_position = aead_tag_allocation.at(buf).unwrap();
+        let tag_position = aead_tag_allocation.at();
         aead_tag_allocation.fill(buf, 0);
 
-        let ciphertext_length = (buf.len() - content_start) as u16;
+        // Write the ciphertext length to the header.
+        let ciphertext_length = buf.len() - content_start;
         if let Some(length_allocation) = length_allocation {
             l0g::debug!("ciphertext length: {ciphertext_length}, {ciphertext_length:02x}, {length_allocation:?}");
-            length_allocation.set(buf, ciphertext_length);
+            length_allocation.set(buf, ciphertext_length as u16);
         }
 
         // ------ Encrypt payload
 
-        let (sequence_number, plaintext_with_tag) = {
-            let encoded_content: &mut [u8] = &mut *buf;
-            let plaintext_position = content_start..content_start + content_length as usize;
+        encryption_function({
+            let plaintext_position = content_start..innerplaintext_end as usize;
 
             // Split the buffer into the 2 slices.
-            to_sequence_number_and_plaintext_with_tag(
-                encoded_content,
+            let (sequence_number, plaintext_with_tag) = to_sequence_number_and_plaintext_with_tag(
+                buf,
                 sequence_number_position,
                 plaintext_position,
                 tag_position,
-            )
-        };
+            );
 
-        encryption_function(EncryptionFunctionArguments {
-            sequence_number,
-            plaintext_with_tag,
+            EncryptionFunctionArguments {
+                sequence_number,
+                plaintext_with_tag,
+            }
         });
 
-        // plaintextodo!();
-
         // ------ Finish record
-        // buf.reset_start();
 
-        Ok(&buf[record_start..])
+        Ok(())
     }
 
     fn encode_content<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<(), ()> {
@@ -366,11 +356,11 @@ fn to_sequence_number_and_plaintext_with_tag(
     plaintext_position: Range<usize>,
     tag_position: Range<usize>,
 ) -> (&mut [u8], &mut [u8]) {
-    // l0g::trace!(
-    //         "snp: {sequence_number_position:?}, pp: {plaintext_position:?}, tp: {tag_position:?}, bl: {}", buf.len()
-    // );
+    l0g::trace!(
+            "snp: {sequence_number_position:?}, pp: {plaintext_position:?}, tp: {tag_position:?}, bl: {}", buf.len()
+    );
 
-    // Enforce the ordering.
+    // Enforce the ordering for tests.
     if !(sequence_number_position.start <= sequence_number_position.end
         && sequence_number_position.end <= plaintext_position.start
         && plaintext_position.start <= plaintext_position.end
@@ -602,17 +592,17 @@ impl<'a> DtlsInnerPlaintext<'a> {
     ///
     /// Follows section 4 in RFC9147.
     pub fn encode(
-        &self,
+        type_: ContentType,
         buf: &mut EncodingBuffer,
         content_size: usize,
         aead_tag_size: usize,
     ) -> Result<(), ()> {
-        buf.push_u8(self.type_ as u8)?;
+        buf.push_u8(type_ as u8)?;
 
         // In accordance with Section 4.2.3 in RFC9147 we need that the cipher text, including tag,
         // to have a minimum of 16 bytes length. Else we must pad the packet. Usually the tag is
         // large enough to not need any padding.
-        let padding_size = 16usize.saturating_sub(aead_tag_size + self.content.len() + 1);
+        let padding_size = 16usize.saturating_sub(aead_tag_size + content_size + 1);
         for _ in 0..padding_size {
             buf.push_u8(0)?;
         }

@@ -59,8 +59,8 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
 
         let binders = match self {
             ClientHandshake::ClientHello(hello) => Some(hello.encode(buf)?),
-            ClientHandshake::ClientFinished(finnished) => {
-                finnished.encode(buf)?;
+            ClientHandshake::ClientFinished(finished) => {
+                finished.encode(buf)?;
                 None
             }
         };

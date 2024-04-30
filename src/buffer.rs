@@ -106,19 +106,26 @@ mod encoding_buffer {
     pub struct EncodingBuffer<'a> {
         buf: &'a mut [u8],
         idx: usize,
-        start: usize,
+        write_back: Option<&'a mut usize>,
     }
 
     impl<'a> fmt::Debug for EncodingBuffer<'a> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(
                 f,
-                "EncodingBuffer (start = {}, idx = {}, capacity = {}) {:?}",
-                self.start,
+                "EncodingBuffer (idx = {}, capacity = {}) {:02x?}",
                 self.idx,
                 self.buf.len(),
                 &self.buf[..self.idx]
             )
+        }
+    }
+
+    impl<'a> Drop for EncodingBuffer<'a> {
+        fn drop(&mut self) {
+            if let Some(write_back) = self.write_back.take() {
+                *write_back += self.idx;
+            }
         }
     }
 
@@ -128,13 +135,24 @@ mod encoding_buffer {
             Self {
                 buf,
                 idx: 0,
-                start: 0,
+                write_back: None,
+            }
+        }
+
+        /// Create a new buffer from an existing one, borrowing the rest of the buffer.
+        ///
+        /// When this is dropped the original buffer can be used again.
+        pub fn new_from_existing(&mut self) -> EncodingBuffer {
+            EncodingBuffer {
+                buf: &mut self.buf[self.idx..],
+                idx: 0,
+                write_back: Some(&mut self.idx),
             }
         }
 
         /// Current length of the buffer.
         pub fn len(&self) -> usize {
-            self.idx - self.start
+            self.idx
         }
 
         /// Capacity of the buffer.
@@ -164,21 +182,6 @@ mod encoding_buffer {
             self.idx += 1;
 
             Ok(())
-        }
-
-        /// Move the start to the current index.
-        pub fn forward_start(&mut self) {
-            self.start = self.idx;
-        }
-
-        /// Reset start to 0.
-        pub fn reset_start(&mut self) {
-            self.start = 0;
-        }
-
-        /// Read the start value.
-        pub fn start(&self) -> usize {
-            self.start
         }
 
         /// Push a u16 in big-endian.
@@ -249,13 +252,13 @@ mod encoding_buffer {
         type Target = [u8];
 
         fn deref(&self) -> &Self::Target {
-            self.buf.get(self.start..self.idx).unwrap_or(&[])
+            self.buf.get(..self.idx).unwrap_or(&[])
         }
     }
 
     impl<'a> DerefMut for EncodingBuffer<'a> {
         fn deref_mut(&mut self) -> &mut Self::Target {
-            self.buf.get_mut(self.start..self.idx).unwrap_or(&mut [])
+            self.buf.get_mut(..self.idx).unwrap_or(&mut [])
         }
     }
 
@@ -279,11 +282,10 @@ mod encoding_buffer {
             core::mem::forget(self);
         }
 
-        /// The position of the data in the encoding buffer. These indexes are relative to `start`.
-        /// If the index is not in the current buffer (i.e before start) nothing is returned.
-        pub fn at(&self, buf: &EncodingBuffer) -> Option<Range<usize>> {
-            let start = self.index.checked_sub(buf.start)?;
-            Some(start..start + 1)
+        /// The position of the data in the encoding buffer.
+        pub fn at(&self) -> Range<usize> {
+            let start = self.index;
+            start..start + 1
         }
     }
 
@@ -307,11 +309,10 @@ mod encoding_buffer {
             core::mem::forget(self);
         }
 
-        /// The position of the data in the encoding buffer. These indexes are relative to `start`.
-        /// If the index is not in the current buffer (i.e before start) nothing is returned.
-        pub fn at(&self, buf: &EncodingBuffer) -> Option<Range<usize>> {
-            let start = self.index.checked_sub(buf.start)?;
-            Some(start..start + 2)
+        /// The position of the data in the encoding buffer.
+        pub fn at(&self) -> Range<usize> {
+            let start = self.index;
+            start..start + 2
         }
     }
 
@@ -335,11 +336,10 @@ mod encoding_buffer {
             core::mem::forget(self);
         }
 
-        /// The position of the data in the encoding buffer. These indexes are relative to `start`.
-        /// If the index is not in the current buffer (i.e before start) nothing is returned.
-        pub fn at(&self, buf: &EncodingBuffer) -> Option<Range<usize>> {
-            let start = self.index.checked_sub(buf.start)?;
-            Some(start..start + 3)
+        /// The position of the data in the encoding buffer.
+        pub fn at(&self) -> Range<usize> {
+            let start = self.index;
+            start..start + 3
         }
     }
 
@@ -363,11 +363,10 @@ mod encoding_buffer {
             core::mem::forget(self);
         }
 
-        /// The position of the data in the encoding buffer. These indexes are relative to `start`.
-        /// If the index is not in the current buffer (i.e before start) nothing is returned.
-        pub fn at(&self, buf: &EncodingBuffer) -> Option<Range<usize>> {
-            let start = self.index.checked_sub(buf.start)?;
-            Some(start..start + 6)
+        /// The position of the data in the encoding buffer.
+        pub fn at(&self) -> Range<usize> {
+            let start = self.index;
+            start..start + 6
         }
     }
 
@@ -388,7 +387,7 @@ mod encoding_buffer {
     impl AllocSliceHandle {
         /// The the slice from buffer that is everything up until this allocation starts.
         pub fn slice_up_until<'a>(&'a self, buf: &'a EncodingBuffer) -> &'a [u8] {
-            buf.buf.get(buf.start..self.index).unwrap_or(&[])
+            buf.buf.get(..self.index).unwrap_or(&[])
         }
 
         /// Set the value.
@@ -420,11 +419,10 @@ mod encoding_buffer {
             r
         }
 
-        /// The position of the data in the encoding buffer. These indexes are relative to `start`.
-        /// If the index is not in the current buffer (i.e before start) nothing is returned.
-        pub fn at(&self, buf: &EncodingBuffer) -> Option<Range<usize>> {
-            let start = self.index.checked_sub(buf.start)?;
-            Some(start..start + self.len)
+        /// The position of the data in the encoding buffer.
+        pub fn at(&self) -> Range<usize> {
+            let start = self.index;
+            start..start + self.len
         }
     }
 
@@ -452,28 +450,32 @@ mod encoding_buffer {
             assert_eq!(buf[1], 12);
             assert_eq!(buf[2], 13);
 
-            buf.forward_start();
+            {
+                let mut buf2 = buf.new_from_existing();
 
-            assert_eq!(buf.len(), 0);
+                assert_eq!(buf2.len(), 0);
 
-            println!("buf: {buf:?}");
-            buf.push_u8(14).unwrap();
-            println!("buf: {buf:?}");
-            assert_eq!(buf[0], 14);
+                println!("buf: {buf2:?}");
+                buf2.push_u8(14).unwrap();
+                println!("buf: {buf2:?}");
+                assert_eq!(buf2[0], 14);
 
-            buf.reset_start();
+                drop(buf2);
+            }
 
             assert_eq!(buf[0], 11);
             assert_eq!(buf[1], 12);
             assert_eq!(buf[2], 13);
             assert_eq!(buf[3], 14);
 
-            buf.forward_start();
+            {
+                let mut buf2 = buf.new_from_existing();
 
-            buf.extend_from_slice(&[1, 2, 3, 4]).unwrap();
-            assert_eq!(buf[..4], [1, 2, 3, 4]);
+                buf2.extend_from_slice(&[1, 2, 3, 4]).unwrap();
+                assert_eq!(buf2[..4], [1, 2, 3, 4]);
 
-            buf.reset_start();
+                drop(buf2);
+            }
             assert_eq!(buf[..], [11, 12, 13, 14, 1, 2, 3, 4]);
         }
 
@@ -509,13 +511,15 @@ mod encoding_buffer {
             println!("buf: {buf:?}");
             assert_eq!(buf[..], [1, 2, 3, 4, 5, 1, 2, 3]);
 
-            buf.forward_start();
-            println!("buf: {buf:?}");
-            let a = buf.alloc_slice(3).unwrap();
-            println!("a: {a:?}");
-            assert_eq!(a.slice_up_until(&buf), []);
+            {
+                let mut buf2 = buf.new_from_existing();
+                println!("buf: {buf2:?}");
+                let a = buf2.alloc_slice(3).unwrap();
+                println!("a: {a:?}");
+                assert_eq!(a.slice_up_until(&buf2), []);
 
-            a.set(&mut buf, &[4, 5, 6]);
+                a.set(&mut buf2, &[4, 5, 6]);
+            }
         }
     }
 }
