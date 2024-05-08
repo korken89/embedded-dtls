@@ -52,61 +52,52 @@ impl<'a> ParseExtension<'a> {
 
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum ClientExtensions<'a> {
-    PskKeyExchangeModes(PskKeyExchangeModes),
-    KeyShare(KeyShareEntry<'a>),
-    SupportedVersions(ClientSupportedVersions),
-    PreSharedKey(OfferedPsks<'a>),
-    // ServerName { // Not sure we need this.
-    //     server_name: &'a str,
-    // },
-    // Heartbeat { // Not sure we need this.
-    //     mode: HeartbeatMode,
-    // },
-    // SupportedGroups {
-    //     supported_groups: Vec<NamedGroup, 16>,
-    // },
-    // SignatureAlgorithms {
-    //     supported_signature_algorithms: Vec<SignatureScheme, 16>,
-    // },
-    // SignatureAlgorithmsCert {
-    //     supported_signature_algorithms: Vec<SignatureScheme, 16>,
-    // },
-    // MaxFragmentLength(MaxFragmentLength),
+pub struct NewClientExtensions<'a> {
+    pub psk_key_exchange_modes: Option<PskKeyExchangeModes>,
+    pub key_share: Option<KeyShareEntry<'a>>,
+    pub supported_versions: Option<ClientSupportedVersions>,
+    pub pre_shared_key: Option<OfferedPsks<'a>>,
 }
 
-impl<'a> ClientExtensions<'a> {
-    /// Encode a client extension.
-    /// Encode the offered pre-shared keys. Returns a handle to write the binders if needed.
+impl<'a> NewClientExtensions<'a> {
+    /// Encode client extensions.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<Option<AllocSliceHandle>, ()> {
-        buf.push_u8(self.extension_type() as u8)?;
+        if let Some(supported_version) = &self.supported_versions {
+            buf.push_u8(ExtensionType::SupportedVersions as u8)?;
+            self.encode_extension(buf, |buf| supported_version.encode(buf))??;
+        }
+        if let Some(pkem) = &self.psk_key_exchange_modes {
+            buf.push_u8(ExtensionType::PskKeyExchangeModes as u8)?;
+            self.encode_extension(buf, |buf| pkem.encode(buf))??;
+        }
+        if let Some(key_share) = &self.key_share {
+            buf.push_u8(ExtensionType::KeyShare as u8)?;
+            self.encode_extension(buf, |buf| key_share.encode(buf))??;
+        }
 
+        if let Some(psk) = &self.pre_shared_key {
+            buf.push_u8(ExtensionType::PreSharedKey as u8)?;
+            Ok(Some(self.encode_extension(buf, |buf| psk.encode(buf))??))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn encode_extension<R, F: FnOnce(&mut EncodingBuffer) -> R>(
+        &self,
+        buf: &mut EncodingBuffer,
+        f: F,
+    ) -> Result<R, ()> {
         let extension_length_allocation = buf.alloc_u16()?;
         let content_start = buf.len();
 
-        let r = match self {
-            ClientExtensions::PskKeyExchangeModes(psk_exchange) => {
-                psk_exchange.encode(buf).map(|_| None)
-            }
-            ClientExtensions::KeyShare(key_share) => key_share.encode(buf).map(|_| None),
-            ClientExtensions::SupportedVersions(versions) => versions.encode(buf).map(|_| None),
-            ClientExtensions::PreSharedKey(offered) => offered.encode(buf).map(|alloc| Some(alloc)),
-        };
+        let r = f(buf);
 
         // Fill in the length of this extension.
         let content_length = (buf.len() - content_start) as u16;
         extension_length_allocation.set(buf, content_length);
 
-        r
-    }
-
-    fn extension_type(&self) -> ExtensionType {
-        match self {
-            ClientExtensions::PskKeyExchangeModes { .. } => ExtensionType::PskKeyExchangeModes,
-            ClientExtensions::KeyShare(_) => ExtensionType::KeyShare,
-            ClientExtensions::SupportedVersions(_) => ExtensionType::SupportedVersions,
-            ClientExtensions::PreSharedKey(_) => ExtensionType::PreSharedKey,
-        }
+        Ok(r)
     }
 }
 

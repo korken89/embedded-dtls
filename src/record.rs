@@ -55,17 +55,17 @@ impl RecordPayloadPositions {
 /// Supported client records.
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum ClientRecord<'a, CipherSuite> {
-    Handshake(ClientHandshake<'a, CipherSuite>, Encryption),
+pub enum ClientRecord<'a> {
+    Handshake(ClientHandshake<'a>, Encryption),
     Alert(/* Alert, */ (), Encryption),
     Ack((), Encryption),
     Heartbeat(()),
     ApplicationData(/* &'a [u8] */),
 }
 
-impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
+impl<'a> ClientRecord<'a> {
     /// Create a client hello handshake.
-    pub fn client_hello<Rng>(
+    pub fn encode_client_hello<Rng>(
         config: &'a ClientConfig<'a>,
         public_key: PublicKey,
         rng: &mut Rng,
@@ -74,13 +74,13 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
         Rng: RngCore + CryptoRng,
     {
         ClientRecord::Handshake(
-            ClientHandshake::ClientHello(ClientHello::new(config, public_key, rng)),
+            ClientHandshake::ClientHello(ClientHello::new(config, public_key)),
             Encryption::Disabled,
         )
     }
 
     /// Encode the record into a buffer.
-    pub fn encode<'buf>(
+    pub fn encode<'buf, CipherSuite: TlsCipherSuite, Rng: RngCore + CryptoRng>(
         &self,
         buf: &'buf mut EncodingBuffer,
         key_schedule: &mut KeySchedule<
@@ -88,6 +88,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
             <CipherSuite as TlsCipherSuite>::Cipher,
         >,
         transcript_hasher: &mut CipherSuite::Hash,
+        rng: &mut Rng,
     ) -> Result<(), ()> {
         if !self.is_encrypted() {
             let header = DTlsPlaintextHeader {
@@ -109,7 +110,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientRecord<'a, CipherSuite> {
                 match self {
                     // NOTE: Each record encoder needs to update the transcript hash at their end.
                     ClientRecord::Handshake(handshake, _) => {
-                        handshake.encode(&mut inner_buf, key_schedule, transcript_hasher)?;
+                        handshake.encode(&mut inner_buf, key_schedule, transcript_hasher, rng)?;
                     }
                     ClientRecord::Alert(_, _) => todo!(),
                     ClientRecord::Ack(_, _) => todo!(),

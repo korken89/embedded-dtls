@@ -48,14 +48,20 @@ impl rand::RngCore for FakeRandom {
 }
 
 pub mod client_config {
-    use crate::handshake::extensions::Psk;
+    use crate::{cipher_suites::CipherSuite, handshake::extensions::Psk};
 
     /// Client configuration.
+    #[derive(Debug)]
     pub struct ClientConfig<'a> {
         /// Preshared key.
         /// TODO: Support a list of PSKs. Needs work in how to calculate binders and track all the
         /// necessary early secrets derived from the PSKs until the server selects one PSK.
         pub psk: Psk<'a>,
+    }
+
+    pub(crate) struct ClientHelloConfig {
+        hash_size: usize,
+        code_point: CipherSuite,
     }
 }
 
@@ -238,9 +244,11 @@ pub mod client {
                 let hello =
                     ClientRecord::<'_, CipherSuite>::client_hello(config, our_public_key, rng);
                 let mut ser_buf = EncodingBuffer::new(buf);
-                hello
-                    .encode(&mut ser_buf, &mut key_schedule, &mut transcript_hasher)
+                let positions = hello
+                    .encode(&mut ser_buf, &mut key_schedule, &mut transcript_hasher, rng)
                     .map_err(|_| Error::InsufficientSpace)?;
+
+                // Do transcript hashing, create binders, do transcript hashing again
 
                 l0g::debug!("Sending client hello: {:02x?}", hello);
                 socket.send(&ser_buf).await.map_err(|e| Error::Send(e))?;

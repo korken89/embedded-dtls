@@ -6,7 +6,7 @@ use crate::{
     client_config::ClientConfig,
     integers::U24,
     key_schedule::KeySchedule,
-    record::LEGACY_DTLS_VERSION,
+    record::{ProtocolVersion, LEGACY_DTLS_VERSION},
 };
 use digest::{Digest, OutputSizeUser};
 use extensions::{ClientExtensions, PskKeyExchangeModes};
@@ -15,8 +15,8 @@ use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::PublicKey;
 
 use self::extensions::{
-    ClientSupportedVersions, DtlsVersions, KeyShareEntry, NamedGroup, OfferedPsks,
-    PskKeyExchangeMode, SelectedPsk, ServerExtensions, ServerSupportedVersion,
+    ClientSupportedVersions, DtlsVersions, KeyShareEntry, NamedGroup, NewClientExtensions,
+    OfferedPsks, PskKeyExchangeMode, SelectedPsk, ServerExtensions, ServerSupportedVersion,
 };
 
 pub mod extensions;
@@ -26,13 +26,13 @@ pub type Random = [u8; 32];
 
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum ClientHandshake<'a, CipherSuite> {
-    ClientHello(ClientHello<'a, CipherSuite>),
+pub enum ClientHandshake<'a> {
+    ClientHello(ClientHello<'a>),
     ClientFinished(Finished<'a>),
 }
 
 impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
-    pub fn encode(
+    pub fn encode<Rng: RngCore + CryptoRng>(
         &self,
         buf: &mut EncodingBuffer,
         key_schedule: &mut KeySchedule<
@@ -40,16 +40,10 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
             <CipherSuite as TlsCipherSuite>::Cipher,
         >,
         transcript_hasher: &mut CipherSuite::Hash,
+        rng: &mut Rng,
     ) -> Result<(), ()> {
         // Encode client handshake.
-        let header = HandshakeHeader {
-            msg_type: self.handshake_type(),
-            length: U24::new(0),          // To be filled later
-            message_seq: 0,               // To be filled later
-            fragment_offset: U24::new(0), // To be filled later
-            fragment_length: U24::new(0), // To be filled later
-        }
-        .encode(buf)?;
+        let header = HandshakeHeader::encode(self.handshake_type(), buf)?;
 
         // TODO: How to support fragmentation so we can ship this over e.g. IEEE802.15.4 radio that
         // only has payload of 60-100 bytes?
@@ -58,7 +52,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
         let content_start = buf.len();
 
         let binders = match self {
-            ClientHandshake::ClientHello(hello) => Some(hello.encode(buf)?),
+            ClientHandshake::ClientHello(hello) => Some(hello.encode(rng, buf)?),
             ClientHandshake::ClientFinished(finished) => {
                 finished.encode(buf)?;
                 None
@@ -114,14 +108,7 @@ pub enum ServerHandshake<'a> {
 impl<'a> ServerHandshake<'a> {
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
         // Encode client handshake.
-        let header = HandshakeHeader {
-            msg_type: self.handshake_type(),
-            length: U24::new(0),          // To be filled later
-            message_seq: 0,               // To be filled later
-            fragment_offset: U24::new(0), // To be filled later
-            fragment_length: U24::new(0), // To be filled later
-        }
-        .encode(buf)?;
+        let header = HandshakeHeader::encode(self.handshake_type(), buf)?;
 
         // TODO: How to support fragmentation so we can ship this over e.g. IEEE802.15.4 radio that
         // only has payload of 60-100 bytes?
@@ -129,11 +116,10 @@ impl<'a> ServerHandshake<'a> {
 
         let content_start = buf.len();
 
-        let binders = match self {
-            ServerHandshake::ServerHello(hello) => Some(hello.encode(buf)?),
+        match self {
+            ServerHandshake::ServerHello(hello) => hello.encode(buf)?,
             ServerHandshake::ServerFinished(finished) => {
                 finished.encode(buf)?;
-                None
             }
         };
 
@@ -143,28 +129,6 @@ impl<'a> ServerHandshake<'a> {
         header.message_seq.set(buf, 1); // TODO: This should probably be something else than 1
         header.fragment_offset.set(buf, 0.into());
         header.fragment_length.set(buf, content_length.into());
-
-        // // The Handshake is finished, ready for transcript hash and binders.
-        // if let Some(binders) = binders {
-        //     // Update the transcript with everything up until the binder itself.
-        //     transcript_hasher.update(binders.slice_up_until(buf));
-
-        //     // Calculate the binder entry.
-        //     let binder_entry = key_schedule
-        //         .create_binder(&transcript_hasher.clone().finalize())
-        //         .expect("Unable to generate binder");
-
-        //     // Save the binder entry to the correct location.
-        //     // TODO: For each binder.
-        //     let buf = binders.into_buffer(buf);
-        //     buf[0] = binder_entry.len() as u8;
-        //     buf[1..].copy_from_slice(&binder_entry);
-
-        //     // Add the binder entry to the transcript.
-        //     transcript_hasher.update(&buf);
-        // } else {
-        //     transcript_hasher.update(buf);
-        // }
 
         Ok(())
     }
@@ -225,8 +189,11 @@ pub struct HandshakeHeaderAllocations {
 impl HandshakeHeader {
     /// Encode the handshake header. The return contains allocated space for
     /// `(length, fragment_length)`.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<HandshakeHeaderAllocations, ()> {
-        buf.push_u8(self.msg_type as u8)?;
+    pub fn encode(
+        msg_type: HandshakeType,
+        buf: &mut EncodingBuffer,
+    ) -> Result<HandshakeHeaderAllocations, ()> {
+        buf.push_u8(msg_type as u8)?;
 
         let length = buf.alloc_u24()?;
         let message_seq = buf.alloc_u16()?;
@@ -254,43 +221,24 @@ impl HandshakeHeader {
 }
 
 /// ClientHello payload in an Handshake.
-pub struct ClientHello<'a, CipherSuite> {
-    random: Random,
-    public_key: PublicKey,
-    config: &'a ClientConfig<'a>,
-    _c: PhantomData<CipherSuite>,
+#[derive(Debug)]
+pub struct ClientHello<'a> {
+    pub version: ProtocolVersion,
+    pub legacy_session_id: &'a [u8],
+    pub cipher_suites: &'a [u8],
+    pub extensions: NewClientExtensions<'a>,
+    // pub binders_start: Option<usize>,
 }
 
-impl<'a, CipherSuite> core::fmt::Debug for ClientHello<'a, CipherSuite> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "ClientHello {{ random: {:02x?}, secret: <REDACTED> }}",
-            &self.random,
-        )
-    }
-}
-
-impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
-    pub fn new<Rng>(config: &'a ClientConfig, public_key: PublicKey, rng: &mut Rng) -> Self
-    where
-        Rng: RngCore + CryptoRng,
-    {
-        let mut random = [0; 32];
-        rng.fill_bytes(&mut random);
-
-        Self {
-            random,
-            public_key,
-            config,
-            _c: PhantomData,
-        }
-    }
-
+impl<'a> ClientHello<'a> {
     /// Encode a client hello payload in a Handshake. RFC 9147 section 5.3.
     ///
     /// Returns the allocated position for binders.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<AllocSliceHandle, ()> {
+    pub fn encode<Rng: RngCore + CryptoRng>(
+        &self,
+        rng: &mut Rng,
+        buf: &mut EncodingBuffer,
+    ) -> Result<AllocSliceHandle, ()> {
         // struct {
         //     ProtocolVersion legacy_version = { 254,253 }; // DTLSv1.2
         //     Random random;
@@ -305,7 +253,9 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
         buf.extend_from_slice(&LEGACY_DTLS_VERSION)?;
 
         // Random.
-        buf.extend_from_slice(&self.random)?;
+        let mut random = [0; 32];
+        rng.fill_bytes(&mut random);
+        buf.extend_from_slice(&random)?;
 
         // Legacy Session ID.
         buf.push_u8(0)?;
@@ -314,8 +264,8 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
         buf.push_u8(0)?;
 
         // Cipher suites, we only support the one selected by the trait.
-        buf.push_u16_be(2)?;
-        buf.push_u16_be(CipherSuite::CODE_POINT as u16)?;
+        buf.push_u16_be(self.cipher_suites.len() as u16)?;
+        buf.extend_from_slice(self.cipher_suites)?;
 
         // Compression methods, select none.
         buf.push_u8(1)?;
@@ -325,21 +275,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHello<'a, CipherSuite> {
         let extensions_length_allocation = buf.alloc_u16()?;
         let content_start = buf.len();
 
-        ClientExtensions::SupportedVersions(ClientSupportedVersions {
-            version: DtlsVersions::V1_3,
-        })
-        .encode(buf)?;
-
-        ClientExtensions::PskKeyExchangeModes(PskKeyExchangeModes {
-            ke_modes: PskKeyExchangeMode::PskDheKe,
-        })
-        .encode(buf)?;
-
-        ClientExtensions::KeyShare(KeyShareEntry {
-            group: NamedGroup::X25519,
-            opaque: self.public_key.as_bytes(),
-        })
-        .encode(buf)?;
+        let binders_allocation = self.extensions.encode(buf)?;
 
         // IMPORTANT: Pre-shared key extension must come last.
         let binders_allocation = ClientExtensions::PreSharedKey(OfferedPsks {
