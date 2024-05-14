@@ -1,22 +1,18 @@
-use core::marker::PhantomData;
-
 use crate::{
     buffer::{AllocSliceHandle, AllocU16Handle, AllocU24Handle, EncodingBuffer, ParseBuffer},
-    cipher_suites::TlsCipherSuite,
-    client_config::ClientConfig,
+    cipher_suites::{CodePoint, TlsCipherSuite},
     integers::U24,
     key_schedule::KeySchedule,
     record::{ProtocolVersion, LEGACY_DTLS_VERSION},
 };
-use digest::{Digest, OutputSizeUser};
-use extensions::{ClientExtensions, PskKeyExchangeModes};
+use digest::Digest;
 use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::PublicKey;
 
 use self::extensions::{
-    ClientSupportedVersions, DtlsVersions, KeyShareEntry, NamedGroup, NewClientExtensions,
-    OfferedPsks, PskKeyExchangeMode, SelectedPsk, ServerExtensions, ServerSupportedVersion,
+    ClientExtensions, DtlsVersions, KeyShareEntry, NamedGroup, NewServerExtensions, SelectedPsk,
+    ServerExtensions, ServerSupportedVersion,
 };
 
 pub mod extensions;
@@ -31,14 +27,11 @@ pub enum ClientHandshake<'a> {
     ClientFinished(Finished<'a>),
 }
 
-impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
-    pub fn encode<Rng: RngCore + CryptoRng>(
+impl<'a> ClientHandshake<'a> {
+    pub fn encode<Rng: RngCore + CryptoRng, CipherSuite: TlsCipherSuite>(
         &self,
         buf: &mut EncodingBuffer,
-        key_schedule: &mut KeySchedule<
-            <CipherSuite as TlsCipherSuite>::Hash,
-            <CipherSuite as TlsCipherSuite>::Cipher,
-        >,
+        key_schedule: &mut KeySchedule<CipherSuite>,
         transcript_hasher: &mut CipherSuite::Hash,
         rng: &mut Rng,
     ) -> Result<(), ()> {
@@ -52,7 +45,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
         let content_start = buf.len();
 
         let binders = match self {
-            ClientHandshake::ClientHello(hello) => Some(hello.encode(rng, buf)?),
+            ClientHandshake::ClientHello(hello) => hello.encode(rng, buf)?,
             ClientHandshake::ClientFinished(finished) => {
                 finished.encode(buf)?;
                 None
@@ -101,8 +94,8 @@ impl<'a, CipherSuite: TlsCipherSuite> ClientHandshake<'a, CipherSuite> {
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ServerHandshake<'a> {
-    ServerHello(ServerHello),
-    ServerFinished(Finished<'a>), // TODO: 64 should not be hardcoded.
+    ServerHello(ServerHello<'a>),
+    ServerFinished(Finished<'a>),
 }
 
 impl<'a> ServerHandshake<'a> {
@@ -131,6 +124,34 @@ impl<'a> ServerHandshake<'a> {
         header.fragment_length.set(buf, content_length.into());
 
         Ok(())
+    }
+
+    /// Parse a handshake message.
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+        let handshake_header = HandshakeHeader::parse(buf)?;
+
+        if handshake_header.length != handshake_header.fragment_length {
+            l0g::error!("We don't support fragmented handshakes yet.");
+            return None;
+        }
+
+        let handshake_payload = buf.pop_slice(handshake_header.fragment_length.get() as usize)?;
+
+        l0g::trace!("Got handshake: {:?}", handshake_header);
+
+        match handshake_header.msg_type {
+            HandshakeType::ServerHello => {
+                let mut buf = ParseBuffer::new(handshake_payload);
+                let mut server_hello = ServerHello::parse(&mut buf)?;
+
+                l0g::trace!("Got server hello: {:02x?}", server_hello);
+
+                Some(Self::ServerHello(server_hello))
+            }
+            HandshakeType::Finished => todo!(),
+            HandshakeType::KeyUpdate => todo!(),
+            _ => None,
+        }
     }
 
     fn handshake_type(&self) -> HandshakeType {
@@ -226,7 +247,7 @@ pub struct ClientHello<'a> {
     pub version: ProtocolVersion,
     pub legacy_session_id: &'a [u8],
     pub cipher_suites: &'a [u8],
-    pub extensions: NewClientExtensions<'a>,
+    pub extensions: ClientExtensions<'a>,
     // pub binders_start: Option<usize>,
 }
 
@@ -238,7 +259,7 @@ impl<'a> ClientHello<'a> {
         &self,
         rng: &mut Rng,
         buf: &mut EncodingBuffer,
-    ) -> Result<AllocSliceHandle, ()> {
+    ) -> Result<Option<AllocSliceHandle>, ()> {
         // struct {
         //     ProtocolVersion legacy_version = { 254,253 }; // DTLSv1.2
         //     Random random;
@@ -253,7 +274,7 @@ impl<'a> ClientHello<'a> {
         buf.extend_from_slice(&LEGACY_DTLS_VERSION)?;
 
         // Random.
-        let mut random = [0; 32];
+        let mut random = Random::default();
         rng.fill_bytes(&mut random);
         buf.extend_from_slice(&random)?;
 
@@ -277,19 +298,62 @@ impl<'a> ClientHello<'a> {
 
         let binders_allocation = self.extensions.encode(buf)?;
 
-        // IMPORTANT: Pre-shared key extension must come last.
-        let binders_allocation = ClientExtensions::PreSharedKey(OfferedPsks {
-            identities: &[&self.config.psk],
-            hash_size: <CipherSuite::Hash as OutputSizeUser>::output_size(),
-        })
-        .encode(buf)?
-        .ok_or(())?;
-
         // Fill in the length of extensions.
         let content_length = (buf.len() - content_start) as u16;
         extensions_length_allocation.set(buf, content_length);
 
         Ok(binders_allocation)
+    }
+
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+        let version = buf.pop_u16_be()?.to_be_bytes();
+        let _random = buf.pop_slice(32)?;
+
+        //     opaque legacy_session_id<0..32>;
+        //     opaque legacy_cookie<0..2^8-1>;                  // DTLS
+        let legacy_session_id_len = buf.pop_u8()?;
+        let legacy_session_id = buf.pop_slice(legacy_session_id_len as usize)?;
+
+        let legacy_cookie = buf.pop_u8()?;
+        if legacy_cookie != 0 {
+            l0g::trace!("Legacy cookie is non-zero");
+            return None;
+        }
+
+        let cipher_suites = {
+            let mut v = Vec::new();
+            let num_cipher_suites_bytes = buf.pop_u16_be()?;
+
+            if num_cipher_suites_bytes % 2 != 0 {
+                // Not an even amount of bytes (each cipher suite needs 2 bytes)
+                return None;
+            }
+
+            let num_cipher_suites = num_cipher_suites_bytes / 2;
+
+            for _ in 0..num_cipher_suites {
+                v.push(buf.pop_u16_be()?);
+            }
+
+            v
+        };
+
+        let legacy_compression_methods_len = buf.pop_u8()?;
+        let legacy_compression_methods = buf.pop_u8()?;
+        if legacy_compression_methods_len != 1 || legacy_compression_methods != 0 {
+            l0g::trace!("Legacy compression methods is non-zero");
+            return None;
+        }
+
+        let (extensions, binders_start) = ClientExtensions::parse(buf)?;
+
+        Some(Self {
+            version,
+            legacy_session_id,
+            cipher_suites,
+            extensions,
+            binders_start,
+        })
     }
 }
 
@@ -306,30 +370,38 @@ impl defmt::Format for ClientHello {
 }
 
 #[derive(Debug)]
-pub struct ServerHello {
-    legacy_session_id: Vec<u8>,
-    supported_version: DtlsVersions,
-    public_key: PublicKey,
-    cipher_suite: u16,
-    selected_psk_identity: u16,
+pub struct ServerHello<'a> {
+    pub version: ProtocolVersion,
+    pub legacy_session_id_echo: &'a [u8],
+    pub cipher_suite_index: u16,
+    pub extensions: NewServerExtensions<'a>,
 }
 
-impl ServerHello {
-    pub fn new(
-        legacy_session_id: Vec<u8>,
-        supported_version: DtlsVersions,
-        public_key: PublicKey,
-        selected_cipher_suite: u16,
-        selected_psk_identity: u16,
-    ) -> Self {
-        Self {
-            legacy_session_id,
-            supported_version,
-            public_key,
-            cipher_suite: selected_cipher_suite,
-            selected_psk_identity,
-        }
-    }
+// #[derive(Debug)]
+// pub struct ServerHello {
+//     legacy_session_id: Vec<u8>,
+//     supported_version: DtlsVersions,
+//     public_key: PublicKey,
+//     cipher_suite: u16,
+//     selected_psk_identity: u16,
+// }
+
+impl<'a> ServerHello<'a> {
+    // pub fn new(
+    //     legacy_session_id: Vec<u8>,
+    //     supported_version: DtlsVersions,
+    //     public_key: PublicKey,
+    //     selected_cipher_suite: u16,
+    //     selected_psk_identity: u16,
+    // ) -> Self {
+    //     Self {
+    //         legacy_session_id,
+    //         supported_version,
+    //         public_key,
+    //         cipher_suite: selected_cipher_suite,
+    //         selected_psk_identity,
+    //     }
+    // }
 
     /// Encode a server hello payload in a Handshake. RFC 8446 section 4.1.3.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
@@ -346,14 +418,14 @@ impl ServerHello {
         buf.extend_from_slice(&LEGACY_DTLS_VERSION)?;
 
         // Random.
-        buf.extend_from_slice(&rand::random::<[u8; 32]>())?;
+        buf.extend_from_slice(&rand::random::<Random>())?;
 
         // Legacy Session ID echo.
-        buf.push_u8(self.legacy_session_id.len() as u8)?;
-        buf.extend_from_slice(&self.legacy_session_id)?;
+        buf.push_u8(self.legacy_session_id_echo.len() as u8)?;
+        buf.extend_from_slice(&self.legacy_session_id_echo)?;
 
         // Selected cipher suite.
-        buf.push_u16_be(self.cipher_suite)?;
+        buf.push_u16_be(self.cipher_suite_index)?;
 
         // Legacy compression methods.
         buf.push_u8(0)?;
@@ -362,27 +434,100 @@ impl ServerHello {
         let extensions_length_allocation = buf.alloc_u16()?;
         let content_start = buf.len();
 
-        ServerExtensions::SelectedSupportedVersion(ServerSupportedVersion {
-            version: self.supported_version,
-        })
-        .encode(buf)?;
-
-        ServerExtensions::KeyShare(KeyShareEntry {
-            group: NamedGroup::X25519,
-            opaque: self.public_key.as_bytes(),
-        })
-        .encode(buf)?;
-
-        ServerExtensions::PreSharedKey(SelectedPsk {
-            selected_identity: self.selected_psk_identity,
-        })
-        .encode(buf)?;
+        self.extensions.encode(buf)?;
 
         // Fill in the length of extensions.
         let content_length = (buf.len() - content_start) as u16;
         extensions_length_allocation.set(buf, content_length);
 
         Ok(())
+    }
+
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+        let version = buf.pop_u16_be()?.to_be_bytes();
+        let _random = buf.pop_slice(32)?;
+        let legacy_session_id_len = buf.pop_u8()?;
+        let legacy_session_id_echo = buf.pop_slice(legacy_session_id_len as usize)?;
+
+        let cipher_suite_index = buf.pop_u16_be()?;
+
+        let _legacy_compression_method = buf.pop_u8()?;
+
+        // Extensions
+        let extensions = NewServerExtensions::parse(buf)?;
+
+        Some(Self {
+            version,
+            legacy_session_id_echo,
+            cipher_suite_index,
+            extensions,
+        })
+    }
+
+    /// Validate the server hello.
+    pub fn validate(&self, our_cipher_suite: CodePoint) -> Result<PublicKey, ()> {
+        if self.version != LEGACY_DTLS_VERSION {
+            l0g::error!(
+                "ServerHello version is not legacy DTLS version: {:02x?}",
+                self.version
+            );
+            return Err(());
+        }
+
+        if !self.legacy_session_id_echo.is_empty() {
+            l0g::error!("ServerHello legacy session id echo is not empty");
+            return Err(());
+        }
+
+        // TODO: Fix me
+        if self.cipher_suite_index != our_cipher_suite as u16 {
+            l0g::error!("ServerHello cipher suite mismatch");
+            return Err(());
+        }
+
+        // Are all the expexted extensions there? By this we enforce that the PSK key exchange
+        // is ECDHE.
+        // Verify with RFC8446, section 9.2
+        let (Some(selected_supported_version), Some(key_share), Some(selected_psk)) = (
+            &self.extensions.selected_supported_version,
+            &self.extensions.key_share,
+            &self.extensions.pre_shared_key,
+        ) else {
+            // TODO: For now we expect these specific extensions.
+            l0g::error!("ServerHello: Not all expected extensions are provided {self:02x?}");
+            return Err(());
+        };
+
+        if selected_supported_version.version != DtlsVersions::V1_3 {
+            // We only support DTLS 1.3.
+            l0g::error!("Not DTLS 1.3");
+            return Err(());
+        }
+        l0g::trace!("DTLS version OK: {:?}", selected_supported_version);
+
+        if key_share.group != NamedGroup::X25519 && key_share.opaque.len() == 32 {
+            l0g::error!(
+                    "ClientHello: The keyshare named group is unsupported or wrong key length: {:?}, len = {}",
+                    key_share.group,
+                    key_share.opaque.len()
+                );
+            return Err(());
+        }
+        l0g::trace!("Keyshare is OK: {:?}", key_share.group);
+
+        // TODO: We currently use the assumption that there is one PSK by looking for idx 0.
+        if selected_psk.selected_identity != 0 {
+            l0g::error!("ServerHello: Unknown selected Psk: {selected_psk:?}");
+            return Err(());
+        };
+        l0g::trace!("Selected Psk identity OK");
+
+        let their_public_key =
+            PublicKey::from(TryInto::<[u8; 32]>::try_into(key_share.opaque).unwrap());
+
+        l0g::trace!("ServerHello VALID");
+
+        Ok(their_public_key)
     }
 }
 

@@ -8,7 +8,7 @@ use sha2::Sha256;
 /// Represents a TLS 1.3 cipher suite
 #[repr(u16)]
 #[derive(Copy, Clone, Debug, defmt::Format, num_enum::TryFromPrimitive)]
-pub enum CipherSuite {
+pub enum CodePoint {
     // TlsAes128GcmSha256 = 0x1301,
     // TlsAes256GcmSha384 = 0x1302,
     // TlsChacha20Poly1305Sha256 = 0x1303,
@@ -21,7 +21,7 @@ pub enum CipherSuite {
 /// Defines cipher and hash to use for as crypto suite.
 pub trait TlsCipherSuite {
     /// The code point as defined in https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml
-    const CODE_POINT: CipherSuite;
+    const CODE_POINT: CodePoint;
 
     /// Cipher to use with this cipher suite.
     type Cipher: AeadMutInPlace + KeySizeUser;
@@ -35,7 +35,7 @@ pub trait TlsCipherSuite {
 pub struct TlsEcdhePskWithChacha20Poly1305Sha256;
 
 impl TlsCipherSuite for TlsEcdhePskWithChacha20Poly1305Sha256 {
-    const CODE_POINT: CipherSuite = CipherSuite::TlsEcdhePskWithChacha20Poly1305Sha256;
+    const CODE_POINT: CodePoint = CodePoint::TlsEcdhePskWithChacha20Poly1305Sha256;
 
     type Cipher = ChaCha20Poly1305;
     type Hash = Sha256;

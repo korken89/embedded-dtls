@@ -48,7 +48,7 @@ impl rand::RngCore for FakeRandom {
 }
 
 pub mod client_config {
-    use crate::{cipher_suites::CipherSuite, handshake::extensions::Psk};
+    use crate::handshake::extensions::Psk;
 
     /// Client configuration.
     #[derive(Debug)]
@@ -57,11 +57,6 @@ pub mod client_config {
         /// TODO: Support a list of PSKs. Needs work in how to calculate binders and track all the
         /// necessary early secrets derived from the PSKs until the server selects one PSK.
         pub psk: Psk<'a>,
-    }
-
-    pub(crate) struct ClientHelloConfig {
-        hash_size: usize,
-        code_point: CipherSuite,
     }
 }
 
@@ -187,8 +182,9 @@ pub mod client {
         buffer::{EncodingBuffer, ParseBuffer},
         cipher_suites::TlsCipherSuite,
         client_config::ClientConfig,
+        handshake::ServerHandshake,
         key_schedule::KeySchedule,
-        record::ClientRecord,
+        record::{ClientRecord, ServerRecord},
         Datagram, Error,
     };
     use chacha20poly1305::{AeadCore, KeySizeUser};
@@ -202,10 +198,7 @@ pub mod client {
         /// Sender/receiver of data.
         socket: Socket,
         /// TODO: Keys for client->server and server->client. Also called "key schedule".
-        key_schedule: KeySchedule<
-            <CipherSuite as TlsCipherSuite>::Hash,
-            <CipherSuite as TlsCipherSuite>::Cipher,
-        >,
+        key_schedule: KeySchedule<CipherSuite>,
     }
 
     impl<Socket, CipherSuite> ClientConnection<Socket, CipherSuite>
@@ -241,16 +234,17 @@ pub mod client {
 
             // Send ClientHello.
             {
-                let hello =
-                    ClientRecord::<'_, CipherSuite>::client_hello(config, our_public_key, rng);
-                let mut ser_buf = EncodingBuffer::new(buf);
-                let positions = hello
-                    .encode(&mut ser_buf, &mut key_schedule, &mut transcript_hasher, rng)
-                    .map_err(|_| Error::InsufficientSpace)?;
+                let ser_buf = &mut EncodingBuffer::new(buf);
+                ClientRecord::encode_client_hello::<CipherSuite, _>(
+                    ser_buf,
+                    config,
+                    &our_public_key,
+                    rng,
+                    &mut key_schedule,
+                    &mut transcript_hasher,
+                )
+                .map_err(|_| Error::InsufficientSpace)?;
 
-                // Do transcript hashing, create binders, do transcript hashing again
-
-                l0g::debug!("Sending client hello: {:02x?}", hello);
                 socket.send(&ser_buf).await.map_err(|e| Error::Send(e))?;
             }
 
@@ -261,8 +255,16 @@ pub mod client {
 
                 // Parse and validate ServerHello.
                 let parse_buffer = &mut ParseBuffer::new(resp);
+
                 let (server_hello, positions) =
-                    parse::parse_server_hello(parse_buffer).ok_or(Error::InvalidServerHello)?;
+                    if let (ServerRecord::Handshake(ServerHandshake::ServerHello(hello), _), pos) =
+                        ServerRecord::parse(parse_buffer).ok_or(Error::InvalidServerHello)?
+                    {
+                        (hello, pos)
+                    } else {
+                        return Err(Error::InvalidServerHello);
+                    };
+
                 let to_hash = positions
                     .into_slice(resp)
                     .ok_or(Error::InvalidServerHello)?;
@@ -310,220 +312,19 @@ pub mod client {
             })
         }
     }
-
-    mod parse {
-        use x25519_dalek::PublicKey;
-
-        use crate::{
-            buffer::ParseBuffer,
-            cipher_suites::CipherSuite,
-            handshake::{
-                extensions::{DtlsVersions, NamedGroup, ParseServerExtensions},
-                HandshakeHeader, HandshakeType,
-            },
-            record::{
-                ContentType, DTlsPlaintextHeader, ProtocolVersion, RecordPayloadPositions,
-                LEGACY_DTLS_VERSION,
-            },
-        };
-
-        pub fn parse_server_hello<'a>(
-            buf: &mut ParseBuffer<'a>,
-        ) -> Option<(ServerHello<'a>, RecordPayloadPositions)> {
-            let record = ServerRecord::parse(buf)?;
-
-            if let (ServerRecord::Handshake(ServerHandshake::ServerHello(hello)), pos) = record {
-                return Some((hello, pos));
-            }
-
-            None
-        }
-
-        pub enum ServerRecord<'a> {
-            Handshake(ServerHandshake<'a>),
-            Alert(),
-            Heartbeat(),
-            Ack(),
-            ApplicationData(),
-        }
-
-        impl<'a> ServerRecord<'a> {
-            fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, RecordPayloadPositions)> {
-                // Parse record.
-                let record_header = DTlsPlaintextHeader::parse(buf)?;
-                let record_payload = buf.pop_slice(record_header.length.into())?;
-                l0g::trace!("Got record: {:?}", record_header);
-
-                let mut buf = ParseBuffer::new(record_payload);
-                let start = buf.current_pos_ptr();
-
-                let ret = match record_header.type_ {
-                    ContentType::Handshake => {
-                        let handshake = ServerHandshake::parse(&mut buf)?;
-
-                        ServerRecord::Handshake(handshake)
-                    }
-                    ContentType::Ack => todo!(),
-                    ContentType::Heartbeat => todo!(),
-                    ContentType::Alert => todo!(),
-                    ContentType::ApplicationData => todo!(),
-                    ContentType::ChangeCipherSpec => todo!(),
-                };
-
-                let end = buf.current_pos_ptr();
-
-                Some((ret, RecordPayloadPositions { start, end }))
-            }
-        }
-
-        enum ServerHandshake<'a> {
-            ServerHello(ServerHello<'a>),
-            Finished(),
-            KeyUpdate(),
-        }
-
-        impl<'a> ServerHandshake<'a> {
-            /// Parse a handshake message.
-            pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
-                let handshake_header = HandshakeHeader::parse(buf)?;
-
-                if handshake_header.length != handshake_header.fragment_length {
-                    l0g::error!("We don't support fragmented handshakes yet.");
-                    return None;
-                }
-
-                let handshake_payload =
-                    buf.pop_slice(handshake_header.fragment_length.get() as usize)?;
-
-                l0g::trace!("Got handshake: {:?}", handshake_header);
-
-                match handshake_header.msg_type {
-                    HandshakeType::ServerHello => {
-                        let mut buf = ParseBuffer::new(handshake_payload);
-                        let mut server_hello = ServerHello::parse(&mut buf)?;
-
-                        l0g::trace!("Got server hello: {:02x?}", server_hello);
-
-                        Some(Self::ServerHello(server_hello))
-                    }
-                    HandshakeType::Finished => todo!(),
-                    HandshakeType::KeyUpdate => todo!(),
-                    _ => None,
-                }
-            }
-        }
-
-        #[derive(Debug)]
-        pub struct ServerHello<'a> {
-            pub version: ProtocolVersion,
-            pub legacy_session_id_echo: &'a [u8],
-            pub cipher_suite: u16,
-            pub extensions: ParseServerExtensions<'a>,
-        }
-
-        impl<'a> ServerHello<'a> {
-            pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
-                let version = buf.pop_u16_be()?.to_be_bytes();
-                let _random = buf.pop_slice(32)?;
-                let legacy_session_id_len = buf.pop_u8()?;
-                let legacy_session_id_echo = buf.pop_slice(legacy_session_id_len as usize)?;
-
-                let cipher_suite = buf.pop_u16_be()?;
-
-                let _legacy_compression_method = buf.pop_u8()?;
-
-                // Extensions
-                let extensions = ParseServerExtensions::parse(buf)?;
-
-                Some(Self {
-                    version,
-                    legacy_session_id_echo,
-                    cipher_suite,
-                    extensions,
-                })
-            }
-
-            /// Validate the server hello.
-            pub fn validate(&self, our_cipher_suite: CipherSuite) -> Result<PublicKey, ()> {
-                if self.version != LEGACY_DTLS_VERSION {
-                    l0g::error!(
-                        "ServerHello version is not legacy DTLS version: {:02x?}",
-                        self.version
-                    );
-                    return Err(());
-                }
-
-                if !self.legacy_session_id_echo.is_empty() {
-                    l0g::error!("ServerHello legacy session id echo is not empty");
-                    return Err(());
-                }
-
-                if self.cipher_suite != our_cipher_suite as u16 {
-                    l0g::error!("ServerHello cipher suite mismatch");
-                    return Err(());
-                }
-
-                // Are all the expexted extensions there? By this we enforce that the PSK key exchange
-                // is ECDHE.
-                // Verify with RFC8446, section 9.2
-                let (Some(selected_supported_version), Some(key_share), Some(selected_psk)) = (
-                    &self.extensions.selected_supported_version,
-                    &self.extensions.key_share,
-                    &self.extensions.pre_shared_key,
-                ) else {
-                    // TODO: For now we expect these specific extensions.
-                    l0g::error!(
-                        "ServerHello: Not all expected extensions are provided {self:02x?}"
-                    );
-                    return Err(());
-                };
-
-                if selected_supported_version.version != DtlsVersions::V1_3 {
-                    // We only support DTLS 1.3.
-                    l0g::error!("Not DTLS 1.3");
-                    return Err(());
-                }
-                l0g::trace!("DTLS version OK: {:?}", selected_supported_version);
-
-                if key_share.group != NamedGroup::X25519 && key_share.opaque.len() == 32 {
-                    l0g::error!(
-                    "ClientHello: The keyshare named group is unsupported or wrong key length: {:?}, len = {}",
-                    key_share.group,
-                    key_share.opaque.len()
-                );
-                    return Err(());
-                }
-                l0g::trace!("Keyshare is OK: {:?}", key_share.group);
-
-                // TODO: We currently use the assumption that there is one PSK by looking for idx 0.
-                if selected_psk.selected_identity != 0 {
-                    l0g::error!("ServerHello: Unknown selected Psk: {selected_psk:?}");
-                    return Err(());
-                };
-                l0g::trace!("Selected Psk identity OK");
-
-                let their_public_key =
-                    PublicKey::from(TryInto::<[u8; 32]>::try_into(key_share.opaque).unwrap());
-
-                l0g::trace!("ServerHello VALID");
-
-                Ok(their_public_key)
-            }
-        }
-    }
 }
 
 // Lives in std land.
 pub mod server {
     use crate::{
         buffer::EncodingBuffer,
+        cipher_suites::TlsEcdhePskWithChacha20Poly1305Sha256,
         handshake::extensions::{DtlsVersions, Psk},
         key_schedule::KeySchedule,
         record::ServerRecord,
         server_config::{Identity, Key, ServerConfig},
         Datagram, Error,
     };
-    use chacha20poly1305::ChaCha20Poly1305;
     use digest::Digest;
     use sha2::Sha256;
     use x25519_dalek::{EphemeralSecret, PublicKey};
@@ -607,18 +408,19 @@ pub mod server {
 
             // Send server hello.
             // TODO: We hardcode the selected PSK as the first one for now.
-            let server_hello = ServerRecord::server_hello(
-                client_hello.legacy_session_id,
+            let legacy_session_id = client_hello.legacy_session_id;
+            let mut enc_buf = EncodingBuffer::new(buf);
+            ServerRecord::encode_server_hello(
+                &legacy_session_id,
                 DtlsVersions::V1_3,
                 our_public_key,
                 selected_cipher_suite,
                 0,
-            );
+                &mut enc_buf,
+            )
+            .map_err(|_| Error::InsufficientSpace)?;
 
-            let mut enc_buf = EncodingBuffer::new(buf);
-            server_hello
-                .encode(&mut enc_buf, |_| unreachable!())
-                .map_err(|_| Error::InsufficientSpace)?;
+            // TODO: Check that this is correct, I think this hashes the plaintext header.
             transcript_hasher.update(&enc_buf);
 
             key_schedule.initialize_handshake_secret(
@@ -628,8 +430,6 @@ pub mod server {
 
             // l0g::error!("Server handshake traffic secrets: {handshake_traffic_secrets:02x?}");
 
-            l0g::debug!("Sending server hello: {server_hello:02x?}");
-
             // TODO: Add the Finished message to this datagram.
 
             let transcript = transcript_hasher.clone().finalize();
@@ -638,7 +438,7 @@ pub mod server {
             l0g::debug!("Sending server finished: {server_finished:02x?}");
 
             server_finished
-                .encode(&mut enc_buf, |_| {
+                .encode(&mut enc_buf, |_encryption_args| {
                     // TODO: todo!()
                 })
                 .map_err(|_| Error::InsufficientSpace)?;
@@ -662,7 +462,7 @@ pub mod server {
 
     enum ServerKeySchedule {
         /// Key schedule for the Chacha20Poly1305 cipher suite.
-        Chacha20Poly1305Sha256(KeySchedule<Sha256, ChaCha20Poly1305>),
+        Chacha20Poly1305Sha256(KeySchedule<TlsEcdhePskWithChacha20Poly1305Sha256>),
     }
 
     impl ServerKeySchedule {

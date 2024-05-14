@@ -50,55 +50,231 @@ impl<'a> ParseExtension<'a> {
     }
 }
 
-#[derive(Clone, Debug, PartialOrd, PartialEq)]
+#[derive(Clone, Default, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct NewClientExtensions<'a> {
+pub struct ClientExtensions<'a> {
     pub psk_key_exchange_modes: Option<PskKeyExchangeModes>,
     pub key_share: Option<KeyShareEntry<'a>>,
     pub supported_versions: Option<ClientSupportedVersions>,
     pub pre_shared_key: Option<OfferedPsks<'a>>,
 }
 
-impl<'a> NewClientExtensions<'a> {
+impl<'a> ClientExtensions<'a> {
     /// Encode client extensions.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<Option<AllocSliceHandle>, ()> {
         if let Some(supported_version) = &self.supported_versions {
             buf.push_u8(ExtensionType::SupportedVersions as u8)?;
-            self.encode_extension(buf, |buf| supported_version.encode(buf))??;
+            encode_extension(buf, |buf| supported_version.encode(buf))??;
         }
         if let Some(pkem) = &self.psk_key_exchange_modes {
             buf.push_u8(ExtensionType::PskKeyExchangeModes as u8)?;
-            self.encode_extension(buf, |buf| pkem.encode(buf))??;
+            encode_extension(buf, |buf| pkem.encode(buf))??;
         }
         if let Some(key_share) = &self.key_share {
             buf.push_u8(ExtensionType::KeyShare as u8)?;
-            self.encode_extension(buf, |buf| key_share.encode(buf))??;
+            encode_extension(buf, |buf| key_share.encode(buf))??;
         }
 
         if let Some(psk) = &self.pre_shared_key {
             buf.push_u8(ExtensionType::PreSharedKey as u8)?;
-            Ok(Some(self.encode_extension(buf, |buf| psk.encode(buf))??))
+            Ok(Some(encode_extension(buf, |buf| psk.encode(buf))??))
         } else {
             Ok(None)
         }
     }
 
-    fn encode_extension<R, F: FnOnce(&mut EncodingBuffer) -> R>(
-        &self,
-        buf: &mut EncodingBuffer,
-        f: F,
-    ) -> Result<R, ()> {
-        let extension_length_allocation = buf.alloc_u16()?;
-        let content_start = buf.len();
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, Option<usize>)> {
+        let mut ret = ClientExtensions::default();
+        let mut binders_start = None;
 
-        let r = f(buf);
+        let extensions_length = buf.pop_u16_be()?;
+        let mut extensions = ParseBuffer::new(buf.pop_slice(extensions_length as usize)?);
 
-        // Fill in the length of this extension.
-        let content_length = (buf.len() - content_start) as u16;
-        extension_length_allocation.set(buf, content_length);
+        while let Some(extension) = ParseExtension::parse(&mut extensions) {
+            if ret.pre_shared_key.is_some() {
+                l0g::error!("Got more extensions after PreSharedKey!");
+                return None;
+            }
 
-        Ok(r)
+            match extension.extension_type {
+                ExtensionType::SupportedVersions => {
+                    let Some(v) = ClientSupportedVersions::parse(&mut ParseBuffer::new(
+                        extension.extension_data,
+                    )) else {
+                        l0g::error!("Failed to parse supported version");
+                        return None;
+                    };
+
+                    if ret.supported_versions.is_some() {
+                        l0g::error!("Supported version extension already parsed!");
+                        return None;
+                    }
+
+                    ret.supported_versions = Some(v);
+                }
+                ExtensionType::PskKeyExchangeModes => {
+                    let Some(v) =
+                        PskKeyExchangeModes::parse(&mut ParseBuffer::new(extension.extension_data))
+                    else {
+                        l0g::error!("Failed to parse PskKeyExchange");
+                        return None;
+                    };
+
+                    if ret.psk_key_exchange_modes.is_some() {
+                        l0g::error!("PskKeyExchangeModes extension already parsed!");
+                        return None;
+                    }
+
+                    ret.psk_key_exchange_modes = Some(v);
+                }
+                ExtensionType::KeyShare => {
+                    let Some(v) =
+                        KeyShareEntry::parse(&mut ParseBuffer::new(extension.extension_data))
+                    else {
+                        l0g::error!("Failed to parse PskKeyExchange");
+                        return None;
+                    };
+
+                    if ret.key_share.is_some() {
+                        l0g::error!("Keyshare extension already parsed!");
+                        return None;
+                    }
+
+                    ret.key_share = Some(v);
+                }
+                ExtensionType::PreSharedKey => {
+                    let Some((psk, binders_start_pos)) =
+                        OfferedPreSharedKey::parse(&mut ParseBuffer::new(extension.extension_data))
+                    else {
+                        l0g::error!("Failed to parse PreSharedKey");
+                        return None;
+                    };
+
+                    if ret.pre_shared_key.is_some() {
+                        l0g::error!("PreSharedKey extension already parsed!");
+                        return None;
+                    }
+
+                    binders_start = Some(binders_start_pos);
+                    ret.pre_shared_key = Some(psk);
+                }
+                _ => {
+                    l0g::error!("Got more extensions than what's supported!");
+                    return None;
+                }
+            }
+        }
+
+        Some((ret, binders_start))
     }
+}
+
+/// Helper to parse server extensions.
+#[derive(Debug, Default)]
+pub struct NewServerExtensions<'a> {
+    pub selected_supported_version: Option<ServerSupportedVersion>,
+    pub key_share: Option<KeyShareEntry<'a>>,
+    pub pre_shared_key: Option<SelectedPsk>,
+}
+
+impl<'a> NewServerExtensions<'a> {
+    /// Encode server extensions.
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+        if let Some(supported_version) = &self.selected_supported_version {
+            buf.push_u8(ExtensionType::SupportedVersions as u8)?;
+            encode_extension(buf, |buf| supported_version.encode(buf))??;
+        }
+        if let Some(key_share) = &self.key_share {
+            buf.push_u8(ExtensionType::KeyShare as u8)?;
+            encode_extension(buf, |buf| key_share.encode(buf))??;
+        }
+
+        if let Some(psk) = &self.pre_shared_key {
+            buf.push_u8(ExtensionType::PreSharedKey as u8)?;
+            encode_extension(buf, |buf| psk.encode(buf))??;
+        }
+
+        Ok(())
+    }
+
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+        let mut ret = NewServerExtensions::default();
+
+        let extensions_length = buf.pop_u16_be()?;
+        let mut extensions = ParseBuffer::new(buf.pop_slice(extensions_length as usize)?);
+
+        while let Some(extension) = ParseExtension::parse(&mut extensions) {
+            match extension.extension_type {
+                ExtensionType::KeyShare => {
+                    let Some(v) =
+                        KeyShareEntry::parse(&mut ParseBuffer::new(extension.extension_data))
+                    else {
+                        l0g::error!("Failed to parse PskKeyExchange");
+                        return None;
+                    };
+
+                    if ret.key_share.is_some() {
+                        l0g::error!("Keyshare extension already parsed!");
+                        return None;
+                    }
+
+                    ret.key_share = Some(v);
+                }
+                ExtensionType::SupportedVersions => {
+                    let Some(v) = ServerSupportedVersion::parse(&mut ParseBuffer::new(
+                        extension.extension_data,
+                    )) else {
+                        l0g::error!("Failed to parse ServerSelectedVersion");
+                        return None;
+                    };
+
+                    if ret.selected_supported_version.is_some() {
+                        l0g::error!("Keyshare extension already parsed!");
+                        return None;
+                    }
+
+                    ret.selected_supported_version = Some(v);
+                }
+                ExtensionType::PreSharedKey => {
+                    let Some(v) =
+                        SelectedPsk::parse(&mut ParseBuffer::new(extension.extension_data))
+                    else {
+                        l0g::error!("Failed to parse SelectedPsk");
+                        return None;
+                    };
+
+                    if ret.pre_shared_key.is_some() {
+                        l0g::error!("Keyshare extension already parsed!");
+                        return None;
+                    }
+
+                    ret.pre_shared_key = Some(v);
+                }
+                _ => {
+                    l0g::error!("Got more extensions than what's supported!");
+                    return None;
+                }
+            }
+        }
+
+        Some(ret)
+    }
+}
+
+fn encode_extension<R, F: FnOnce(&mut EncodingBuffer) -> R>(
+    buf: &mut EncodingBuffer,
+    f: F,
+) -> Result<R, ()> {
+    let extension_length_allocation = buf.alloc_u16()?;
+    let content_start = buf.len();
+
+    let r = f(buf);
+
+    // Fill in the length of this extension.
+    let content_length = (buf.len() - content_start) as u16;
+    extension_length_allocation.set(buf, content_length);
+
+    Ok(r)
 }
 
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
@@ -335,7 +511,10 @@ impl ServerSupportedVersion {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct OfferedPsks<'a> {
     /// List of identities that can be used. Ticket age is set to 0.
-    pub identities: &'a [&'a Psk<'a>],
+    pub identities: &'a [Psk<'a>],
+
+    // pub ser: &'a [Psk<'a>],
+    // pub deser: PskIter<'a>,
     /// Size of the binder hash.
     pub hash_size: usize,
 }
@@ -371,7 +550,6 @@ impl<'a> OfferedPsks<'a> {
 pub struct OfferedPreSharedKey<'a> {
     pub identity: &'a [u8],
     pub binder: &'a [u8],
-    pub _ticket_age: u32,
 }
 
 impl<'a> OfferedPreSharedKey<'a> {
@@ -391,7 +569,7 @@ impl<'a> OfferedPreSharedKey<'a> {
         }
 
         let identity = buf.pop_slice(identity_length as usize)?;
-        let ticket_age = buf.pop_u32_be()?;
+        let _ticket_age = buf.pop_u32_be()?;
 
         // Binders part
         let binders_size = buf.pop_u16_be()?;
@@ -413,7 +591,6 @@ impl<'a> OfferedPreSharedKey<'a> {
             OfferedPreSharedKey {
                 identity: identity,
                 binder: binder,
-                _ticket_age: ticket_age,
             },
             binders_start_pos,
         ))

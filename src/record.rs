@@ -3,12 +3,17 @@ use crate::{
     cipher_suites::TlsCipherSuite,
     client_config::ClientConfig,
     handshake::{
-        extensions::DtlsVersions, ClientHandshake, ClientHello, Finished, ServerHandshake,
-        ServerHello,
+        extensions::{
+            ClientExtensions, ClientSupportedVersions, DtlsVersions, KeyShareEntry, NamedGroup,
+            NewServerExtensions, OfferedPsks, PskKeyExchangeMode, PskKeyExchangeModes, SelectedPsk,
+            ServerSupportedVersion,
+        },
+        ClientHandshake, ClientHello, Finished, ServerHandshake, ServerHello,
     },
     integers::U48,
     key_schedule::KeySchedule,
 };
+use digest::OutputSizeUser;
 use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
 use std::ops::Range;
@@ -65,28 +70,55 @@ pub enum ClientRecord<'a> {
 
 impl<'a> ClientRecord<'a> {
     /// Create a client hello handshake.
-    pub fn encode_client_hello<Rng>(
+    pub fn encode_client_hello<CipherSuite: TlsCipherSuite, Rng: RngCore + CryptoRng>(
+        buf: &mut EncodingBuffer,
         config: &'a ClientConfig<'a>,
-        public_key: PublicKey,
+        public_key: &PublicKey,
         rng: &mut Rng,
-    ) -> Self
+        key_schedule: &mut KeySchedule<CipherSuite>,
+        transcript_hasher: &mut CipherSuite::Hash,
+    ) -> Result<(), ()>
     where
         Rng: RngCore + CryptoRng,
     {
+        let identities = &[config.psk.clone()];
+        let client_hello = ClientHello {
+            version: LEGACY_DTLS_VERSION,
+            legacy_session_id: &[],
+            cipher_suites: &(<CipherSuite as TlsCipherSuite>::CODE_POINT as u16).to_be_bytes(),
+            extensions: ClientExtensions {
+                psk_key_exchange_modes: Some(PskKeyExchangeModes {
+                    ke_modes: PskKeyExchangeMode::PskDheKe,
+                }),
+                key_share: Some(KeyShareEntry {
+                    group: NamedGroup::X25519,
+                    opaque: public_key.as_bytes(),
+                }),
+                supported_versions: Some(ClientSupportedVersions {
+                    version: DtlsVersions::V1_3,
+                }),
+                pre_shared_key: Some(OfferedPsks {
+                    identities,
+                    hash_size:
+                        <<CipherSuite as TlsCipherSuite>::Hash as OutputSizeUser>::output_size(),
+                }),
+            },
+        };
+
+        l0g::debug!("Sending client hello: {:02x?}", client_hello);
+
         ClientRecord::Handshake(
-            ClientHandshake::ClientHello(ClientHello::new(config, public_key)),
+            ClientHandshake::ClientHello(client_hello),
             Encryption::Disabled,
         )
+        .encode::<CipherSuite, Rng>(buf, key_schedule, transcript_hasher, rng)
     }
 
     /// Encode the record into a buffer.
     pub fn encode<'buf, CipherSuite: TlsCipherSuite, Rng: RngCore + CryptoRng>(
         &self,
         buf: &'buf mut EncodingBuffer,
-        key_schedule: &mut KeySchedule<
-            <CipherSuite as TlsCipherSuite>::Hash,
-            <CipherSuite as TlsCipherSuite>::Cipher,
-        >,
+        key_schedule: &mut KeySchedule<CipherSuite>,
         transcript_hasher: &mut CipherSuite::Hash,
         rng: &mut Rng,
     ) -> Result<(), ()> {
@@ -110,7 +142,12 @@ impl<'a> ClientRecord<'a> {
                 match self {
                     // NOTE: Each record encoder needs to update the transcript hash at their end.
                     ClientRecord::Handshake(handshake, _) => {
-                        handshake.encode(&mut inner_buf, key_schedule, transcript_hasher, rng)?;
+                        handshake.encode::<Rng, CipherSuite>(
+                            &mut inner_buf,
+                            key_schedule,
+                            transcript_hasher,
+                            rng,
+                        )?;
                     }
                     ClientRecord::Alert(_, _) => todo!(),
                     ClientRecord::Ack(_, _) => todo!(),
@@ -179,23 +216,39 @@ pub enum ServerRecord<'a> {
 
 impl<'a> ServerRecord<'a> {
     /// Create a client hello handshake.
-    pub fn server_hello(
-        legacy_session_id: Vec<u8>,
+    pub fn encode_server_hello<'buf>(
+        legacy_session_id: &[u8],
         supported_version: DtlsVersions,
         public_key: PublicKey,
         selected_cipher_suite: u16,
         selected_psk_identity: u16,
-    ) -> Self {
+        buf: &'buf mut EncodingBuffer,
+    ) -> Result<(), ()> {
+        let server_hello = ServerHello {
+            version: LEGACY_DTLS_VERSION,
+            legacy_session_id_echo: &legacy_session_id,
+            cipher_suite_index: selected_cipher_suite,
+            extensions: NewServerExtensions {
+                selected_supported_version: Some(ServerSupportedVersion {
+                    version: supported_version,
+                }),
+                key_share: Some(KeyShareEntry {
+                    group: NamedGroup::X25519,
+                    opaque: public_key.as_bytes(),
+                }),
+                pre_shared_key: Some(SelectedPsk {
+                    selected_identity: selected_psk_identity,
+                }),
+            },
+        };
+
+        l0g::debug!("Sending server hello: {server_hello:02x?}");
+
         ServerRecord::Handshake(
-            ServerHandshake::ServerHello(ServerHello::new(
-                legacy_session_id,
-                supported_version,
-                public_key,
-                selected_cipher_suite,
-                selected_psk_identity,
-            )),
+            ServerHandshake::ServerHello(server_hello),
             Encryption::Disabled,
         )
+        .encode(buf, |_| unreachable!())
     }
 
     /// Create a server's finished message.
@@ -348,6 +401,34 @@ impl<'a> ServerRecord<'a> {
             ServerRecord::Heartbeat(_) => ContentType::Heartbeat,
             ServerRecord::ApplicationData() => ContentType::ApplicationData,
         }
+    }
+
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, RecordPayloadPositions)> {
+        // Parse record.
+        // TODO: Parse encrypted record
+        let record_header = DTlsPlaintextHeader::parse(buf)?;
+        let record_payload = buf.pop_slice(record_header.length.into())?;
+        l0g::trace!("Got record: {:?}", record_header);
+
+        let mut buf = ParseBuffer::new(record_payload);
+        let start = buf.current_pos_ptr();
+
+        let ret = match record_header.type_ {
+            ContentType::Handshake => {
+                let handshake = ServerHandshake::parse(&mut buf)?;
+
+                ServerRecord::Handshake(handshake, Encryption::Disabled)
+            }
+            ContentType::Ack => todo!(),
+            ContentType::Heartbeat => todo!(),
+            ContentType::Alert => todo!(),
+            ContentType::ApplicationData => todo!(),
+            ContentType::ChangeCipherSpec => todo!(),
+        };
+
+        let end = buf.current_pos_ptr();
+
+        Some((ret, RecordPayloadPositions { start, end }))
     }
 }
 

@@ -14,7 +14,7 @@
 //      HKDF-Expand-Label(Secret, Label,
 //                        Transcript-Hash(Messages), Hash.length)
 
-use crate::{buffer::EncodingBuffer, handshake::extensions::Psk};
+use crate::{buffer::EncodingBuffer, cipher_suites::TlsCipherSuite, handshake::extensions::Psk};
 use chacha20poly1305::{AeadCore, KeySizeUser};
 use digest::{
     core_api::BlockSizeUser,
@@ -97,31 +97,27 @@ pub struct Iv<N: ArrayLength<u8>> {
     key: GenericArray<u8, N>,
 }
 
-struct Secret<Hash: Digest + OutputSizeUser + BlockSizeUser + Clone, Cipher: AeadCore + KeySizeUser>
-{
+struct Secret<CipherSuite: TlsCipherSuite> {
     // TODO: This is not used as the `secret` is stored in the hkdf.
     // /// Extract secret.
     // secret: HashArray<D>,
     /// HKDF to derive secrets from.
-    hkdf: SimpleHkdf<Hash>,
+    hkdf: SimpleHkdf<<CipherSuite as TlsCipherSuite>::Hash>,
     /// Traffic secret.
-    traffic_secrets: TrafficSecrets<Cipher>,
+    traffic_secrets: TrafficSecrets<<CipherSuite as TlsCipherSuite>::Cipher>,
     // /// Server handshake traffic secret.
     // server_handshake_traffic_secret: Key<D>,
 }
 
-enum KeyScheduleState<
-    Hash: Digest + OutputSizeUser + BlockSizeUser + Clone,
-    Cipher: AeadCore + KeySizeUser,
-> {
+enum KeyScheduleState<CipherSuite: TlsCipherSuite> {
     /// Not initialized.
     Uninitialized,
     /// Optional PSK initialization is done.
-    EarlySecret(EarlySecret<Hash>),
+    EarlySecret(EarlySecret<<CipherSuite as TlsCipherSuite>::Hash>),
     /// Handshake secret is created.
-    HandshakeSecret(Secret<Hash, Cipher>),
+    HandshakeSecret(Secret<CipherSuite>),
     /// Master secret is created.
-    MasterSecret(Secret<Hash, Cipher>),
+    MasterSecret(Secret<CipherSuite>),
 }
 
 /// This tracks the state of the shared secrets.
@@ -129,19 +125,15 @@ enum KeyScheduleState<
 // Check the flow-chart in RFC8446 section 7.1, page 93 to see the entire flow.
 // This means that the HKDF needs to be tracked as continous state for the entire lifetime of the
 // connection.
-pub struct KeySchedule<
-    Hash: Digest + OutputSizeUser + BlockSizeUser + Clone,
-    Cipher: AeadCore + KeySizeUser,
-> {
-    keyschedule_state: KeyScheduleState<Hash, Cipher>,
+pub struct KeySchedule<CipherSuite: TlsCipherSuite> {
+    keyschedule_state: KeyScheduleState<CipherSuite>,
     // server_state: ServerKeySchedule<D>,
     // client_state: ClientKeySchedule<D>,
 }
 
-impl<Hash, Cipher> KeySchedule<Hash, Cipher>
+impl<CipherSuite> KeySchedule<CipherSuite>
 where
-    Hash: Digest + OutputSizeUser + BlockSizeUser + Clone,
-    Cipher: AeadCore + KeySizeUser,
+    CipherSuite: TlsCipherSuite,
 {
     /// Create a new key schedule.
     pub fn new() -> Self {
@@ -159,7 +151,10 @@ where
     }
 
     /// Derive a secret for the current state in the key schedule.
-    fn derive_secret(&self, label: HkdfLabelContext) -> HashArray<Hash> {
+    fn derive_secret(
+        &self,
+        label: HkdfLabelContext,
+    ) -> HashArray<<CipherSuite as TlsCipherSuite>::Hash> {
         let hkdf = match &self.keyschedule_state {
             KeyScheduleState::Uninitialized => unreachable!("Internal error! `derive_secret` was called before the key schedule was initialized"),
             KeyScheduleState::EarlySecret(secret) =>  &secret.hkdf,
@@ -167,14 +162,18 @@ where
             KeyScheduleState::MasterSecret(secret) => &secret.hkdf,
         };
 
-        let mut secret = HashArray::<Hash>::default();
-        hkdf_make_expanded_label::<Hash>(hkdf, label, &mut secret);
+        let mut secret = HashArray::<<CipherSuite as TlsCipherSuite>::Hash>::default();
+        hkdf_make_expanded_label::<<CipherSuite as TlsCipherSuite>::Hash>(hkdf, label, &mut secret);
         secret
     }
 
     /// Calculate a binder. The hash must be the same size as the output for the hash function.
-    pub fn create_binder(&self, transcript_hash: &[u8]) -> Option<HashArray<Hash>> {
-        if transcript_hash.len() != <Hash as Digest>::output_size() {
+    pub fn create_binder(
+        &self,
+        transcript_hash: &[u8],
+    ) -> Option<HashArray<<CipherSuite as TlsCipherSuite>::Hash>> {
+        if transcript_hash.len() != <<CipherSuite as TlsCipherSuite>::Hash as Digest>::output_size()
+        {
             return None;
         }
 
@@ -185,9 +184,11 @@ where
             }
         };
 
-        let binder_hkdf = SimpleHkdf::<Hash>::from_prk(&secret.binder_key).unwrap();
-        let mut binder_key = HashArray::<Hash>::default();
-        hkdf_make_expanded_label::<Hash>(
+        let binder_hkdf =
+            SimpleHkdf::<<CipherSuite as TlsCipherSuite>::Hash>::from_prk(&secret.binder_key)
+                .unwrap();
+        let mut binder_key = HashArray::<<CipherSuite as TlsCipherSuite>::Hash>::default();
+        hkdf_make_expanded_label::<<CipherSuite as TlsCipherSuite>::Hash>(
             &binder_hkdf,
             HkdfLabelContext {
                 label: b"finished",
@@ -196,7 +197,11 @@ where
             &mut binder_key,
         );
 
-        let mut hmac = <SimpleHmac<Hash> as KeyInit>::new_from_slice(&binder_key).unwrap();
+        let mut hmac =
+            <SimpleHmac<<CipherSuite as TlsCipherSuite>::Hash> as KeyInit>::new_from_slice(
+                &binder_key,
+            )
+            .unwrap();
         Mac::update(&mut hmac, &transcript_hash);
 
         Some(hmac.finalize().into_bytes())
@@ -205,7 +210,7 @@ where
     /// Move to the next step in the secrets.
     ///
     /// Note that the next state needs to be initialized with new input key material.
-    fn derived(&self) -> HashArray<Hash> {
+    fn derived(&self) -> HashArray<<CipherSuite as TlsCipherSuite>::Hash> {
         self.derive_secret(HkdfLabelContext {
             label: b"derived",
             context: &[],
@@ -222,16 +227,16 @@ where
         }
 
         // When there is no PSK, input 0s as IKM.
-        let no_psk_ikm = HashArray::<Hash>::default();
-        let (_secret, hkdf) = SimpleHkdf::<Hash>::extract(
-            Some(&HashArray::<Hash>::default()),
+        let no_psk_ikm = HashArray::<<CipherSuite as TlsCipherSuite>::Hash>::default();
+        let (_secret, hkdf) = SimpleHkdf::<<CipherSuite as TlsCipherSuite>::Hash>::extract(
+            Some(&HashArray::<<CipherSuite as TlsCipherSuite>::Hash>::default()),
             psk.map(|psk| psk.key).unwrap_or(&no_psk_ikm),
         );
 
         // binder_key derivation, not using `derive_secret` due to the `keyschedule_state` being
         // wrong here. We update it below.
-        let mut binder_key = HashArray::<Hash>::default();
-        hkdf_make_expanded_label::<Hash>(
+        let mut binder_key = HashArray::<<CipherSuite as TlsCipherSuite>::Hash>::default();
+        hkdf_make_expanded_label::<<CipherSuite as TlsCipherSuite>::Hash>(
             &hkdf,
             HkdfLabelContext {
                 label: b"ext binder",
@@ -254,7 +259,10 @@ where
         }
 
         // Prepare the previous secret for use in the next stage.
-        let (_secret, hkdf) = SimpleHkdf::<Hash>::extract(Some(&self.derived()), ecdhe_secret);
+        let (_secret, hkdf) = SimpleHkdf::<<CipherSuite as TlsCipherSuite>::Hash>::extract(
+            Some(&self.derived()),
+            ecdhe_secret,
+        );
 
         let traffic_secrets = Self::create_handshake_traffic_secrets(&hkdf, transcript);
 
@@ -267,12 +275,12 @@ where
     /// Get the handshake traffic secrets.
     /// The transcript hash is over the ClientHello and ServerHello.
     fn create_handshake_traffic_secrets(
-        hkdf: &SimpleHkdf<Hash>,
+        hkdf: &SimpleHkdf<<CipherSuite as TlsCipherSuite>::Hash>,
         transcript_hash: &[u8],
-    ) -> TrafficSecrets<Cipher> {
+    ) -> TrafficSecrets<<CipherSuite as TlsCipherSuite>::Cipher> {
         // This follows Section 7.3. Traffic Key Calculation in RFC8446.
-        let mut client = HashArray::<Hash>::default();
-        hkdf_make_expanded_label::<Hash>(
+        let mut client = HashArray::<<CipherSuite as TlsCipherSuite>::Hash>::default();
+        hkdf_make_expanded_label::<<CipherSuite as TlsCipherSuite>::Hash>(
             hkdf,
             HkdfLabelContext {
                 label: b"c hs traffic",
@@ -281,8 +289,8 @@ where
             &mut client,
         );
 
-        let mut server = HashArray::<Hash>::default();
-        hkdf_make_expanded_label::<Hash>(
+        let mut server = HashArray::<<CipherSuite as TlsCipherSuite>::Hash>::default();
+        hkdf_make_expanded_label::<<CipherSuite as TlsCipherSuite>::Hash>(
             hkdf,
             HkdfLabelContext {
                 label: b"s hs traffic",
@@ -309,9 +317,9 @@ where
         }
 
         // Prepare the previous secret for use in the next stage.
-        let (_secret, hkdf) = SimpleHkdf::<Hash>::extract(
+        let (_secret, hkdf) = SimpleHkdf::<<CipherSuite as TlsCipherSuite>::Hash>::extract(
             Some(&self.derived()),
-            &HashArray::<Hash>::default(), // The input key material is the "0" string
+            &HashArray::<<CipherSuite as TlsCipherSuite>::Hash>::default(), // The input key material is the "0" string
         );
         let traffic_secrets = todo!();
         self.keyschedule_state = KeyScheduleState::MasterSecret(Secret {
@@ -325,12 +333,12 @@ where
     }
 
     fn create_traffic_keying_material<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>>(
-        secret: &HashArray<Hash>,
+        secret: &HashArray<<CipherSuite as TlsCipherSuite>::Hash>,
     ) -> TrafficKeyingMaterial<KeySize, IvSize> {
         let hkdf = SimpleHkdf::from_prk(&secret).unwrap();
 
         let mut write_key = GenericArray::default();
-        hkdf_make_expanded_label::<Hash>(
+        hkdf_make_expanded_label::<<CipherSuite as TlsCipherSuite>::Hash>(
             &hkdf,
             HkdfLabelContext {
                 label: b"key",
@@ -340,7 +348,7 @@ where
         );
 
         let mut write_iv = GenericArray::default();
-        hkdf_make_expanded_label::<Hash>(
+        hkdf_make_expanded_label::<<CipherSuite as TlsCipherSuite>::Hash>(
             &hkdf,
             HkdfLabelContext {
                 label: b"iv",
@@ -350,7 +358,7 @@ where
         );
 
         let mut sn_key = GenericArray::default();
-        hkdf_make_expanded_label::<Hash>(
+        hkdf_make_expanded_label::<<CipherSuite as TlsCipherSuite>::Hash>(
             &hkdf,
             HkdfLabelContext {
                 label: b"sn",
