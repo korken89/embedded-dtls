@@ -1,6 +1,6 @@
 use crate::{
     buffer::{AllocU16Handle, EncodingBuffer, ParseBuffer},
-    cipher_suites::TlsCipherSuite,
+    cipher_suites::DtlsCipherSuite,
     client_config::ClientConfig,
     handshake::{
         extensions::{
@@ -80,7 +80,7 @@ pub enum ClientRecord<'a> {
 
 impl<'a> ClientRecord<'a> {
     /// Create a client hello handshake.
-    pub fn encode_client_hello<CipherSuite: TlsCipherSuite, Rng: RngCore + CryptoRng>(
+    pub fn encode_client_hello<CipherSuite: DtlsCipherSuite, Rng: RngCore + CryptoRng>(
         buf: &mut EncodingBuffer,
         config: &'a ClientConfig<'a>,
         public_key: &PublicKey,
@@ -95,7 +95,7 @@ impl<'a> ClientRecord<'a> {
         let client_hello = ClientHello {
             version: LEGACY_DTLS_VERSION,
             legacy_session_id: &[],
-            cipher_suites: &(<CipherSuite as TlsCipherSuite>::CODE_POINT as u16).to_be_bytes(),
+            cipher_suites: &(<CipherSuite as DtlsCipherSuite>::CODE_POINT as u16).to_be_bytes(),
             extensions: ClientExtensions {
                 psk_key_exchange_modes: Some(PskKeyExchangeModes {
                     ke_modes: PskKeyExchangeMode::PskDheKe,
@@ -110,7 +110,7 @@ impl<'a> ClientRecord<'a> {
                 pre_shared_key: Some(OfferedPsks {
                     identities: EncodeOrParse::Encode(identities),
                     hash_size: EncodeOrParse::Encode(
-                        <<CipherSuite as TlsCipherSuite>::Hash as OutputSizeUser>::output_size(),
+                        <<CipherSuite as DtlsCipherSuite>::Hash as OutputSizeUser>::output_size(),
                     ),
                 }),
             },
@@ -126,7 +126,7 @@ impl<'a> ClientRecord<'a> {
     }
 
     /// Encode the record into a buffer.
-    pub fn encode<'buf, CipherSuite: TlsCipherSuite, Rng: RngCore + CryptoRng>(
+    pub fn encode<'buf, CipherSuite: DtlsCipherSuite, Rng: RngCore + CryptoRng>(
         &self,
         buf: &'buf mut EncodingBuffer,
         key_schedule: &mut KeySchedule<CipherSuite>,

@@ -1,7 +1,7 @@
 use self::extensions::{ClientExtensions, DtlsVersions, NamedGroup, NewServerExtensions};
 use crate::{
     buffer::{AllocSliceHandle, AllocU16Handle, AllocU24Handle, EncodingBuffer, ParseBuffer},
-    cipher_suites::{CodePoint, TlsCipherSuite},
+    cipher_suites::DtlsCipherSuite,
     handshake::extensions::PskKeyExchangeMode,
     integers::U24,
     key_schedule::KeySchedule,
@@ -27,7 +27,7 @@ pub enum ClientHandshake<'a> {
 }
 
 impl<'a> ClientHandshake<'a> {
-    pub fn encode<Rng: RngCore + CryptoRng, CipherSuite: TlsCipherSuite>(
+    pub fn encode<Rng: RngCore + CryptoRng, CipherSuite: DtlsCipherSuite>(
         &self,
         buf: &mut EncodingBuffer,
         key_schedule: &mut KeySchedule<CipherSuite>,
@@ -573,7 +573,7 @@ impl<'a> ServerHello<'a> {
     }
 
     /// Validate the server hello.
-    pub fn validate(&self, our_cipher_suite: CodePoint) -> Result<PublicKey, ()> {
+    pub fn validate(&self) -> Result<PublicKey, ()> {
         if self.version != LEGACY_DTLS_VERSION {
             l0g::error!(
                 "ServerHello version is not legacy DTLS version: {:02x?}",
@@ -587,8 +587,8 @@ impl<'a> ServerHello<'a> {
             return Err(());
         }
 
-        // TODO: Fix me
-        if self.cipher_suite_index != our_cipher_suite as u16 {
+        // TODO: We only support one today, maybe more in the future.
+        if self.cipher_suite_index != 0 {
             l0g::error!("ServerHello cipher suite mismatch");
             return Err(());
         }

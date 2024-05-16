@@ -180,7 +180,7 @@ pub trait Datagram {
 pub mod client {
     use crate::{
         buffer::{EncodingBuffer, ParseBuffer},
-        cipher_suites::TlsCipherSuite,
+        cipher_suites::DtlsCipherSuite,
         client_config::ClientConfig,
         handshake::ServerHandshake,
         key_schedule::KeySchedule,
@@ -194,7 +194,7 @@ pub mod client {
 
     // TODO: How to select between server and client? Typestate, flag or two separate structs?
     /// A DTLS 1.3 connection.
-    pub struct ClientConnection<Socket, CipherSuite: TlsCipherSuite> {
+    pub struct ClientConnection<Socket, CipherSuite: DtlsCipherSuite> {
         /// Sender/receiver of data.
         socket: Socket,
         /// TODO: Keys for client->server and server->client. Also called "key schedule".
@@ -204,7 +204,7 @@ pub mod client {
     impl<Socket, CipherSuite> ClientConnection<Socket, CipherSuite>
     where
         Socket: Datagram,
-        CipherSuite: TlsCipherSuite + core::fmt::Debug,
+        CipherSuite: DtlsCipherSuite + core::fmt::Debug,
     {
         /// Open a DTLS 1.3 client connection.
         /// This returns an active connection after handshake is completed.
@@ -218,9 +218,9 @@ pub mod client {
         ) -> Result<Self, Error<Socket>>
         where
             Rng: RngCore + CryptoRng,
-            <CipherSuite as TlsCipherSuite>::Hash: std::fmt::Debug,
-            <<CipherSuite as TlsCipherSuite>::Cipher as AeadCore>::NonceSize: std::fmt::Debug,
-            <<CipherSuite as TlsCipherSuite>::Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
+            <CipherSuite as DtlsCipherSuite>::Hash: std::fmt::Debug,
+            <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize: std::fmt::Debug,
+            <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
         {
             let mut key_schedule = KeySchedule::new();
             let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
@@ -272,7 +272,7 @@ pub mod client {
 
                 // Update key schedule to Handshake Secret using public keys.
                 let their_public_key = server_hello
-                    .validate(CipherSuite::CODE_POINT)
+                    .validate()
                     .map_err(|_| Error::InvalidServerHello)?;
                 let shared_secret = secret_key.diffie_hellman(&their_public_key);
                 key_schedule.initialize_handshake_secret(
@@ -318,7 +318,7 @@ pub mod client {
 pub mod server {
     use crate::{
         buffer::{EncodingBuffer, ParseBuffer},
-        cipher_suites::TlsEcdhePskWithChacha20Poly1305Sha256,
+        cipher_suites::DtlsEcdhePskWithChacha20Poly1305Sha256,
         handshake::{
             extensions::{DtlsVersions, Psk},
             ClientHandshake,
@@ -376,8 +376,6 @@ pub mod server {
                 }
             };
 
-            // parse::parse_client_hello(resp).ok_or(Error::Parse)?};
-
             // Find the first supported cipher suite.
             let (mut key_schedule, selected_cipher_suite) = {
                 let mut r = None;
@@ -426,9 +424,9 @@ pub mod server {
             let shared_secret = secret.diffie_hellman(&their_public_key);
 
             // Send server hello.
-            // TODO: We hardcode the selected PSK as the first one for now.
             let legacy_session_id: Vec<_> = client_hello.legacy_session_id.into();
 
+            // TODO: We hardcode the selected PSK as the first one for now.
             let mut enc_buf = EncodingBuffer::new(buf);
             ServerRecord::encode_server_hello(
                 &legacy_session_id,
@@ -447,8 +445,6 @@ pub mod server {
                 shared_secret.as_bytes(),
                 &transcript_hasher.clone().finalize(),
             );
-
-            // l0g::error!("Server handshake traffic secrets: {handshake_traffic_secrets:02x?}");
 
             // TODO: Add the Finished message to this datagram.
 
@@ -482,7 +478,7 @@ pub mod server {
 
     pub enum ServerKeySchedule {
         /// Key schedule for the Chacha20Poly1305 cipher suite.
-        Chacha20Poly1305Sha256(KeySchedule<TlsEcdhePskWithChacha20Poly1305Sha256>),
+        Chacha20Poly1305Sha256(KeySchedule<DtlsEcdhePskWithChacha20Poly1305Sha256>),
     }
 
     impl ServerKeySchedule {
@@ -568,7 +564,7 @@ mod test {
 
     use super::*;
     use crate::{
-        cipher_suites::TlsEcdhePskWithChacha20Poly1305Sha256, client::ClientConnection,
+        cipher_suites::DtlsEcdhePskWithChacha20Poly1305Sha256, client::ClientConnection,
         client_config::ClientConfig, handshake::extensions::Psk, server::ServerConnection,
         server_config::ServerConfig,
     };
@@ -639,7 +635,7 @@ mod test {
             };
 
             let mut client_connection =
-                ClientConnection::<_, TlsEcdhePskWithChacha20Poly1305Sha256>::open_client(
+                ClientConnection::<_, DtlsEcdhePskWithChacha20Poly1305Sha256>::open_client(
                     &mut rng,
                     client_buf,
                     client_socket,

@@ -19,9 +19,12 @@ pub enum CodePoint {
 }
 
 /// Defines cipher and hash to use for as crypto suite.
-pub trait TlsCipherSuite {
+pub trait DtlsCipherSuite {
     /// The code point as defined in https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml
     const CODE_POINT: CodePoint;
+
+    // TODO: Add if this cipher suite uses PskDheKe or not. Needs proper piping and handling.
+    // const ECDHE_KEYSHARE: bool;
 
     /// Cipher to use with this cipher suite.
     type Cipher: AeadMutInPlace + KeySizeUser;
@@ -32,10 +35,11 @@ pub trait TlsCipherSuite {
 
 /// Chacha chipher.
 #[derive(Debug)]
-pub struct TlsEcdhePskWithChacha20Poly1305Sha256;
+pub struct DtlsEcdhePskWithChacha20Poly1305Sha256;
 
-impl TlsCipherSuite for TlsEcdhePskWithChacha20Poly1305Sha256 {
+impl DtlsCipherSuite for DtlsEcdhePskWithChacha20Poly1305Sha256 {
     const CODE_POINT: CodePoint = CodePoint::TlsEcdhePskWithChacha20Poly1305Sha256;
+    // const ECDHE_KEYSHARE: bool = true;
 
     type Cipher = ChaCha20Poly1305;
     type Hash = Sha256;
