@@ -5,6 +5,7 @@ mod parse_buffer {
     use crate::integers::{U24, U48};
 
     /// Buffer for helping parsing of records.
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct ParseBuffer<'a> {
         data: &'a [u8],
     }

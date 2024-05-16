@@ -14,7 +14,10 @@
 //!
 //! All this is defined in RFC 8446 (TLS 1.3) at Page 37.
 
-use crate::buffer::{AllocSliceHandle, EncodingBuffer, ParseBuffer};
+use crate::{
+    buffer::{AllocSliceHandle, EncodingBuffer, ParseBuffer},
+    record::EncodeOrParse,
+};
 use num_enum::TryFromPrimitive;
 
 /// Version numbers.
@@ -50,7 +53,7 @@ impl<'a> ParseExtension<'a> {
     }
 }
 
-#[derive(Clone, Default, Debug, PartialOrd, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ClientExtensions<'a> {
     pub psk_key_exchange_modes: Option<PskKeyExchangeModes>,
@@ -144,7 +147,7 @@ impl<'a> ClientExtensions<'a> {
                 }
                 ExtensionType::PreSharedKey => {
                     let Some((psk, binders_start_pos)) =
-                        OfferedPreSharedKey::parse(&mut ParseBuffer::new(extension.extension_data))
+                        OfferedPsks::parse(&mut ParseBuffer::new(extension.extension_data))
                     else {
                         l0g::error!("Failed to parse PreSharedKey");
                         return None;
@@ -507,23 +510,26 @@ impl ServerSupportedVersion {
 }
 
 /// The pre-shared keys the client can offer to use.
-#[derive(Clone, Debug, PartialOrd, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct OfferedPsks<'a> {
     /// List of identities that can be used. Ticket age is set to 0.
-    pub identities: &'a [Psk<'a>],
+    pub identities: EncodeOrParse<&'a [Psk<'a>], PskIter<'a>>,
 
-    // pub ser: &'a [Psk<'a>],
-    // pub deser: PskIter<'a>,
-    /// Size of the binder hash.
-    pub hash_size: usize,
+    /// Size of the binder hash
+    pub hash_size: EncodeOrParse<usize, ()>,
 }
 
 impl<'a> OfferedPsks<'a> {
     /// Encode the offered pre-shared keys. Returns a handle to write the binders.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<AllocSliceHandle, ()> {
-        let ident_len = self
-            .identities
+        let (EncodeOrParse::Encode(identities), EncodeOrParse::Encode(hash_size)) =
+            (&self.identities, self.hash_size)
+        else {
+            return Err(());
+        };
+
+        let ident_len = identities
             .iter()
             .map(|ident| ident.identity.len() + 4 + 2)
             .sum::<usize>();
@@ -532,16 +538,29 @@ impl<'a> OfferedPsks<'a> {
         buf.push_u16_be(ident_len as u16)?;
 
         // Each identity.
-        for identity in self.identities {
+        for identity in *identities {
             identity.encode(buf)?;
         }
 
         // Allocate space for binders and return it for future use.
-        let binders_len = (1 + self.hash_size) * self.identities.len();
+        let binders_len = (1 + hash_size) * identities.len();
 
         // Binders length.
         buf.push_u16_be(binders_len as u16)?;
         buf.alloc_slice(binders_len)
+    }
+
+    /// Parse offered pre-share-keys.
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, usize)> {
+        let (iter, binders_pos) = PskIter::parse(buf)?;
+
+        Some((
+            Self {
+                identities: EncodeOrParse::Parse(iter),
+                hash_size: EncodeOrParse::Parse(()),
+            },
+            binders_pos,
+        ))
     }
 }
 
@@ -552,45 +571,84 @@ pub struct OfferedPreSharedKey<'a> {
     pub binder: &'a [u8],
 }
 
-impl<'a> OfferedPreSharedKey<'a> {
+/// This iterator gives an identity and its associated binder for each iteration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PskIter<'a> {
+    /// The entire identities slice, including size and length headers.
+    identities: ParseBuffer<'a>,
+    /// The entire binders slice, including size and length headers.
+    binders: ParseBuffer<'a>,
+}
+
+impl<'a> Iterator for PskIter<'a> {
+    type Item = OfferedPreSharedKey<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let identity = {
+            let identity_length = self.identities.pop_u16_be()?;
+            let identity = self
+                .identities
+                .pop_slice(identity_length as usize)
+                .expect("UNREACHABLE");
+            let _ticket_age = self.identities.pop_u32_be().expect("UNREACHABLE");
+
+            identity
+        };
+
+        let binder = {
+            let binder_length = self.binders.pop_u8()?;
+            let binder = self
+                .binders
+                .pop_slice(binder_length as usize)
+                .expect("UNREACHABLE");
+
+            binder
+        };
+
+        Some(OfferedPreSharedKey { identity, binder })
+    }
+}
+
+impl<'a> PskIter<'a> {
     pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, usize)> {
         // Identity part
         let identity_size = buf.pop_u16_be()?;
-        let identity_length = buf.pop_u16_be()?;
-
-        // TODO: For now we only support one identity.
-        let expected_identity_size = identity_length + 4 + 2; // +4 for the ticket, +2 for size
-        if identity_size != expected_identity_size {
-            l0g::error!(
-                "Identity size failure, expected {expected_identity_size}, got {identity_size}"
-            );
-
-            return None;
-        }
-
-        let identity = buf.pop_slice(identity_length as usize)?;
-        let _ticket_age = buf.pop_u32_be()?;
+        let identities = buf.pop_slice(identity_size as usize)?;
 
         // Binders part
         let binders_size = buf.pop_u16_be()?;
         let binders_start_pos = buf.current_pos_ptr();
-        let binder_length = buf.pop_u8()?;
+        let binders = buf.pop_slice(binders_size as usize)?;
 
-        let expected_binders_size = binder_length as u16 + 1;
-        if binders_size != expected_binders_size {
-            l0g::error!(
-                "Binders size failure, expected {expected_binders_size}, got {binders_size}"
-            );
+        // Traverse the slices and make sure all sizes do add up, else return error.
+        // This so the iterator itself does not start giving out values with broken data until
+        // the error is hit.
 
-            return None;
+        // Check that the identities makes sense.
+        {
+            let mut buf = ParseBuffer::new(identities);
+
+            while !buf.is_empty() {
+                let identity_length = buf.pop_u16_be()?;
+                let _identity = buf.pop_slice(identity_length as usize)?;
+                let _ticket_age = buf.pop_u32_be()?;
+            }
         }
 
-        let binder = buf.pop_slice(binder_length as usize)?;
+        // Check that the binders makes sense.
+        {
+            let mut buf = ParseBuffer::new(binders);
+
+            while !buf.is_empty() {
+                let binder_length = buf.pop_u8()?;
+                let _binder = buf.pop_slice(binder_length as usize)?;
+            }
+        }
 
         Some((
-            OfferedPreSharedKey {
-                identity: identity,
-                binder: binder,
+            PskIter {
+                identities: ParseBuffer::new(identities),
+                binders: ParseBuffer::new(binders),
             },
             binders_start_pos,
         ))

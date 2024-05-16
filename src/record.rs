@@ -26,17 +26,27 @@ pub enum Encryption {
     Disabled,
 }
 
+/// Helper when something needs to encode or parse something differently.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum EncodeOrParse<E, P> {
+    /// The encoding branch.
+    Encode(E),
+    /// The parsing branch.
+    Parse(P),
+}
+
 /// Holds positions of key positions in the payload data. Used for transcript hashing.
 pub struct RecordPayloadPositions {
     pub start: usize,
+    pub binders: Option<usize>,
     pub end: usize,
 }
 
 impl RecordPayloadPositions {
-    pub fn into_sub_slices(self, buf: &[u8], split_at: usize) -> Option<(&[u8], &[u8])> {
+    pub fn into_pre_post_binders(self, buf: &[u8]) -> Option<(&[u8], &[u8])> {
         // Calculate indices
         let start = self.start.checked_sub(buf.as_ptr() as usize)?;
-        let middle = split_at.checked_sub(buf.as_ptr() as usize)?;
+        let middle = self.binders?.checked_sub(buf.as_ptr() as usize)?;
         let end = self.end.checked_sub(buf.as_ptr() as usize)?;
 
         debug_assert!(start < middle);
@@ -98,9 +108,10 @@ impl<'a> ClientRecord<'a> {
                     version: DtlsVersions::V1_3,
                 }),
                 pre_shared_key: Some(OfferedPsks {
-                    identities,
-                    hash_size:
+                    identities: EncodeOrParse::Encode(identities),
+                    hash_size: EncodeOrParse::Encode(
                         <<CipherSuite as TlsCipherSuite>::Hash as OutputSizeUser>::output_size(),
+                    ),
                 }),
             },
         };
@@ -166,6 +177,45 @@ impl<'a> ClientRecord<'a> {
         } else {
             todo!()
         }
+    }
+
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, RecordPayloadPositions)> {
+        // Parse record.
+
+        let record_header = DTlsPlaintextHeader::parse(buf)?;
+
+        // TODO: Check if encrypted.
+        let encrypted = Encryption::Disabled;
+
+        let record_payload = buf.pop_slice(record_header.length.into())?;
+        l0g::trace!("Got record: {:?}", record_header);
+
+        let mut buf = ParseBuffer::new(record_payload);
+        let start = buf.current_pos_ptr();
+
+        let (ret, binders_pos) = match record_header.type_ {
+            ContentType::Handshake => {
+                let (handshake, binders_pos) = ClientHandshake::parse(&mut buf)?;
+
+                (ClientRecord::Handshake(handshake, encrypted), binders_pos)
+            }
+            ContentType::Ack => todo!(),
+            ContentType::Heartbeat => todo!(),
+            ContentType::Alert => todo!(),
+            ContentType::ApplicationData => todo!(),
+            ContentType::ChangeCipherSpec => todo!(),
+        };
+
+        let end = buf.current_pos_ptr();
+
+        Some((
+            ret,
+            RecordPayloadPositions {
+                start,
+                binders: binders_pos,
+                end,
+            },
+        ))
     }
 
     fn is_encrypted(&self) -> bool {
@@ -428,7 +478,14 @@ impl<'a> ServerRecord<'a> {
 
         let end = buf.current_pos_ptr();
 
-        Some((ret, RecordPayloadPositions { start, end }))
+        Some((
+            ret,
+            RecordPayloadPositions {
+                start,
+                end,
+                binders: None,
+            },
+        ))
     }
 }
 

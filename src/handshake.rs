@@ -1,9 +1,12 @@
 use crate::{
     buffer::{AllocSliceHandle, AllocU16Handle, AllocU24Handle, EncodingBuffer, ParseBuffer},
     cipher_suites::{CodePoint, TlsCipherSuite},
+    handshake::extensions::PskKeyExchangeMode,
     integers::U24,
     key_schedule::KeySchedule,
-    record::{ProtocolVersion, LEGACY_DTLS_VERSION},
+    record::{EncodeOrParse, ProtocolVersion, LEGACY_DTLS_VERSION},
+    server::ServerKeySchedule,
+    server_config::{Identity, ServerConfig},
 };
 use digest::Digest;
 use num_enum::TryFromPrimitive;
@@ -82,6 +85,34 @@ impl<'a> ClientHandshake<'a> {
         }
 
         Ok(())
+    }
+
+    /// Parse a handshake message.
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, Option<usize>)> {
+        let handshake_header = HandshakeHeader::parse(buf)?;
+
+        if handshake_header.length != handshake_header.fragment_length {
+            l0g::error!("We don't support fragmented handshakes yet.");
+            return None;
+        }
+
+        let handshake_payload = buf.pop_slice(handshake_header.fragment_length.get() as usize)?;
+
+        l0g::trace!("Got handshake: {:?}", handshake_header);
+
+        match handshake_header.msg_type {
+            HandshakeType::ClientHello => {
+                let mut buf = ParseBuffer::new(handshake_payload);
+                let (client_hello, binders_pos) = ClientHello::parse(&mut buf)?;
+
+                l0g::trace!("Got client hello: {:02x?}", client_hello);
+
+                Some((Self::ClientHello(client_hello), binders_pos))
+            }
+            HandshakeType::Finished => todo!(),
+            HandshakeType::KeyUpdate => todo!(),
+            _ => None,
+        }
     }
 
     fn handshake_type(&self) -> HandshakeType {
@@ -305,7 +336,7 @@ impl<'a> ClientHello<'a> {
         Ok(binders_allocation)
     }
 
-    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, Option<usize>)> {
         let version = buf.pop_u16_be()?.to_be_bytes();
         let _random = buf.pop_slice(32)?;
 
@@ -321,7 +352,6 @@ impl<'a> ClientHello<'a> {
         }
 
         let cipher_suites = {
-            let mut v = Vec::new();
             let num_cipher_suites_bytes = buf.pop_u16_be()?;
 
             if num_cipher_suites_bytes % 2 != 0 {
@@ -329,13 +359,7 @@ impl<'a> ClientHello<'a> {
                 return None;
             }
 
-            let num_cipher_suites = num_cipher_suites_bytes / 2;
-
-            for _ in 0..num_cipher_suites {
-                v.push(buf.pop_u16_be()?);
-            }
-
-            v
+            buf.pop_slice(num_cipher_suites_bytes as usize)?
         };
 
         let legacy_compression_methods_len = buf.pop_u8()?;
@@ -347,13 +371,125 @@ impl<'a> ClientHello<'a> {
 
         let (extensions, binders_start) = ClientExtensions::parse(buf)?;
 
-        Some(Self {
-            version,
-            legacy_session_id,
-            cipher_suites,
-            extensions,
+        Some((
+            Self {
+                version,
+                legacy_session_id,
+                cipher_suites,
+                extensions,
+            },
             binders_start,
-        })
+        ))
+    }
+
+    /// Check a client hello if it is valid, perform binder verification and setup the key
+    /// schedule.
+    pub fn validate_and_initialize_keyschedule(
+        &self,
+        key_schedule: &mut ServerKeySchedule,
+        server_config: &ServerConfig,
+        binders_hash: &[u8],
+    ) -> Result<PublicKey, ()> {
+        debug_assert!(key_schedule.is_uninitialized());
+
+        if self.version != LEGACY_DTLS_VERSION {
+            l0g::error!(
+                "ClientHello version is not legacy DTLS version: {:02x?}",
+                self.version
+            );
+            return Err(());
+        }
+
+        l0g::trace!("DTLS legacy version OK");
+
+        // Are all the expexted extensions there? By this we enforce that the PSK key exchange
+        // is ECDHE.
+        // Verify with RFC8446, section 9.2
+        let (
+            Some(psk_key_exchange_modes),
+            Some(supported_versions),
+            Some(key_share),
+            Some(pre_shared_key),
+        ) = (
+            &self.extensions.psk_key_exchange_modes,
+            &self.extensions.supported_versions,
+            &self.extensions.key_share,
+            &self.extensions.pre_shared_key,
+        )
+        else {
+            // TODO: For now we expect these specific extensions.
+            l0g::error!("ClientHello: Not all expected extensions are provided {self:02x?}");
+            return Err(());
+        };
+
+        l0g::trace!("All required extensions are present");
+
+        if supported_versions.version != DtlsVersions::V1_3 {
+            // We only support DTLS 1.3.
+            l0g::error!("Not DTLS 1.3");
+            return Err(());
+        }
+        l0g::trace!("DTLS version OK: {:?}", supported_versions.version);
+
+        if key_share.group != NamedGroup::X25519 && key_share.opaque.len() == 32 {
+            l0g::error!(
+                    "ClientHello: The keyshare named group is unsupported or wrong key length: {:?}, len = {}",
+                    key_share.group,
+                    key_share.opaque.len()
+                );
+            return Err(());
+        }
+        l0g::trace!("Keyshare is OK: {:?}", key_share.group);
+
+        if psk_key_exchange_modes.ke_modes != PskKeyExchangeMode::PskDheKe {
+            l0g::error!(
+                "ClientHello: The PskKeyExchangeMode is unsupported: {:?}",
+                key_share.group
+            );
+            return Err(());
+        }
+        l0g::trace!(
+            "Psk key exchange mode is OK: {:?}",
+            psk_key_exchange_modes.ke_modes
+        );
+
+        // Find the PSK.
+        {
+            let EncodeOrParse::Parse(psk_iter) = &pre_shared_key.identities else {
+                l0g::error!("ClientHello: Expected parse, got encoded PSK");
+                return Err(());
+            };
+
+            // TODO: We only support a single PSK for now.
+
+            let pre_shared_key = psk_iter.clone().next().ok_or(())?;
+
+            let psk_identity = Identity::from(pre_shared_key.identity);
+            let Some(psk) = server_config.psk.get(&psk_identity) else {
+                l0g::error!("ClientHello: Psk unknown identity: {psk_identity:?}");
+                return Err(());
+            };
+            l0g::trace!("Psk identity '{:?}' is AVAILABLE", psk_identity);
+
+            // Perform PSK -> Early Secret with Key Schedule
+            key_schedule.initialize_early_secret(Some((&psk_identity, psk)));
+
+            // Verify binders with Early Secret
+            let binder = key_schedule.create_binders(binders_hash);
+
+            if binder != pre_shared_key.binder {
+                l0g::error!("ClientHello: Psk binder mismatch");
+                return Err(());
+            }
+            l0g::trace!("Psk binders MATCH");
+        }
+
+        let their_public_key =
+            PublicKey::from(TryInto::<[u8; 32]>::try_into(key_share.opaque).unwrap());
+
+        l0g::trace!("ClientHello VALID");
+
+        Ok(their_public_key)
     }
 }
 
