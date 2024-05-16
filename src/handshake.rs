@@ -1,3 +1,4 @@
+use self::extensions::{ClientExtensions, DtlsVersions, NamedGroup, NewServerExtensions};
 use crate::{
     buffer::{AllocSliceHandle, AllocU16Handle, AllocU24Handle, EncodingBuffer, ParseBuffer},
     cipher_suites::{CodePoint, TlsCipherSuite},
@@ -12,11 +13,6 @@ use digest::Digest;
 use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::PublicKey;
-
-use self::extensions::{
-    ClientExtensions, DtlsVersions, KeyShareEntry, NamedGroup, NewServerExtensions, SelectedPsk,
-    ServerExtensions, ServerSupportedVersion,
-};
 
 pub mod extensions;
 
@@ -272,14 +268,13 @@ impl HandshakeHeader {
     }
 }
 
-/// ClientHello payload in an Handshake.
+/// ClientHello payload in a Handshake.
 #[derive(Debug)]
 pub struct ClientHello<'a> {
     pub version: ProtocolVersion,
     pub legacy_session_id: &'a [u8],
     pub cipher_suites: &'a [u8],
     pub extensions: ClientExtensions<'a>,
-    // pub binders_start: Option<usize>,
 }
 
 impl<'a> ClientHello<'a> {
@@ -336,9 +331,11 @@ impl<'a> ClientHello<'a> {
         Ok(binders_allocation)
     }
 
+    /// Parse a ClientHello.
     pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, Option<usize>)> {
         let version = buf.pop_u16_be()?.to_be_bytes();
         let _random = buf.pop_slice(32)?;
+        // TODO: Should random be checked somehow?
 
         //     opaque legacy_session_id<0..32>;
         //     opaque legacy_cookie<0..2^8-1>;                  // DTLS
@@ -513,32 +510,7 @@ pub struct ServerHello<'a> {
     pub extensions: NewServerExtensions<'a>,
 }
 
-// #[derive(Debug)]
-// pub struct ServerHello {
-//     legacy_session_id: Vec<u8>,
-//     supported_version: DtlsVersions,
-//     public_key: PublicKey,
-//     cipher_suite: u16,
-//     selected_psk_identity: u16,
-// }
-
 impl<'a> ServerHello<'a> {
-    // pub fn new(
-    //     legacy_session_id: Vec<u8>,
-    //     supported_version: DtlsVersions,
-    //     public_key: PublicKey,
-    //     selected_cipher_suite: u16,
-    //     selected_psk_identity: u16,
-    // ) -> Self {
-    //     Self {
-    //         legacy_session_id,
-    //         supported_version,
-    //         public_key,
-    //         cipher_suite: selected_cipher_suite,
-    //         selected_psk_identity,
-    //     }
-    // }
-
     /// Encode a server hello payload in a Handshake. RFC 8446 section 4.1.3.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
         // struct {
