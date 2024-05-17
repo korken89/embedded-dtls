@@ -379,16 +379,17 @@ pub mod server {
             // Find the first supported cipher suite.
             let (mut key_schedule, selected_cipher_suite) = {
                 let mut r = None;
-                for cipher_suite in client_hello
+                for (index, cipher_suite) in client_hello
                     .cipher_suites
                     .chunks_exact(2)
                     .map(|chunk| u16::from_be_bytes(chunk.try_into().unwrap()))
+                    .enumerate()
                 {
                     // Check so we can support this cipher suite.
                     if let Some(key_schedule) =
                         ServerKeySchedule::try_from_cipher_suite(cipher_suite)
                     {
-                        r = Some((key_schedule, cipher_suite));
+                        r = Some((key_schedule, index));
                     }
                 }
 
@@ -432,7 +433,7 @@ pub mod server {
                 &legacy_session_id,
                 DtlsVersions::V1_3,
                 our_public_key,
-                selected_cipher_suite,
+                selected_cipher_suite as u16,
                 0,
                 &mut enc_buf,
             )

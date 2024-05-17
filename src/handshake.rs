@@ -589,7 +589,10 @@ impl<'a> ServerHello<'a> {
 
         // TODO: We only support one today, maybe more in the future.
         if self.cipher_suite_index != 0 {
-            l0g::error!("ServerHello cipher suite mismatch");
+            l0g::error!(
+                "ServerHello cipher suite mismatch, got {:04x}",
+                self.cipher_suite_index
+            );
             return Err(());
         }
 
