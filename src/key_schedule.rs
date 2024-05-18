@@ -14,7 +14,13 @@
 //      HKDF-Expand-Label(Secret, Label,
 //                        Transcript-Hash(Messages), Hash.length)
 
-use crate::{buffer::EncodingBuffer, cipher_suites::DtlsCipherSuite, handshake::extensions::Psk};
+use crate::{
+    buffer::{CryptoBuffer, EncodingBuffer},
+    cipher_suites::{DtlsCipher, DtlsCipherSuite},
+    handshake::extensions::Psk,
+    record::{CipherArguments, CiphertextSequenceNumber, GenericCipher},
+};
+use aead::Buffer;
 use chacha20poly1305::{AeadCore, KeySizeUser};
 use digest::{
     core_api::BlockSizeUser,
@@ -42,7 +48,7 @@ struct EarlySecret<Hash: Digest + OutputSizeUser + BlockSizeUser + Clone> {
 #[derive(Zeroize)]
 pub struct TrafficSecrets<Cipher>
 where
-    Cipher: AeadCore + KeySizeUser,
+    Cipher: DtlsCipher + KeySizeUser,
 {
     /// Client traffic keying material.
     pub client:
@@ -54,7 +60,7 @@ where
 
 impl<Cipher> core::fmt::Debug for TrafficSecrets<Cipher>
 where
-    Cipher: AeadCore + KeySizeUser,
+    Cipher: DtlsCipher + KeySizeUser,
     <Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
     <Cipher as AeadCore>::NonceSize: std::fmt::Debug,
 {
@@ -77,13 +83,18 @@ pub struct TrafficKeyingMaterial<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u
 }
 
 impl<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>> TrafficKeyingMaterial<KeySize, IvSize> {
-    /// Create the initialization vector given the record sequence number.
-    pub fn create_iv(&self, record_sequence_number: u64) -> GenericArray<u8, IvSize> {
+    /// Create the nonce given the record sequence number.
+    pub fn create_nonce(&self, record_number: u64) -> GenericArray<u8, IvSize> {
         // Defined in Section 5.3, RFC8446.
         let mut iv = self.write_iv.clone();
-        let seq = record_sequence_number.to_be_bytes();
 
-        for (iv, seq) in iv.iter_mut().zip(seq.iter().copied()) {
+        // NOTE(rev): The sequence number is padded to the left with zeros,
+        // so apply the XOR from the end instead of skipping from the start of `iv`.
+        for (iv, seq) in iv
+            .iter_mut()
+            .rev()
+            .zip(record_number.to_be_bytes().iter().rev().copied())
+        {
             *iv ^= seq;
         }
 
@@ -127,18 +138,35 @@ enum KeyScheduleState<CipherSuite: DtlsCipherSuite> {
 // connection.
 pub struct KeySchedule<CipherSuite: DtlsCipherSuite> {
     keyschedule_state: KeyScheduleState<CipherSuite>,
-    // server_state: ServerKeySchedule<D>,
-    // client_state: ClientKeySchedule<D>,
+    cipher: CipherSuite::Cipher,
+    write_record_number: u64,
+    read_record_number: u64,
+    is_server: bool,
 }
 
 impl<CipherSuite> KeySchedule<CipherSuite>
 where
     CipherSuite: DtlsCipherSuite,
 {
-    /// Create a new key schedule.
-    pub fn new() -> Self {
+    /// Create a new key schedule for a server.
+    pub fn new_server(cipher: CipherSuite::Cipher) -> Self {
         Self {
             keyschedule_state: KeyScheduleState::Uninitialized,
+            cipher,
+            write_record_number: 0,
+            read_record_number: 0,
+            is_server: true,
+        }
+    }
+
+    /// Create a new key schedule for a client.
+    pub fn new_client(cipher: CipherSuite::Cipher) -> Self {
+        Self {
+            keyschedule_state: KeyScheduleState::Uninitialized,
+            cipher,
+            write_record_number: 0,
+            read_record_number: 0,
+            is_server: false,
         }
     }
 
@@ -304,8 +332,6 @@ where
             &mut server,
         );
 
-        // TODO: Create sn_key for record number encryption (section 4.2.3, RFC9147)
-
         TrafficSecrets {
             client: Self::create_traffic_keying_material(&client),
             server: Self::create_traffic_keying_material(&server),
@@ -327,6 +353,7 @@ where
             &HashArray::<<CipherSuite as DtlsCipherSuite>::Hash>::default(), // The input key material is the "0" string
         );
         let traffic_secrets = todo!();
+
         self.keyschedule_state = KeyScheduleState::MasterSecret(Secret {
             hkdf,
             traffic_secrets,
@@ -378,6 +405,121 @@ where
             sn_key,
         }
     }
+
+    fn create_encryption_nonce(
+        &self,
+    ) -> GenericArray<u8, <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize> {
+        match &self.keyschedule_state {
+            KeyScheduleState::Uninitialized => unreachable!(),
+            KeyScheduleState::EarlySecret(_) => unreachable!(),
+            KeyScheduleState::HandshakeSecret(s) => {
+                if self.is_server {
+                    &s.traffic_secrets.server
+                } else {
+                    &s.traffic_secrets.client
+                }
+            }
+            KeyScheduleState::MasterSecret(s) => {
+                if self.is_server {
+                    &s.traffic_secrets.server
+                } else {
+                    &s.traffic_secrets.client
+                }
+            }
+        }
+        .create_nonce(self.write_record_number)
+    }
+
+    fn create_decryption_nonce(
+        &self,
+        record_number: u64,
+    ) -> GenericArray<u8, <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize> {
+        match &self.keyschedule_state {
+            KeyScheduleState::Uninitialized => unreachable!(),
+            KeyScheduleState::EarlySecret(_) => unreachable!(),
+            KeyScheduleState::HandshakeSecret(s) => {
+                if self.is_server {
+                    &s.traffic_secrets.client
+                } else {
+                    &s.traffic_secrets.server
+                }
+            }
+            KeyScheduleState::MasterSecret(s) => {
+                if self.is_server {
+                    &s.traffic_secrets.client
+                } else {
+                    &s.traffic_secrets.server
+                }
+            }
+        }
+        .create_nonce(record_number)
+    }
+
+    fn create_read_record_number(
+        &self,
+        short_sequence_number: CiphertextSequenceNumber,
+    ) -> Option<u64> {
+        // Based on the recommendation in Section 4.2.2 RFC9147
+        // TODO: This needs to handle the wrapping.
+        match short_sequence_number {
+            CiphertextSequenceNumber::Short(s) => {
+                // TODO
+            }
+            CiphertextSequenceNumber::Long(l) => {
+                // TODO
+            }
+        }
+
+        Some(self.read_record_number)
+    }
+}
+
+const MASK_UPPER16: u64 = !0xffff;
+const MASK_MSB16: u16 = 0x8000;
+const OFFSET16: u64 = 0x8000;
+
+const MASK_UPPER8: u64 = !0xff;
+const MASK_MSB8: u16 = 0x80;
+const OFFSET8: u64 = 0x80;
+
+pub fn find_closest2(last_successful_record_number: u64, seq: CiphertextSequenceNumber) -> u64 {
+    let (mask_upper, mask_msb, offset, seq) = match seq {
+        CiphertextSequenceNumber::Short(s) => (MASK_UPPER8, MASK_MSB8, OFFSET8, s as u64),
+        CiphertextSequenceNumber::Long(l) => (MASK_UPPER16, MASK_MSB16, OFFSET16, l as u64),
+    };
+
+    let lower = (last_successful_record_number as u16).wrapping_add(1);
+    let msb = lower & mask_msb != 0;
+
+    let option1 = last_successful_record_number;
+    let candidate1 = (option1 & mask_upper) | seq;
+    let diff1 = last_successful_record_number.abs_diff(candidate1 + 1) as u16;
+
+    if msb {
+        let option2 = last_successful_record_number + offset;
+        let candidate2 = (option2 & mask_upper) | seq;
+        let diff2 = last_successful_record_number.abs_diff(candidate2 + 1) as u16;
+
+        if diff1 < diff2 {
+            candidate1
+        } else {
+            candidate2
+        }
+    } else {
+        if last_successful_record_number < offset {
+            return candidate1;
+        }
+
+        let option3 = last_successful_record_number - offset;
+        let candidate3 = (option3 & mask_upper) | seq;
+        let diff3 = last_successful_record_number.abs_diff(candidate3 + 1) as u16;
+
+        if diff1 < diff3 {
+            candidate1
+        } else {
+            candidate3
+        }
+    }
 }
 
 struct HkdfLabelContext<'a, 'b> {
@@ -415,4 +557,84 @@ where
 
     okm.fill(0);
     hkdf.expand(&hkdf_label, okm).expect("Internal error");
+}
+
+impl<CipherSuite> GenericCipher for KeySchedule<CipherSuite>
+where
+    CipherSuite: DtlsCipherSuite,
+{
+    async fn encrypt_record(&mut self, args: CipherArguments<'_>) -> aead::Result<()> {
+        let CipherArguments {
+            unified_hdr,
+            sequence_number_position,
+            payload_with_tag,
+        } = args;
+
+        let mut buf = {
+            let payload_len = payload_with_tag.len();
+            let mut buf = CryptoBuffer::new(payload_with_tag);
+            // Make the buffer indicate that the tag space is unwritten.
+            buf.truncate(payload_len - self.tag_size());
+            buf
+        };
+
+        self.cipher
+            .encrypt_plaintext(&self.create_encryption_nonce(), &mut buf, unified_hdr)
+            .await?;
+
+        let ciphertext: &[u8] = &buf.as_ref()[..16];
+        self.cipher
+            .apply_mask_for_record_number(
+                ciphertext.try_into().unwrap(),
+                &mut unified_hdr[sequence_number_position],
+            )
+            .await?;
+
+        self.write_record_number += 1;
+
+        Ok(())
+    }
+
+    async fn decrypt_record(&mut self, args: CipherArguments<'_>) -> aead::Result<()> {
+        let CipherArguments {
+            unified_hdr,
+            sequence_number_position,
+            payload_with_tag,
+        } = args;
+
+        // TODO: Check the epoch, early return if wrong. Section 4.2.2 RFC 9147.
+
+        let mut buf = CryptoBuffer::new(payload_with_tag);
+
+        let ciphertext: &[u8] = &buf.as_ref()[..16];
+        self.cipher.apply_mask_for_record_number(
+            ciphertext.try_into().unwrap(),
+            &mut unified_hdr[sequence_number_position.clone()],
+        );
+
+        let read_record_number = self
+            .create_read_record_number(
+                CiphertextSequenceNumber::from_bytes(&unified_hdr[sequence_number_position])
+                    .ok_or(aead::Error)?,
+            )
+            .ok_or(aead::Error)?;
+
+        self.cipher
+            .decrypt_ciphertext(
+                &self.create_decryption_nonce(read_record_number),
+                &mut buf,
+                unified_hdr,
+            )
+            .await?;
+
+        // Decryption successful, store the read_record_number if it is larger.
+        self.read_record_number = self.read_record_number.max(read_record_number);
+
+        Ok(())
+    }
+
+    fn tag_size(&self) -> usize {
+        use aead::generic_array::typenum::Unsigned;
+        <CipherSuite::Cipher as AeadCore>::TagSize::to_usize()
+    }
 }

@@ -1,5 +1,54 @@
+pub use crypto_buffer::*;
 pub use encoding_buffer::*;
 pub use parse_buffer::*;
+
+mod crypto_buffer {
+    use aead::{Buffer, Error};
+
+    /// Buffer for encrypting and decrypting records that implements `aead::Buffer` so it works
+    /// with exising AEAD traits.
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct CryptoBuffer<'a> {
+        data: &'a mut [u8],
+        idx: usize,
+    }
+
+    impl<'a> CryptoBuffer<'a> {
+        /// Create a new crypt buffer.
+        pub fn new(buf: &'a mut [u8]) -> Self {
+            let idx = buf.len();
+            Self { data: buf, idx }
+        }
+    }
+
+    impl<'a> AsRef<[u8]> for CryptoBuffer<'a> {
+        fn as_ref(&self) -> &[u8] {
+            &self.data[..self.idx]
+        }
+    }
+
+    impl<'a> AsMut<[u8]> for CryptoBuffer<'a> {
+        fn as_mut(&mut self) -> &mut [u8] {
+            &mut self.data[..self.idx]
+        }
+    }
+
+    impl<'a> Buffer for CryptoBuffer<'a> {
+        fn extend_from_slice(&mut self, other: &[u8]) -> aead::Result<()> {
+            self.data
+                .get_mut(self.idx..self.idx + other.len())
+                .ok_or(Error)?
+                .copy_from_slice(other);
+            self.idx += other.len();
+
+            Ok(())
+        }
+
+        fn truncate(&mut self, len: usize) {
+            self.idx = len;
+        }
+    }
+}
 
 mod parse_buffer {
     use crate::integers::{U24, U48};

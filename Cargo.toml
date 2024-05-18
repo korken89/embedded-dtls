@@ -22,6 +22,8 @@ hkdf = { version = "0.12.4", default-features = false }
 l0g = "1.0.0"
 zeroize = { version = "1.7.0", default-features = false, features = ["derive", "std"] }
 num_enum = { version = "0.7.2", default-features = false }
+aead = "0.5.2"
+chacha20 = "0.9.1"
 
 # p256-cortex-m4 = "0.1.0-alpha.6"
 # hkdf = { version = "0.12.4", default-features = false }

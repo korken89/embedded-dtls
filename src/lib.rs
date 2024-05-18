@@ -214,6 +214,8 @@ pub mod client {
             rng: &mut Rng,
             buf: &mut [u8],
             socket: Socket,
+            cipher: <CipherSuite as DtlsCipherSuite>::Cipher, // TODO: Should this be &mut ?
+            // transcript_hasher: <CipherSuite as DtlsCipherSuite>::Hash,     // TODO: Should this be &mut ?
             config: &ClientConfig<'_>,
         ) -> Result<Self, Error<Socket>>
         where
@@ -222,7 +224,7 @@ pub mod client {
             <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize: std::fmt::Debug,
             <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
         {
-            let mut key_schedule = KeySchedule::new();
+            let mut key_schedule = KeySchedule::new_client(cipher);
             let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
 
             // Initialize key-schedule for generating binders.
@@ -318,7 +320,7 @@ pub mod client {
 pub mod server {
     use crate::{
         buffer::{EncodingBuffer, ParseBuffer},
-        cipher_suites::DtlsEcdhePskWithChacha20Poly1305Sha256,
+        cipher_suites::{ChaCha20Poly1305Cipher, DtlsEcdhePskWithChacha20Poly1305Sha256},
         handshake::{
             extensions::{DtlsVersions, Psk},
             ClientHandshake,
@@ -437,6 +439,7 @@ pub mod server {
                 0,
                 &mut enc_buf,
             )
+            .await
             .map_err(|_| Error::InsufficientSpace)?;
 
             // TODO: Check that this is correct, I think this hashes the plaintext header.
@@ -447,17 +450,10 @@ pub mod server {
                 &transcript_hasher.clone().finalize(),
             );
 
-            // TODO: Add the Finished message to this datagram.
-
-            let transcript = transcript_hasher.clone().finalize();
-            let server_finished = ServerRecord::finished(&transcript);
-
-            l0g::debug!("Sending server finished: {server_finished:02x?}");
-
-            server_finished
-                .encode(&mut enc_buf, |_encryption_args| {
-                    // TODO: todo!()
-                })
+            // Add the Finished message to this datagram.
+            ServerRecord::finished(&transcript_hasher.clone().finalize())
+                .encode(&mut enc_buf, &mut t)
+                .await
                 .map_err(|_| Error::InsufficientSpace)?;
 
             socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
@@ -500,7 +496,9 @@ pub mod server {
         pub fn try_from_cipher_suite(cipher_suites: u16) -> Option<Self> {
             Some(match cipher_suites {
                 // TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256
-                0xCCAC => ServerKeySchedule::Chacha20Poly1305Sha256(KeySchedule::new()),
+                0xCCAC => ServerKeySchedule::Chacha20Poly1305Sha256(KeySchedule::new_server(
+                    ChaCha20Poly1305Cipher::default(),
+                )),
                 _ => {
                     l0g::trace!("Detected unsupported cipher suite {cipher_suites:04x}");
                     return None;
@@ -565,8 +563,11 @@ mod test {
 
     use super::*;
     use crate::{
-        cipher_suites::DtlsEcdhePskWithChacha20Poly1305Sha256, client::ClientConnection,
-        client_config::ClientConfig, handshake::extensions::Psk, server::ServerConnection,
+        cipher_suites::{ChaCha20Poly1305Cipher, DtlsEcdhePskWithChacha20Poly1305Sha256},
+        client::ClientConnection,
+        client_config::ClientConfig,
+        handshake::extensions::Psk,
+        server::ServerConnection,
         server_config::ServerConfig,
     };
     use rand::{rngs::StdRng, SeedableRng};
@@ -635,11 +636,13 @@ mod test {
                 },
             };
 
+            let cipher = ChaCha20Poly1305Cipher::default();
             let mut client_connection =
                 ClientConnection::<_, DtlsEcdhePskWithChacha20Poly1305Sha256>::open_client(
                     &mut rng,
                     client_buf,
                     client_socket,
+                    cipher,
                     &client_config,
                 )
                 .await

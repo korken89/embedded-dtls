@@ -238,19 +238,21 @@ impl<'a> ClientRecord<'a> {
     }
 }
 
-// encryption_function: impl FnOnce(
-//     sequence_number: &mut [u8],
-//     plaintext: &mut [u8],
-//     tag_space: &mut [u8],
-// ),
+pub(crate) trait GenericCipher {
+    async fn encrypt_record(&mut self, args: CipherArguments) -> aead::Result<()>;
+    async fn decrypt_record(&mut self, args: CipherArguments) -> aead::Result<()>;
+    fn tag_size(&self) -> usize;
+}
 
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct EncryptionFunctionArguments<'a> {
-    /// The encoded sequence number.
-    pub sequence_number: &'a mut [u8],
-    /// The location of the plaintext with space for the tag at the end.
-    pub plaintext_with_tag: &'a mut [u8],
+pub struct CipherArguments<'a> {
+    /// The header of the ciphertext.
+    pub unified_hdr: &'a mut [u8],
+    /// The location of the encoded sequence number in `unified_hdr`.
+    pub sequence_number_position: Range<usize>,
+    /// The location of the payload (plaintext/ciphertext) with the tag at the end.
+    pub payload_with_tag: &'a mut [u8],
 }
 
 /// Supported client records.
@@ -266,13 +268,13 @@ pub enum ServerRecord<'a> {
 
 impl<'a> ServerRecord<'a> {
     /// Create a client hello handshake.
-    pub fn encode_server_hello<'buf>(
+    pub async fn encode_server_hello<'buf>(
         legacy_session_id: &[u8],
         supported_version: DtlsVersions,
         public_key: PublicKey,
         selected_cipher_suite: u16,
         selected_psk_identity: u16,
-        buf: &'buf mut EncodingBuffer,
+        buf: &'buf mut EncodingBuffer<'_>,
     ) -> Result<(), ()> {
         let server_hello = ServerHello {
             version: LEGACY_DTLS_VERSION,
@@ -298,27 +300,32 @@ impl<'a> ServerRecord<'a> {
             ServerHandshake::ServerHello(server_hello),
             Encryption::Disabled,
         )
-        .encode(buf, |_| unreachable!())
+        .encode(buf, todo!())
+        .await
     }
 
     /// Create a server's finished message.
     pub fn finished(transcript_hash: &'a [u8]) -> Self {
-        ServerRecord::Handshake(
+        let finished = ServerRecord::Handshake(
             ServerHandshake::ServerFinished(Finished {
                 verify: transcript_hash,
             }),
             Encryption::Enabled,
-        )
+        );
+
+        l0g::debug!("Sending server finished: {finished:02x?}");
+
+        finished
     }
 
     /// Encode the record into a buffer. Returns (packet to send, content to hash).
-    pub fn encode<'buf>(
+    pub async fn encode<'buf>(
         &self,
-        buf: &'buf mut EncodingBuffer,
-        encryption_function: impl FnOnce(EncryptionFunctionArguments),
+        buf: &'buf mut EncodingBuffer<'_>,
+        cipher: &mut impl GenericCipher,
     ) -> Result<(), ()> {
         if self.is_encrypted() {
-            self.encode_encrypted(buf, encryption_function)
+            self.encode_encrypted(buf, cipher).await
         } else {
             self.encode_unencrypted(buf)
         }
@@ -353,29 +360,31 @@ impl<'a> ServerRecord<'a> {
     }
 
     /// Encrypted path for the encoding.
-    fn encode_encrypted<'buf>(
+    async fn encode_encrypted<'buf, C>(
         &self,
-        buf: &'buf mut EncodingBuffer,
-        encryption_function: impl FnOnce(EncryptionFunctionArguments),
-    ) -> Result<(), ()> {
+        buf: &'buf mut EncodingBuffer<'_>,
+        cipher: &mut C,
+    ) -> Result<(), ()>
+    where
+        C: GenericCipher,
+    {
         let buf = &mut buf.new_from_existing();
 
-        // TODO: Pipe AEAD tag size here
-        let aead_tag_size = 16;
+        let header_start = buf.len();
 
-        let header = DTlsCiphertextHeader {
+        // Create record header.
+        let (sequence_number_position, length_allocation) = DTlsCiphertextHeader {
             epoch: 0,                                           // TODO: Fix
             sequence_number: CiphertextSequenceNumber::Long(0), // TODO: Fix
             length: Some(0),
             connection_id: None,
-        };
-
-        // Create record header.
-        let (sequence_number_position, length_allocation) = header.encode(buf)?;
+        }
+        .encode(buf)?;
 
         // ------ Start record
 
         let content_start = buf.len();
+        let header_position = header_start..content_start;
 
         // ------ Encode payload
         self.encode_content(buf)?;
@@ -383,12 +392,12 @@ impl<'a> ServerRecord<'a> {
         let content_length = buf.len() - content_start;
 
         // Encode the tail of the DTLSInnerPlaintext.
-        DtlsInnerPlaintext::encode(self.content_type(), buf, content_length, aead_tag_size)?;
+        DtlsInnerPlaintext::encode(self.content_type(), buf, content_length, cipher.tag_size())?;
 
         let innerplaintext_end = buf.len();
 
         // Allocate space for the AEAD tag.
-        let aead_tag_allocation = buf.alloc_slice(aead_tag_size)?;
+        let aead_tag_allocation = buf.alloc_slice(cipher.tag_size())?;
         let tag_position = aead_tag_allocation.at();
         aead_tag_allocation.fill(buf, 0);
 
@@ -400,23 +409,25 @@ impl<'a> ServerRecord<'a> {
         }
 
         // ------ Encrypt payload
-
-        encryption_function({
+        {
             let plaintext_position = content_start..innerplaintext_end as usize;
 
             // Split the buffer into the 2 slices.
-            let (sequence_number, plaintext_with_tag) = to_sequence_number_and_plaintext_with_tag(
+            let (unified_hdr, payload_with_tag) = to_header_and_payload_with_tag(
                 buf,
-                sequence_number_position,
+                header_position,
                 plaintext_position,
                 tag_position,
             );
 
-            EncryptionFunctionArguments {
-                sequence_number,
-                plaintext_with_tag,
-            }
-        });
+            let cipher_args = CipherArguments {
+                unified_hdr,
+                sequence_number_position,
+                payload_with_tag,
+            };
+
+            cipher.encrypt_record(cipher_args);
+        }
 
         // ------ Finish record
 
@@ -489,19 +500,25 @@ impl<'a> ServerRecord<'a> {
     }
 }
 
-fn to_sequence_number_and_plaintext_with_tag(
+pub trait Test {
+    async fn encrypt(&mut self, buf: &mut [u8]);
+    async fn decrypt(&mut self, buf: &mut [u8]);
+}
+
+fn to_header_and_payload_with_tag(
     buf: &mut [u8],
-    sequence_number_position: Range<usize>,
+    header_position: Range<usize>,
     plaintext_position: Range<usize>,
     tag_position: Range<usize>,
 ) -> (&mut [u8], &mut [u8]) {
     l0g::trace!(
-            "snp: {sequence_number_position:?}, pp: {plaintext_position:?}, tp: {tag_position:?}, bl: {}", buf.len()
+        "hp: {header_position:?}, pp: {plaintext_position:?}, tp: {tag_position:?}, bl: {}",
+        buf.len()
     );
 
     // Enforce the ordering for tests.
-    if !(sequence_number_position.start <= sequence_number_position.end
-        && sequence_number_position.end <= plaintext_position.start
+    if !(header_position.start <= header_position.end
+        && header_position.end <= plaintext_position.start
         && plaintext_position.start <= plaintext_position.end
         && plaintext_position.end <= tag_position.start
         && tag_position.start <= tag_position.end
@@ -509,7 +526,7 @@ fn to_sequence_number_and_plaintext_with_tag(
         && tag_position.end <= buf.len())
     {
         panic!(
-            "The order of data in the encryption is wrong or longer than the buffer they stem from: snp: {sequence_number_position:?}, pp: {plaintext_position:?}, tp: {tag_position:?}, bl: {}", buf.len()
+            "The order of data in the encryption is wrong or longer than the buffer they stem from: hp: {header_position:?}, pp: {plaintext_position:?}, tp: {tag_position:?}, bl: {}", buf.len()
         );
     }
 
@@ -522,11 +539,11 @@ fn to_sequence_number_and_plaintext_with_tag(
     let mut curr_start = 0;
 
     // Extract sequence number slice.
-    let (_, r) = buf.split_at_mut(sequence_number_position.start);
-    curr_start += sequence_number_position.start;
+    let (_, r) = buf.split_at_mut(header_position.start);
+    curr_start += header_position.start;
 
-    let (sequence_number, r) = r.split_at_mut(sequence_number_position.end - curr_start);
-    curr_start += sequence_number_position.end - curr_start;
+    let (sequence_number, r) = r.split_at_mut(header_position.end - curr_start);
+    curr_start += header_position.end - curr_start;
 
     // Extract plaintext slice compounded with the tag slice.
     let (_, r) = r.split_at_mut(plaintext_position.start - curr_start);
@@ -784,6 +801,29 @@ pub enum CiphertextSequenceNumber {
     Short(u8),
     /// Long two byte sequence number.
     Long(u16),
+}
+
+impl CiphertextSequenceNumber {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() == 1 {
+            Some(CiphertextSequenceNumber::Short(bytes[0]))
+        } else if bytes.len() == 2 {
+            Some(CiphertextSequenceNumber::Long(u16::from_be_bytes(
+                bytes.try_into().unwrap(),
+            )))
+        } else {
+            None
+        }
+    }
+}
+
+impl From<CiphertextSequenceNumber> for u64 {
+    fn from(value: CiphertextSequenceNumber) -> Self {
+        match value {
+            CiphertextSequenceNumber::Short(s) => s as u64,
+            CiphertextSequenceNumber::Long(l) => l as u64,
+        }
+    }
 }
 
 /// TLS content type. RFC 9147 - Appendix A.1
