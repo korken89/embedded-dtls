@@ -332,113 +332,24 @@ impl<'a> ServerRecord<'a> {
         cipher: &mut impl GenericCipher,
     ) -> Result<(), ()> {
         if self.is_encrypted() {
-            self.encode_encrypted(buf, cipher).await
-        } else {
-            self.encode_unencrypted(buf)
-        }
-    }
-
-    /// Unencrypted path for the encoding.
-    fn encode_unencrypted<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<(), ()> {
-        let header = DTlsPlaintextHeader {
-            type_: self.content_type(),
-            epoch: 0,                  // TODO: Fix
-            sequence_number: 0.into(), // TODO: Fix
-            length: 0,                 // To be encoded later.
-        };
-        // Create record header.
-        let length_allocation = header.encode(buf)?;
-
-        // ------ Start record
-
-        let content_length = {
-            let mut inner_buf = buf.new_from_existing();
-
-            // ------ Encode payload
-            self.encode_content(&mut inner_buf)?;
-
-            inner_buf.len()
-        };
-
-        length_allocation.set(buf, content_length as u16);
-
-        // ------ Finish record
-        Ok(())
-    }
-
-    /// Encrypted path for the encoding.
-    async fn encode_encrypted<'buf, C>(
-        &self,
-        buf: &'buf mut EncodingBuffer<'_>,
-        cipher: &mut C,
-    ) -> Result<(), ()>
-    where
-        C: GenericCipher,
-    {
-        let buf = &mut buf.new_from_existing();
-
-        let header_start = buf.len();
-
-        // Create record header.
-        let (sequence_number_position, length_allocation) = DTlsCiphertextHeader {
-            epoch: 0,                                           // TODO: Fix
-            sequence_number: CiphertextSequenceNumber::Long(0), // TODO: Fix
-            length: Some(0),
-            connection_id: None,
-        }
-        .encode(buf)?;
-
-        // ------ Start record
-
-        let content_start = buf.len();
-        let header_position = header_start..content_start;
-
-        // ------ Encode payload
-        self.encode_content(buf)?;
-
-        let content_length = buf.len() - content_start;
-
-        // Encode the tail of the DTLSInnerPlaintext.
-        DtlsInnerPlaintext::encode(self.content_type(), buf, content_length, cipher.tag_size())?;
-
-        let innerplaintext_end = buf.len();
-
-        // Allocate space for the AEAD tag.
-        let aead_tag_allocation = buf.alloc_slice(cipher.tag_size())?;
-        let tag_position = aead_tag_allocation.at();
-        aead_tag_allocation.fill(buf, 0);
-
-        // Write the ciphertext length to the header.
-        let ciphertext_length = buf.len() - content_start;
-        if let Some(length_allocation) = length_allocation {
-            l0g::debug!("ciphertext length: {ciphertext_length}, {ciphertext_length:02x}, {length_allocation:?}");
-            length_allocation.set(buf, ciphertext_length as u16);
-        }
-
-        // ------ Encrypt payload
-        {
-            let plaintext_position = content_start..innerplaintext_end as usize;
-
-            // Split the buffer into the 2 slices.
-            let (unified_hdr, payload_with_tag) = to_header_and_payload_with_tag(
+            encode_ciphertext(
                 buf,
-                header_position,
-                plaintext_position,
-                tag_position,
-            );
-
-            let cipher_args = CipherArguments {
-                unified_hdr,
-                sequence_number_position,
-                payload_with_tag,
-            };
-
-            cipher.encrypt_record(cipher_args);
+                cipher,
+                self.content_type(),
+                0,                                 // TODO: Fix epoch
+                CiphertextSequenceNumber::Long(0), // TODO: Fix sequence number
+                |buf| self.encode_content(buf),
+            )
+            .await
+        } else {
+            encode_plaintext(
+                buf,
+                self.content_type(),
+                0,        // TODO: Fix epoch
+                0.into(), // TODO: Fix sequence number
+                |buf| self.encode_content(buf),
+            )
         }
-
-        // ------ Finish record
-
-        Ok(())
     }
 
     fn encode_content<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<(), ()> {
@@ -471,20 +382,32 @@ impl<'a> ServerRecord<'a> {
         }
     }
 
-    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, RecordPayloadPositions)> {
-        // Parse record.
-        // TODO: Parse encrypted record
-        let record_header = DTlsPlaintextHeader::parse(buf)?;
-        let record_payload = buf.pop_slice(record_header.length.into())?;
+    /// Parse a `ServerRecord`.
+    pub fn parse(
+        buf: &mut ParseBuffer<'a>,
+        cipher: &mut impl GenericCipher,
+    ) -> Option<(Self, RecordPayloadPositions)> {
+        let record_header = DTlsHeader::parse(buf)?;
         l0g::trace!("Got record: {:?}", record_header);
 
-        let mut buf = ParseBuffer::new(record_payload);
-        let start = buf.current_pos_ptr();
+        match record_header {
+            DTlsHeader::Plaintext(record_header) => {
+                parse_plaintext(&record_header, buf, |content_type, buf| {
+                    Self::parse_content(content_type, buf)
+                })
+            }
+            DTlsHeader::Ciphertext(record_header) => {
+                parse_ciphertext(&record_header, buf, cipher, |content_type, buf| {
+                    Self::parse_content(content_type, buf)
+                })
+            }
+        }
+    }
 
-        let ret = match record_header.type_ {
+    fn parse_content(content_type: ContentType, buf: &mut ParseBuffer<'a>) -> Option<Self> {
+        Some(match content_type {
             ContentType::Handshake => {
-                let handshake = ServerHandshake::parse(&mut buf)?;
-
+                let handshake = ServerHandshake::parse(buf)?;
                 ServerRecord::Handshake(handshake, Encryption::Disabled)
             }
             ContentType::Ack => todo!(),
@@ -492,18 +415,7 @@ impl<'a> ServerRecord<'a> {
             ContentType::Alert => todo!(),
             ContentType::ApplicationData => todo!(),
             ContentType::ChangeCipherSpec => todo!(),
-        };
-
-        let end = buf.current_pos_ptr();
-
-        Some((
-            ret,
-            RecordPayloadPositions {
-                start,
-                end,
-                binders: None,
-            },
-        ))
+        })
     }
 }
 
@@ -566,6 +478,28 @@ pub type ProtocolVersion = [u8; 2];
 
 /// Value used for protocol version in DTLS 1.3.
 pub const LEGACY_DTLS_VERSION: ProtocolVersion = [254, 253];
+
+/// Helper to parse DTLS headers.
+#[derive(Debug)]
+pub enum DTlsHeader<'a> {
+    Plaintext(DTlsPlaintextHeader),
+    Ciphertext(DTlsCiphertextHeader<'a>),
+}
+
+impl<'a> DTlsHeader<'a> {
+    pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        let mut pt_buf = buf.clone(); // We need 2 parse buffers.
+
+        if let Some(h) = DTlsCiphertextHeader::parse(buf) {
+            Some(DTlsHeader::Ciphertext(h))
+        } else if let Some(h) = DTlsPlaintextHeader::parse(&mut pt_buf) {
+            *buf = pt_buf;
+            Some(DTlsHeader::Plaintext(h))
+        } else {
+            None
+        }
+    }
+}
 
 /// DTls 1.3 plaintext header.
 #[derive(Debug)]
@@ -846,4 +780,144 @@ pub enum ContentType {
     Heartbeat = 24,
     // Tls12Cid = 25,
     Ack = 26,
+}
+
+/// Encode a plaintext.
+fn encode_plaintext<'buf>(
+    buf: &'buf mut EncodingBuffer,
+    content_type: ContentType,
+    epoch: u16,
+    sequence_number: U48,
+    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<(), ()>,
+) -> Result<(), ()> {
+    let header = DTlsPlaintextHeader {
+        type_: content_type,
+        epoch,
+        sequence_number,
+        length: 0, // To be encoded later.
+    };
+    // Create record header.
+    let length_allocation = header.encode(buf)?;
+
+    // ------ Start record
+
+    let content_length = {
+        let mut inner_buf = buf.new_from_existing();
+
+        // ------ Encode payload
+        encode_content(&mut inner_buf)?;
+
+        inner_buf.len()
+    };
+
+    length_allocation.set(buf, content_length as u16);
+
+    // ------ Finish record
+    Ok(())
+}
+
+/// Encode a ciphertext.
+async fn encode_ciphertext<'buf>(
+    buf: &'buf mut EncodingBuffer<'_>,
+    cipher: &mut impl GenericCipher,
+    content_type: ContentType,
+    epoch: u8,
+    sequence_number: CiphertextSequenceNumber,
+    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<(), ()>,
+) -> Result<(), ()> {
+    let buf = &mut buf.new_from_existing();
+
+    let header_start = buf.len();
+
+    // Create record header.
+    let (sequence_number_position, length_allocation) = DTlsCiphertextHeader {
+        epoch,
+        sequence_number,
+        length: Some(0),
+        connection_id: None,
+    }
+    .encode(buf)?;
+
+    // ------ Start record
+
+    let content_start = buf.len();
+    let header_position = header_start..content_start;
+
+    // ------ Encode payload
+    encode_content(buf)?;
+
+    let content_length = buf.len() - content_start;
+
+    // Encode the tail of the DTLSInnerPlaintext.
+    DtlsInnerPlaintext::encode(content_type, buf, content_length, cipher.tag_size())?;
+
+    let innerplaintext_end = buf.len();
+
+    // Allocate space for the AEAD tag.
+    let aead_tag_allocation = buf.alloc_slice(cipher.tag_size())?;
+    let tag_position = aead_tag_allocation.at();
+    aead_tag_allocation.fill(buf, 0);
+
+    // Write the ciphertext length to the header.
+    let ciphertext_length = buf.len() - content_start;
+    if let Some(length_allocation) = length_allocation {
+        l0g::debug!("ciphertext length: {ciphertext_length}, {ciphertext_length:02x}, {length_allocation:?}");
+        length_allocation.set(buf, ciphertext_length as u16);
+    }
+
+    // ------ Encrypt payload
+    {
+        let plaintext_position = content_start..innerplaintext_end as usize;
+
+        // Split the buffer into the 2 slices.
+        let (unified_hdr, payload_with_tag) =
+            to_header_and_payload_with_tag(buf, header_position, plaintext_position, tag_position);
+
+        let cipher_args = CipherArguments {
+            unified_hdr,
+            sequence_number_position,
+            payload_with_tag,
+        };
+
+        cipher.encrypt_record(cipher_args).await.map_err(|_| ())?;
+    }
+
+    // ------ Finish record
+
+    Ok(())
+}
+
+fn parse_ciphertext<'a, Content>(
+    header: &DTlsCiphertextHeader,
+    buf: &mut ParseBuffer<'a>,
+    cipher: &mut impl GenericCipher,
+    parse_content: impl FnOnce(ContentType, &mut ParseBuffer<'a>) -> Option<Content>,
+) -> Option<(Content, RecordPayloadPositions)> {
+    // TODO: Parse encrypted record
+
+    todo!()
+}
+
+fn parse_plaintext<'a, Content>(
+    header: &DTlsPlaintextHeader,
+    buf: &mut ParseBuffer<'a>,
+    parse_content: impl FnOnce(ContentType, &mut ParseBuffer<'a>) -> Option<Content>,
+) -> Option<(Content, RecordPayloadPositions)> {
+    let record_payload = buf.pop_slice(header.length.into())?;
+
+    let mut buf = ParseBuffer::new(record_payload);
+    let start = buf.current_pos_ptr();
+
+    let ret = parse_content(header.type_, &mut buf)?;
+
+    let end = buf.current_pos_ptr();
+
+    Some((
+        ret,
+        RecordPayloadPositions {
+            start,
+            end,
+            binders: None,
+        },
+    ))
 }

@@ -142,6 +142,8 @@ pub enum Error<D: Datagram> {
     InvalidClientHello,
     /// The server hello was invalid.
     InvalidServerHello,
+    /// The server finished was invalid.
+    InvalidServerFinished,
     /// An error related to sending on the socket.
     Send(D::SendError),
     /// An error related to receivnig on the socket.
@@ -260,7 +262,8 @@ pub mod client {
 
                 let (server_hello, positions) =
                     if let (ServerRecord::Handshake(ServerHandshake::ServerHello(hello), _), pos) =
-                        ServerRecord::parse(parse_buffer).ok_or(Error::InvalidServerHello)?
+                        ServerRecord::parse(parse_buffer, &mut key_schedule)
+                            .ok_or(Error::InvalidServerHello)?
                     {
                         (hello, pos)
                     } else {
@@ -283,16 +286,27 @@ pub mod client {
                 );
 
                 // Check if we got more datagrams, we're expecting a finished.
-                if !parse_buffer.is_empty() {
-                    l0g::error!("More!");
+                let finished = {
+                    let buf = if parse_buffer.is_empty() {
+                        // Wait for finished.
+                        socket.recv(buf).await.map_err(|e| Error::Recv(e))?
+                    } else {
+                        l0g::error!("More!");
+                        parse_buffer.pop_rest()
+                    };
 
-                    todo!();
-                } else {
-                    // Wait for finished.
-                    todo!();
-                }
+                    if let (ServerRecord::Handshake(ServerHandshake::ServerFinished(fin), _), _) =
+                        ServerRecord::parse(&mut ParseBuffer::new(buf), &mut key_schedule)
+                            .ok_or(Error::InvalidServerFinished)?
+                    {
+                        fin
+                    } else {
+                        return Err(Error::InvalidServerFinished);
+                    }
+                };
             }
 
+            todo!();
             // let handshake_traffic_secrets = key_schedule
             //     .create_handshake_traffic_secrets::<CipherSuite::Cipher>(
             //         &transcript_hasher.clone().finalize(),
