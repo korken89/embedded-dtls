@@ -175,13 +175,13 @@ pub trait Datagram {
     /// Send a complete datagram.
     async fn send(&self, buf: &[u8]) -> Result<(), Self::SendError>;
     /// Receive a complete datagram.
-    async fn recv<'a>(&self, buf: &'a mut [u8]) -> Result<&'a [u8], Self::ReceiveError>;
+    async fn recv<'a>(&self, buf: &'a mut [u8]) -> Result<&'a mut [u8], Self::ReceiveError>;
 }
 
 // Lives in no_std land.
 pub mod client {
     use crate::{
-        buffer::{EncodingBuffer, ParseBuffer},
+        buffer::{EncodingBuffer, ParseBuffer, ParseBufferMut},
         cipher_suites::DtlsCipherSuite,
         client_config::ClientConfig,
         handshake::ServerHandshake,
@@ -258,11 +258,14 @@ pub mod client {
                 l0g::trace!("Got datagram!");
 
                 // Parse and validate ServerHello.
-                let parse_buffer = &mut ParseBuffer::new(resp);
+                let mut parse_buffer = ParseBufferMut::new(resp);
 
-                let (server_hello, positions) =
-                    if let (ServerRecord::Handshake(ServerHandshake::ServerHello(hello), _), pos) =
-                        ServerRecord::parse(parse_buffer, &mut key_schedule)
+                let (positions, shared_secret) = {
+                    let (server_hello, positions) = if let (
+                        ServerRecord::Handshake(ServerHandshake::ServerHello(hello), _),
+                        pos,
+                    ) =
+                        ServerRecord::parse(&mut parse_buffer, &mut key_schedule)
                             .ok_or(Error::InvalidServerHello)?
                     {
                         (hello, pos)
@@ -270,16 +273,23 @@ pub mod client {
                         return Err(Error::InvalidServerHello);
                     };
 
-                let to_hash = positions
-                    .into_slice(resp)
-                    .ok_or(Error::InvalidServerHello)?;
-                transcript_hasher.update(to_hash);
+                    // Update key schedule to Handshake Secret using public keys.
+                    let their_public_key = server_hello
+                        .validate()
+                        .map_err(|_| Error::InvalidServerHello)?;
 
-                // Update key schedule to Handshake Secret using public keys.
-                let their_public_key = server_hello
-                    .validate()
-                    .map_err(|_| Error::InvalidServerHello)?;
-                let shared_secret = secret_key.diffie_hellman(&their_public_key);
+                    drop(server_hello);
+
+                    (positions, secret_key.diffie_hellman(&their_public_key))
+                };
+
+                let data_left = parse_buffer.len();
+
+                transcript_hasher.update(
+                    positions
+                        .into_slice(resp)
+                        .ok_or(Error::InvalidServerHello)?,
+                );
                 key_schedule.initialize_handshake_secret(
                     shared_secret.as_bytes(),
                     &transcript_hasher.clone().finalize(),
@@ -287,16 +297,18 @@ pub mod client {
 
                 // Check if we got more datagrams, we're expecting a finished.
                 let finished = {
-                    let buf = if parse_buffer.is_empty() {
+                    let buf = if data_left == 0 {
                         // Wait for finished.
                         socket.recv(buf).await.map_err(|e| Error::Recv(e))?
                     } else {
-                        l0g::error!("More! {}, {:02x?}", parse_buffer.len(), parse_buffer);
-                        parse_buffer.pop_rest()
+                        // l0g::error!("More! {}, {:02x?}", parse_buffer.len(), parse_buffer);
+                        // parse_buffer.pop_rest()
+                        let parsed_len = resp.len() - data_left;
+                        &mut resp[parsed_len..]
                     };
 
                     if let (ServerRecord::Handshake(ServerHandshake::ServerFinished(fin), _), _) =
-                        ServerRecord::parse(&mut ParseBuffer::new(buf), &mut key_schedule)
+                        ServerRecord::parse(&mut ParseBufferMut::new(buf), &mut key_schedule)
                             .ok_or(Error::InvalidServerFinished)?
                     {
                         fin
@@ -650,12 +662,12 @@ mod test {
             self.tx.send(buf.into()).await.map_err(|_| ())
         }
 
-        async fn recv<'a>(&self, buf: &'a mut [u8]) -> Result<&'a [u8], Self::ReceiveError> {
+        async fn recv<'a>(&self, buf: &'a mut [u8]) -> Result<&'a mut [u8], Self::ReceiveError> {
             let r = self.rx.lock().await.recv().await.ok_or(())?;
 
             buf[..r.len()].copy_from_slice(&r);
 
-            Ok(&buf[..r.len()])
+            Ok(&mut buf[..r.len()])
         }
     }
 

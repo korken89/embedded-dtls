@@ -1,5 +1,5 @@
 use crate::{
-    buffer::{AllocU16Handle, EncodingBuffer, ParseBuffer},
+    buffer::{AllocU16Handle, EncodingBuffer, ParseBuffer, ParseBufferMut},
     cipher_suites::DtlsCipherSuite,
     client_config::ClientConfig,
     handshake::{
@@ -398,23 +398,24 @@ impl<'a> ServerRecord<'a> {
 
     /// Parse a `ServerRecord`.
     pub fn parse(
-        buf: &mut ParseBuffer<'a>,
+        buf: &mut ParseBufferMut<'a>,
         cipher: &mut impl GenericCipher,
     ) -> Option<(Self, RecordPayloadPositions)> {
-        let record_header = DTlsHeader::parse(buf)?;
-        l0g::trace!("Got record: {:?}", record_header);
+        let is_ciphertext = buf.first()? >> 5 == 0b001;
 
-        match record_header {
-            DTlsHeader::Plaintext(record_header) => {
-                parse_plaintext(&record_header, buf, |content_type, buf| {
-                    Self::parse_content(content_type, buf)
-                })
-            }
-            DTlsHeader::Ciphertext(record_header) => {
-                parse_ciphertext(&record_header, buf, cipher, |content_type, buf| {
-                    Self::parse_content(content_type, buf)
-                })
-            }
+        if is_ciphertext {
+            let r = parse_ciphertext(buf, cipher, |content_type, buf| {
+                Self::parse_content(content_type, buf)
+            });
+            let len = buf.len();
+            r
+        } else {
+            let r = parse_plaintext(&mut buf.as_parse_buffer(), |content_type, buf| {
+                Self::parse_content(content_type, buf)
+            });
+
+            let len = buf.len();
+            r
         }
     }
 
@@ -905,8 +906,7 @@ async fn encode_ciphertext<'buf>(
 }
 
 fn parse_ciphertext<'a, Content>(
-    header: &DTlsCiphertextHeader,
-    buf: &mut ParseBuffer<'a>,
+    buf: &mut ParseBufferMut<'a>,
     cipher: &mut impl GenericCipher,
     parse_content: impl FnOnce(ContentType, &mut ParseBuffer<'a>) -> Option<Content>,
 ) -> Option<(Content, RecordPayloadPositions)> {
@@ -918,7 +918,6 @@ fn parse_ciphertext<'a, Content>(
 }
 
 fn parse_plaintext<'a, Content>(
-    header: &DTlsPlaintextHeader,
     buf: &mut ParseBuffer<'a>,
     parse_content: impl FnOnce(ContentType, &mut ParseBuffer<'a>) -> Option<Content>,
 ) -> Option<(Content, RecordPayloadPositions)> {
