@@ -80,7 +80,7 @@ pub trait DtlsCipher: AeadCore {
     ) -> aead::Result<()>;
 }
 
-/// Chacha chipher.
+/// Chacha cipher.
 #[derive(Debug)]
 pub struct DtlsEcdhePskWithChacha20Poly1305Sha256;
 

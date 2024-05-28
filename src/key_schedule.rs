@@ -454,72 +454,6 @@ where
         }
         .create_nonce(record_number)
     }
-
-    fn create_read_record_number(
-        &self,
-        short_sequence_number: CiphertextSequenceNumber,
-    ) -> Option<u64> {
-        // Based on the recommendation in Section 4.2.2 RFC9147
-        // TODO: This needs to handle the wrapping.
-        match short_sequence_number {
-            CiphertextSequenceNumber::Short(s) => {
-                // TODO
-            }
-            CiphertextSequenceNumber::Long(l) => {
-                // TODO
-            }
-        }
-
-        Some(self.read_record_number)
-    }
-}
-
-const MASK_UPPER16: u64 = !0xffff;
-const MASK_MSB16: u16 = 0x8000;
-const OFFSET16: u64 = 0x8000;
-
-const MASK_UPPER8: u64 = !0xff;
-const MASK_MSB8: u16 = 0x80;
-const OFFSET8: u64 = 0x80;
-
-pub fn find_closest2(last_successful_record_number: u64, seq: CiphertextSequenceNumber) -> u64 {
-    let (mask_upper, mask_msb, offset, seq) = match seq {
-        CiphertextSequenceNumber::Short(s) => (MASK_UPPER8, MASK_MSB8, OFFSET8, s as u64),
-        CiphertextSequenceNumber::Long(l) => (MASK_UPPER16, MASK_MSB16, OFFSET16, l as u64),
-    };
-
-    let lower = (last_successful_record_number as u16).wrapping_add(1);
-    let msb = lower & mask_msb != 0;
-
-    let option1 = last_successful_record_number;
-    let candidate1 = (option1 & mask_upper) | seq;
-    let diff1 = last_successful_record_number.abs_diff(candidate1 + 1) as u16;
-
-    if msb {
-        let option2 = last_successful_record_number + offset;
-        let candidate2 = (option2 & mask_upper) | seq;
-        let diff2 = last_successful_record_number.abs_diff(candidate2 + 1) as u16;
-
-        if diff1 < diff2 {
-            candidate1
-        } else {
-            candidate2
-        }
-    } else {
-        if last_successful_record_number < offset {
-            return candidate1;
-        }
-
-        let option3 = last_successful_record_number - offset;
-        let candidate3 = (option3 & mask_upper) | seq;
-        let diff3 = last_successful_record_number.abs_diff(candidate3 + 1) as u16;
-
-        if diff1 < diff3 {
-            candidate1
-        } else {
-            candidate3
-        }
-    }
 }
 
 struct HkdfLabelContext<'a, 'b> {
@@ -612,23 +546,22 @@ where
             &mut unified_hdr[sequence_number_position.clone()],
         );
 
-        let read_record_number = self
-            .create_read_record_number(
-                CiphertextSequenceNumber::from_bytes(&unified_hdr[sequence_number_position])
-                    .ok_or(aead::Error)?,
-            )
-            .ok_or(aead::Error)?;
+        let estimated_read_record_number = find_closest_record_number(
+            self.read_record_number,
+            CiphertextSequenceNumber::from_bytes(&unified_hdr[sequence_number_position])
+                .ok_or(aead::Error)?,
+        );
 
         self.cipher
             .decrypt_ciphertext(
-                &self.create_decryption_nonce(read_record_number),
+                &self.create_decryption_nonce(estimated_read_record_number),
                 &mut buf,
                 unified_hdr,
             )
             .await?;
 
         // Decryption successful, store the read_record_number if it is larger.
-        self.read_record_number = self.read_record_number.max(read_record_number);
+        self.read_record_number = self.read_record_number.max(estimated_read_record_number);
 
         Ok(())
     }
@@ -636,5 +569,93 @@ where
     fn tag_size(&self) -> usize {
         use aead::generic_array::typenum::Unsigned;
         <CipherSuite::Cipher as AeadCore>::TagSize::to_usize()
+    }
+}
+
+/// This implements the recommended reconstruction algorithm in Section 4.2.2 RFC 9147.
+fn find_closest_record_number(
+    last_successful_record_number: u64,
+    seq: CiphertextSequenceNumber,
+) -> u64 {
+    const MASK_UPPER16: u64 = !0xffff;
+    const MASK_MSB16: u16 = 0x8000;
+    const OFFSET16: u64 = 0x8000;
+
+    const MASK_UPPER8: u64 = !0xff;
+    const MASK_MSB8: u16 = 0x80;
+    const OFFSET8: u64 = 0x80;
+
+    let (mask_upper, mask_msb, offset, seq) = match seq {
+        CiphertextSequenceNumber::Short(s) => (MASK_UPPER8, MASK_MSB8, OFFSET8, s as u64),
+        CiphertextSequenceNumber::Long(l) => (MASK_UPPER16, MASK_MSB16, OFFSET16, l as u64),
+    };
+
+    let lower = (last_successful_record_number as u16).wrapping_add(1);
+    // If MSB is set we need to check the current record number and the next overflow for the
+    // match. If it is not set we need to check the current and the previous.
+    let msb = lower & mask_msb != 0;
+
+    let candidate_center = (last_successful_record_number & mask_upper) | seq;
+    let diff_center = last_successful_record_number.abs_diff(candidate_center + 1) as u16;
+
+    if msb {
+        let candidate_next = ((last_successful_record_number + offset) & mask_upper) | seq;
+        let diff_next = last_successful_record_number.abs_diff(candidate_next + 1) as u16;
+
+        if diff_center < diff_next {
+            candidate_center
+        } else {
+            candidate_next
+        }
+    } else {
+        if last_successful_record_number < offset {
+            return candidate_center;
+        }
+
+        let candidate_prev = ((last_successful_record_number - offset) & mask_upper) | seq;
+        let diff_prev = last_successful_record_number.abs_diff(candidate_prev + 1) as u16;
+
+        if diff_center < diff_prev {
+            candidate_center
+        } else {
+            candidate_prev
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    // TODO: More tests. One that takes worst case +/- around current and shuffles.
+    use super::find_closest_record_number;
+    use crate::record::CiphertextSequenceNumber;
+
+    fn closest_record_number_linear_u8() {
+        let mut last_record_number = 0;
+
+        for num in 0..10_000_000 {
+            let estimated = find_closest_record_number(
+                last_record_number,
+                CiphertextSequenceNumber::Short(num as u8),
+            );
+
+            assert_eq!(num, estimated);
+
+            last_record_number = estimated;
+        }
+    }
+
+    fn closest_record_number_linear_u16() {
+        let mut last_record_number = 0;
+
+        for num in 0..10_000_000 {
+            let estimated = find_closest_record_number(
+                last_record_number,
+                CiphertextSequenceNumber::Long(num as u16),
+            );
+
+            assert_eq!(num, estimated);
+
+            last_record_number = estimated;
+        }
     }
 }
