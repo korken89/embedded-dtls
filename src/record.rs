@@ -240,7 +240,13 @@ impl<'a> ClientRecord<'a> {
 
 pub(crate) trait GenericCipher {
     async fn encrypt_record(&mut self, args: CipherArguments) -> aead::Result<()>;
-    async fn decrypt_record(&mut self, args: CipherArguments) -> aead::Result<()>;
+
+    async fn decrypt_record(
+        &mut self,
+        ciphertext_header: &DTlsCiphertextHeader,
+        args: CipherArguments,
+    ) -> aead::Result<()>;
+
     fn tag_size(&self) -> usize;
 }
 
@@ -274,6 +280,7 @@ impl<'a> ServerRecord<'a> {
         public_key: PublicKey,
         selected_cipher_suite: u16,
         selected_psk_identity: u16,
+        key_schedule: &mut impl GenericCipher,
         buf: &'buf mut EncodingBuffer<'_>,
     ) -> Result<(), ()> {
         let server_hello = ServerHello {
@@ -300,7 +307,7 @@ impl<'a> ServerRecord<'a> {
             ServerHandshake::ServerHello(server_hello),
             Encryption::Disabled,
         )
-        .encode(buf, todo!())
+        .encode(buf, key_schedule)
         .await
     }
 
@@ -613,7 +620,8 @@ impl DTlsPlaintextHeader {
 #[derive(Copy, Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DTlsCiphertextHeader<'a> {
-    /// The shortened epoch of this record.
+    /// The shortened 2-bit epoch number of this record.
+    // TODO: Make epoc only representable as 2 bits.
     pub epoch: u8,
     /// The shortened sequence number of this record.
     pub sequence_number: CiphertextSequenceNumber,

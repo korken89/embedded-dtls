@@ -5,8 +5,8 @@ pub use parse_buffer::*;
 mod crypto_buffer {
     use aead::{Buffer, Error};
 
-    /// Buffer for encrypting and decrypting records that implements `aead::Buffer` so it works
-    /// with exising AEAD traits.
+    /// Buffer for encrypting and decrypting records that implements `aead::Buffer`, so it works
+    /// with existing AEAD traits.
     #[derive(Debug, PartialEq, Eq)]
     pub struct CryptoBuffer<'a> {
         data: &'a mut [u8],
@@ -22,12 +22,14 @@ mod crypto_buffer {
     }
 
     impl<'a> AsRef<[u8]> for CryptoBuffer<'a> {
+        #[inline(always)]
         fn as_ref(&self) -> &[u8] {
             &self.data[..self.idx]
         }
     }
 
     impl<'a> AsMut<[u8]> for CryptoBuffer<'a> {
+        #[inline(always)]
         fn as_mut(&mut self) -> &mut [u8] {
             &mut self.data[..self.idx]
         }

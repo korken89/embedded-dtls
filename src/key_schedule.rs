@@ -15,10 +15,10 @@
 //                        Transcript-Hash(Messages), Hash.length)
 
 use crate::{
-    buffer::{CryptoBuffer, EncodingBuffer},
+    buffer::{CryptoBuffer, EncodingBuffer, ParseBuffer},
     cipher_suites::{DtlsCipher, DtlsCipherSuite},
     handshake::extensions::Psk,
-    record::{CipherArguments, CiphertextSequenceNumber, GenericCipher},
+    record::{CipherArguments, CiphertextSequenceNumber, DTlsCiphertextHeader, GenericCipher},
 };
 use aead::Buffer;
 use chacha20poly1305::{AeadCore, KeySizeUser};
@@ -141,6 +141,7 @@ pub struct KeySchedule<CipherSuite: DtlsCipherSuite> {
     cipher: CipherSuite::Cipher,
     write_record_number: u64,
     read_record_number: u64,
+    epoch_number: u64,
     is_server: bool,
 }
 
@@ -155,6 +156,7 @@ where
             cipher,
             write_record_number: 0,
             read_record_number: 0,
+            epoch_number: 0,
             is_server: true,
         }
     }
@@ -166,6 +168,7 @@ where
             cipher,
             write_record_number: 0,
             read_record_number: 0,
+            epoch_number: 0,
             is_server: false,
         }
     }
@@ -504,7 +507,12 @@ where
             payload_with_tag,
         } = args;
 
-        let mut buf = {
+        if payload_with_tag.len() < 16 {
+            // Invalid record.
+            return Err(aead::Error);
+        }
+
+        let mut payload_with_tag = {
             let payload_len = payload_with_tag.len();
             let mut buf = CryptoBuffer::new(payload_with_tag);
             // Make the buffer indicate that the tag space is unwritten.
@@ -513,14 +521,20 @@ where
         };
 
         self.cipher
-            .encrypt_plaintext(&self.create_encryption_nonce(), &mut buf, unified_hdr)
+            .encrypt_plaintext(
+                &self.create_encryption_nonce(),
+                &mut payload_with_tag,
+                unified_hdr,
+            )
             .await?;
 
-        let ciphertext: &[u8] = &buf.as_ref()[..16];
         self.cipher
             .apply_mask_for_record_number(
-                ciphertext.try_into().unwrap(),
-                &mut unified_hdr[sequence_number_position],
+                // NOTE(unwrap/slicing): Guaranteed to succeed. The length must be at least 16.
+                &payload_with_tag.as_ref()[..16].try_into().unwrap(),
+                unified_hdr
+                    .get_mut(sequence_number_position)
+                    .ok_or(aead::Error)?,
             )
             .await?;
 
@@ -529,33 +543,45 @@ where
         Ok(())
     }
 
-    async fn decrypt_record(&mut self, args: CipherArguments<'_>) -> aead::Result<()> {
+    async fn decrypt_record(
+        &mut self,
+        ciphertext_header: &DTlsCiphertextHeader<'_>,
+        args: CipherArguments<'_>,
+    ) -> aead::Result<()> {
         let CipherArguments {
             unified_hdr,
             sequence_number_position,
             payload_with_tag,
         } = args;
 
-        // TODO: Check the epoch, early return if wrong. Section 4.2.2 RFC 9147.
+        if payload_with_tag.len() < 16 {
+            // Invalid record.
+            return Err(aead::Error);
+        }
 
-        let mut buf = CryptoBuffer::new(payload_with_tag);
+        // Check the epoch, early return if wrong.
+        if ciphertext_header.epoch & 0b11 != self.epoch_number as u8 & 0b11 {
+            // TODO: Log?
+            return Err(aead::Error);
+        }
 
-        let ciphertext: &[u8] = &buf.as_ref()[..16];
+        let mut payload_with_tag = CryptoBuffer::new(payload_with_tag);
+
         self.cipher.apply_mask_for_record_number(
-            ciphertext.try_into().unwrap(),
-            &mut unified_hdr[sequence_number_position.clone()],
-        );
-
-        let estimated_read_record_number = find_closest_record_number(
-            self.read_record_number,
-            CiphertextSequenceNumber::from_bytes(&unified_hdr[sequence_number_position])
+            // NOTE(unwrap/slicing): Guaranteed to succeed. The length must be at least 16.
+            &payload_with_tag.as_ref()[..16].try_into().unwrap(),
+            unified_hdr
+                .get_mut(sequence_number_position)
                 .ok_or(aead::Error)?,
         );
+
+        let estimated_read_record_number =
+            find_closest_record_number(self.read_record_number, ciphertext_header.sequence_number);
 
         self.cipher
             .decrypt_ciphertext(
                 &self.create_decryption_nonce(estimated_read_record_number),
-                &mut buf,
+                &mut payload_with_tag,
                 unified_hdr,
             )
             .await?;

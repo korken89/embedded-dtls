@@ -326,7 +326,9 @@ pub mod server {
             ClientHandshake,
         },
         key_schedule::KeySchedule,
-        record::{ClientRecord, ServerRecord},
+        record::{
+            CipherArguments, ClientRecord, DTlsCiphertextHeader, GenericCipher, ServerRecord,
+        },
         server_config::{Identity, Key, ServerConfig},
         Datagram, Error,
     };
@@ -437,6 +439,7 @@ pub mod server {
                 our_public_key,
                 selected_cipher_suite as u16,
                 0,
+                &mut key_schedule,
                 &mut enc_buf,
             )
             .await
@@ -452,7 +455,7 @@ pub mod server {
 
             // Add the Finished message to this datagram.
             ServerRecord::finished(&transcript_hasher.clone().finalize())
-                .encode(&mut enc_buf, &mut t)
+                .encode(&mut enc_buf, &mut key_schedule)
                 .await
                 .map_err(|_| Error::InsufficientSpace)?;
 
@@ -532,6 +535,35 @@ pub mod server {
                 ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => {
                     key_schedule.initialize_handshake_secret(ecdhe, transcript);
                 }
+            }
+        }
+    }
+
+    // All server ciphers must implement `GenericCipher`.
+    impl GenericCipher for ServerKeySchedule {
+        async fn encrypt_record(&mut self, args: CipherArguments<'_>) -> aead::Result<()> {
+            match self {
+                ServerKeySchedule::Chacha20Poly1305Sha256(cipher) => {
+                    cipher.encrypt_record(args).await
+                }
+            }
+        }
+
+        async fn decrypt_record(
+            &mut self,
+            ciphertext_header: &DTlsCiphertextHeader<'_>,
+            args: CipherArguments<'_>,
+        ) -> aead::Result<()> {
+            match self {
+                ServerKeySchedule::Chacha20Poly1305Sha256(cipher) => {
+                    cipher.decrypt_record(ciphertext_header, args).await
+                }
+            }
+        }
+
+        fn tag_size(&self) -> usize {
+            match self {
+                ServerKeySchedule::Chacha20Poly1305Sha256(cipher) => cipher.tag_size(),
             }
         }
     }
