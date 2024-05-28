@@ -239,15 +239,24 @@ impl<'a> ClientRecord<'a> {
 }
 
 pub(crate) trait GenericCipher {
+    /// Encrypts a record.
     async fn encrypt_record(&mut self, args: CipherArguments) -> aead::Result<()>;
 
+    /// Decrypts a record.
     async fn decrypt_record(
         &mut self,
         ciphertext_header: &DTlsCiphertextHeader,
         args: CipherArguments,
     ) -> aead::Result<()>;
 
+    /// Returns the size of the AEAD tag.
     fn tag_size(&self) -> usize;
+
+    /// Get the current record number and increase it.
+    fn write_record_number(&mut self) -> u64;
+
+    /// Get the current epoch number.
+    fn epoch_number(&self) -> u64;
 }
 
 #[derive(Debug)]
@@ -331,13 +340,18 @@ impl<'a> ServerRecord<'a> {
         buf: &'buf mut EncodingBuffer<'_>,
         cipher: &mut impl GenericCipher,
     ) -> Result<(), ()> {
+        let epoch = cipher.epoch_number();
+        let record_number = cipher.write_record_number();
+
+        l0g::error!("encoding record with record_number {record_number}");
+
         if self.is_encrypted() {
             encode_ciphertext(
                 buf,
                 cipher,
                 self.content_type(),
-                0,                                 // TODO: Fix epoch
-                CiphertextSequenceNumber::Long(0), // TODO: Fix sequence number
+                epoch as u8,
+                CiphertextSequenceNumber::Long(record_number as u16),
                 |buf| self.encode_content(buf),
             )
             .await
@@ -345,8 +359,8 @@ impl<'a> ServerRecord<'a> {
             encode_plaintext(
                 buf,
                 self.content_type(),
-                0,        // TODO: Fix epoch
-                0.into(), // TODO: Fix sequence number
+                epoch as u16,
+                record_number.into(), // TODO: Check if we should protect here
                 |buf| self.encode_content(buf),
             )
         }
@@ -487,7 +501,7 @@ pub enum DTlsHeader<'a> {
 }
 
 impl<'a> DTlsHeader<'a> {
-    pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
         let mut pt_buf = buf.clone(); // We need 2 parse buffers.
 
         if let Some(h) = DTlsCiphertextHeader::parse(buf) {
@@ -502,7 +516,7 @@ impl<'a> DTlsHeader<'a> {
 }
 
 /// DTls 1.3 plaintext header.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct DTlsPlaintextHeader {
     pub type_: ContentType,
     pub epoch: u16,
@@ -590,8 +604,8 @@ impl<'a> DTlsCiphertextHeader<'a> {
     //     opaque encrypted_record[length];
     // } DTLSCiphertext;
 
-    /// Encode a DTlsCiphertext unified header, return the allocation for the length field in
-    /// case the length is not `None`.
+    /// Encode a DTlsCiphertext unified header, return the sequence number location in the buffer
+    /// and allocation for the length field in case the length is not `None`.
     ///
     /// Follows section 4 in RFC9147.
     pub fn encode(
@@ -770,7 +784,7 @@ impl From<CiphertextSequenceNumber> for u64 {
 
 /// TLS content type. RFC 9147 - Appendix A.1
 #[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialOrd, PartialEq, TryFromPrimitive)]
+#[derive(Copy, Clone, Debug, PartialOrd, PartialEq, Eq, TryFromPrimitive)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ContentType {
     ChangeCipherSpec = 20,
@@ -838,6 +852,8 @@ async fn encode_ciphertext<'buf>(
     }
     .encode(buf)?;
 
+    l0g::debug!("encoded header = {:02x?}", buf);
+
     // ------ Start record
 
     let content_start = buf.len();
@@ -883,6 +899,7 @@ async fn encode_ciphertext<'buf>(
     }
 
     // ------ Finish record
+    l0g::debug!("encoded record = {:02x?}", buf);
 
     Ok(())
 }
@@ -894,6 +911,8 @@ fn parse_ciphertext<'a, Content>(
     parse_content: impl FnOnce(ContentType, &mut ParseBuffer<'a>) -> Option<Content>,
 ) -> Option<(Content, RecordPayloadPositions)> {
     // TODO: Parse encrypted record
+
+    // cipher.decrypt_record(header, CipherArguments { unified_hdr: , sequence_number_position: , payload_with_tag:  })
 
     todo!()
 }
@@ -920,4 +939,59 @@ fn parse_plaintext<'a, Content>(
             binders: None,
         },
     ))
+}
+
+#[cfg(test)]
+mod test {
+    use super::{ContentType, DTlsPlaintextHeader};
+    use crate::{
+        buffer::{EncodingBuffer, ParseBuffer},
+        record::DTlsCiphertextHeader,
+    };
+
+    #[test]
+    fn plaintext_header_rount_trip() {
+        let header = DTlsPlaintextHeader {
+            type_: ContentType::Handshake,
+            epoch: 2,
+            sequence_number: 123456.into(),
+            length: 321,
+        };
+
+        let mut buf = [0; 32];
+        let buf = &mut EncodingBuffer::new(&mut buf);
+
+        let len_alloc = header.encode(buf).unwrap();
+        len_alloc.set(buf, header.length);
+
+        let recv_buf: &[u8] = &buf;
+
+        let parse_buffer = &mut ParseBuffer::new(recv_buf);
+        let parsed_header = DTlsPlaintextHeader::parse(parse_buffer).unwrap();
+
+        assert_eq!(header, parsed_header)
+    }
+
+    #[test]
+    fn ciphertext_header_rount_trip() {
+        let header = DTlsCiphertextHeader {
+            epoch: 2,
+            sequence_number: crate::record::CiphertextSequenceNumber::Long(123),
+            length: Some(321),
+            connection_id: None,
+        };
+
+        let mut buf = [0; 32];
+        let buf = &mut EncodingBuffer::new(&mut buf);
+
+        let (_sn_pos, len_alloc) = header.encode(buf).unwrap();
+        len_alloc.unwrap().set(buf, header.length.unwrap());
+
+        let recv_buf: &[u8] = &buf;
+
+        let parse_buffer = &mut ParseBuffer::new(recv_buf);
+        let parsed_header = DTlsCiphertextHeader::parse(parse_buffer).unwrap();
+
+        assert_eq!(header, parsed_header)
+    }
 }

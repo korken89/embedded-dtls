@@ -291,7 +291,7 @@ pub mod client {
                         // Wait for finished.
                         socket.recv(buf).await.map_err(|e| Error::Recv(e))?
                     } else {
-                        l0g::error!("More!");
+                        l0g::error!("More! {}, {:02x?}", parse_buffer.len(), parse_buffer);
                         parse_buffer.pop_rest()
                     };
 
@@ -578,6 +578,18 @@ pub mod server {
         fn tag_size(&self) -> usize {
             match self {
                 ServerKeySchedule::Chacha20Poly1305Sha256(cipher) => cipher.tag_size(),
+            }
+        }
+
+        fn write_record_number(&mut self) -> u64 {
+            match self {
+                ServerKeySchedule::Chacha20Poly1305Sha256(cipher) => cipher.write_record_number(),
+            }
+        }
+
+        fn epoch_number(&self) -> u64 {
+            match self {
+                ServerKeySchedule::Chacha20Poly1305Sha256(cipher) => cipher.epoch_number(),
             }
         }
     }

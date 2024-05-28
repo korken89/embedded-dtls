@@ -567,13 +567,15 @@ where
 
         let mut payload_with_tag = CryptoBuffer::new(payload_with_tag);
 
-        self.cipher.apply_mask_for_record_number(
-            // NOTE(unwrap/slicing): Guaranteed to succeed. The length must be at least 16.
-            &payload_with_tag.as_ref()[..16].try_into().unwrap(),
-            unified_hdr
-                .get_mut(sequence_number_position)
-                .ok_or(aead::Error)?,
-        );
+        self.cipher
+            .apply_mask_for_record_number(
+                // NOTE(unwrap/slicing): Guaranteed to succeed. The length must be at least 16.
+                &payload_with_tag.as_ref()[..16].try_into().unwrap(),
+                unified_hdr
+                    .get_mut(sequence_number_position)
+                    .ok_or(aead::Error)?,
+            )
+            .await?;
 
         let estimated_read_record_number =
             find_closest_record_number(self.read_record_number, ciphertext_header.sequence_number);
@@ -595,6 +597,18 @@ where
     fn tag_size(&self) -> usize {
         use aead::generic_array::typenum::Unsigned;
         <CipherSuite::Cipher as AeadCore>::TagSize::to_usize()
+    }
+
+    fn write_record_number(&mut self) -> u64 {
+        let r = self.write_record_number;
+        self.write_record_number += 1;
+
+        l0g::error!("incrementing write record number: {}", r);
+        r
+    }
+
+    fn epoch_number(&self) -> u64 {
+        self.epoch_number
     }
 }
 
