@@ -84,7 +84,7 @@ mod parse_buffer {
         }
 
         /// Create a `ParseBuffer` from the current position.
-        pub fn as_parse_buffer<'b>(&'b self) -> ParseBuffer<'b> {
+        pub fn as_parse_buffer(&self) -> ParseBuffer {
             ParseBuffer::new(self.data)
         }
 
@@ -98,6 +98,12 @@ mod parse_buffer {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct ParseBuffer<'a> {
         data: &'a [u8],
+    }
+
+    impl<'a> AsRef<[u8]> for ParseBuffer<'a> {
+        fn as_ref(&self) -> &[u8] {
+            self.data
+        }
     }
 
     impl<'a> ParseBuffer<'a> {
@@ -122,7 +128,7 @@ mod parse_buffer {
         }
 
         /// Pop the rest of the buffer.
-        pub fn pop_rest(&mut self) -> &[u8] {
+        pub fn pop_rest(&mut self) -> &'a [u8] {
             let r = self.data;
             self.data = &[];
             r

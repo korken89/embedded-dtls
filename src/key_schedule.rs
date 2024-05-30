@@ -294,6 +294,10 @@ where
             ),
         }
 
+        l0g::info!(
+            "Crate handshake secrets ecdhe {ecdhe_secret:02x?}, transcript {transcript:02x?}"
+        );
+
         // Prepare the previous secret for use in the next stage.
         let (_secret, hkdf) = SimpleHkdf::<<CipherSuite as DtlsCipherSuite>::Hash>::extract(
             Some(&self.derived()),
@@ -417,15 +421,31 @@ where
             KeyScheduleState::EarlySecret(_) => unreachable!(),
             KeyScheduleState::HandshakeSecret(s) => {
                 if self.is_server {
+                    l0g::debug!(
+                        "Creating server handshake encryption nonce {}",
+                        self.write_record_number
+                    );
                     &s.traffic_secrets.server
                 } else {
+                    l0g::debug!(
+                        "Creating client handshake encryption nonce {}",
+                        self.write_record_number
+                    );
                     &s.traffic_secrets.client
                 }
             }
             KeyScheduleState::MasterSecret(s) => {
                 if self.is_server {
+                    l0g::debug!(
+                        "Creating server master encryption nonce {}",
+                        self.write_record_number
+                    );
                     &s.traffic_secrets.server
                 } else {
+                    l0g::debug!(
+                        "Creating client master encryption nonce {}",
+                        self.write_record_number
+                    );
                     &s.traffic_secrets.client
                 }
             }
@@ -442,15 +462,19 @@ where
             KeyScheduleState::EarlySecret(_) => unreachable!(),
             KeyScheduleState::HandshakeSecret(s) => {
                 if self.is_server {
+                    l0g::debug!("Creating server handshake decryption nonce {record_number}");
                     &s.traffic_secrets.client
                 } else {
+                    l0g::debug!("Creating client handshake decryption nonce {record_number}");
                     &s.traffic_secrets.server
                 }
             }
             KeyScheduleState::MasterSecret(s) => {
                 if self.is_server {
+                    l0g::debug!("Creating client master decryption nonce {record_number}");
                     &s.traffic_secrets.client
                 } else {
+                    l0g::debug!("Creating server master decryption nonce {record_number}");
                     &s.traffic_secrets.server
                 }
             }
@@ -502,8 +526,7 @@ where
 {
     async fn encrypt_record(&mut self, args: CipherArguments<'_>) -> aead::Result<()> {
         let CipherArguments {
-            unified_hdr,
-            sequence_number_position,
+            mut unified_hdr,
             payload_with_tag,
         } = args;
 
@@ -524,7 +547,7 @@ where
             .encrypt_plaintext(
                 &self.create_encryption_nonce(),
                 &mut payload_with_tag,
-                unified_hdr,
+                unified_hdr.full_header(),
             )
             .await?;
 
@@ -532,66 +555,72 @@ where
             .apply_mask_for_record_number(
                 // NOTE(unwrap/slicing): Guaranteed to succeed. The length must be at least 16.
                 &payload_with_tag.as_ref()[..16].try_into().unwrap(),
-                unified_hdr
-                    .get_mut(sequence_number_position)
-                    .ok_or(aead::Error)?,
+                unified_hdr.sequence_number_mut(),
             )
             .await?;
-
-        self.write_record_number += 1;
 
         Ok(())
     }
 
-    async fn decrypt_record(
+    async fn decrypt_record<'a>(
         &mut self,
         ciphertext_header: &DTlsCiphertextHeader<'_>,
-        args: CipherArguments<'_>,
-    ) -> aead::Result<()> {
+        args: CipherArguments<'a>,
+    ) -> aead::Result<&'a [u8]> {
         let CipherArguments {
-            unified_hdr,
-            sequence_number_position,
+            mut unified_hdr,
             payload_with_tag,
         } = args;
 
-        if payload_with_tag.len() < 16 {
-            // Invalid record.
+        if payload_with_tag.len() < 16.max(self.tag_size()) {
+            l0g::debug!("Invalid record");
+            // Invalid record, 16 bytes minimum for record number max and tag size to make sure
+            // there is a tag.
             return Err(aead::Error);
         }
 
         // Check the epoch, early return if wrong.
         if ciphertext_header.epoch & 0b11 != self.epoch_number as u8 & 0b11 {
+            l0g::debug!("Wrong epoch");
             // TODO: Log?
             return Err(aead::Error);
         }
 
-        let mut payload_with_tag = CryptoBuffer::new(payload_with_tag);
+        let mut payload_with_tag_buffer = CryptoBuffer::new(payload_with_tag);
 
-        self.cipher
+        if self
+            .cipher
             .apply_mask_for_record_number(
                 // NOTE(unwrap/slicing): Guaranteed to succeed. The length must be at least 16.
-                &payload_with_tag.as_ref()[..16].try_into().unwrap(),
-                unified_hdr
-                    .get_mut(sequence_number_position)
-                    .ok_or(aead::Error)?,
+                &payload_with_tag_buffer.as_ref()[..16].try_into().unwrap(),
+                unified_hdr.sequence_number_mut(),
             )
-            .await?;
+            .await
+            .is_err()
+        {
+            l0g::debug!("Applying mask failed");
+        }
 
+        let sequence_number = unified_hdr.sequence_number();
+        l0g::debug!("Got sequence number: {sequence_number:?}");
         let estimated_read_record_number =
-            find_closest_record_number(self.read_record_number, ciphertext_header.sequence_number);
+            find_closest_record_number(self.read_record_number, sequence_number);
+        l0g::debug!("Estimated read record number: {estimated_read_record_number:?}");
 
         self.cipher
             .decrypt_ciphertext(
                 &self.create_decryption_nonce(estimated_read_record_number),
-                &mut payload_with_tag,
-                unified_hdr,
+                &mut payload_with_tag_buffer,
+                unified_hdr.full_header(),
             )
             .await?;
+
+        l0g::debug!("Decryption successful");
 
         // Decryption successful, store the read_record_number if it is larger.
         self.read_record_number = self.read_record_number.max(estimated_read_record_number);
 
-        Ok(())
+        Ok(&payload_with_tag[..payload_with_tag.len() - self.tag_size()])
     }
 
     fn tag_size(&self) -> usize {
@@ -599,12 +628,19 @@ where
         <CipherSuite::Cipher as AeadCore>::TagSize::to_usize()
     }
 
-    fn write_record_number(&mut self) -> u64 {
+    fn write_record_number(&self) -> u64 {
         let r = self.write_record_number;
-        self.write_record_number += 1;
 
-        l0g::error!("incrementing write record number: {}", r);
+        l0g::error!("using write record number: {}", r);
         r
+    }
+
+    fn increment_write_record_number(&mut self) {
+        self.write_record_number += 1;
+        l0g::error!(
+            "incremented write record number to: {}",
+            self.write_record_number
+        );
     }
 
     fn epoch_number(&self) -> u64 {
@@ -669,6 +705,7 @@ mod test {
     use super::find_closest_record_number;
     use crate::record::CiphertextSequenceNumber;
 
+    #[test]
     fn closest_record_number_linear_u8() {
         let mut last_record_number = 0;
 
@@ -684,6 +721,7 @@ mod test {
         }
     }
 
+    #[test]
     fn closest_record_number_linear_u16() {
         let mut last_record_number = 0;
 

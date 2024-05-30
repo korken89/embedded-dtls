@@ -168,14 +168,19 @@ impl<'a> ServerHandshake<'a> {
 
         match handshake_header.msg_type {
             HandshakeType::ServerHello => {
-                let mut buf = ParseBuffer::new(handshake_payload);
-                let mut server_hello = ServerHello::parse(&mut buf)?;
+                let server_hello = ServerHello::parse(&mut ParseBuffer::new(handshake_payload))?;
 
                 l0g::trace!("Got server hello: {:02x?}", server_hello);
 
                 Some(Self::ServerHello(server_hello))
             }
-            HandshakeType::Finished => todo!(),
+            HandshakeType::Finished => {
+                let server_finished = Finished::parse(&mut ParseBuffer::new(handshake_payload));
+
+                l0g::trace!("Got server finished: {:02x?}", server_finished);
+
+                Some(Self::ServerFinished(server_finished))
+            }
             HandshakeType::KeyUpdate => todo!(),
             _ => None,
         }
@@ -653,5 +658,12 @@ impl<'a> Finished<'a> {
     /// Encode a Finished payload in an Handshake.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
         buf.extend_from_slice(&self.verify)
+    }
+
+    /// Parse a finished message.
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Self {
+        Self {
+            verify: buf.pop_rest(),
+        }
     }
 }

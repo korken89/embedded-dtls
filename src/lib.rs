@@ -249,47 +249,51 @@ pub mod client {
                 )
                 .map_err(|_| Error::InsufficientSpace)?;
 
+                l0g::info!(
+                    "Client transcript after client hello: {:02x?}",
+                    transcript_hasher.clone().finalize()
+                );
+
                 socket.send(&ser_buf).await.map_err(|e| Error::Send(e))?;
             }
 
             // Wait for response (ServerHello and Finished).
             {
-                let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+                let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
                 l0g::trace!("Got datagram!");
 
                 // Parse and validate ServerHello.
-                let mut parse_buffer = ParseBufferMut::new(resp);
+                // let mut parse_buffer = ParseBufferMut::new(resp);
 
-                let (positions, shared_secret) = {
-                    let (server_hello, positions) = if let (
-                        ServerRecord::Handshake(ServerHandshake::ServerHello(hello), _),
-                        pos,
-                    ) =
-                        ServerRecord::parse(&mut parse_buffer, &mut key_schedule)
+                let shared_secret = {
+                    let server_hello =
+                        if let ServerRecord::Handshake(ServerHandshake::ServerHello(hello), _) =
+                            ServerRecord::parse(
+                                &mut resp,
+                                Some(&mut transcript_hasher),
+                                &mut key_schedule,
+                            )
+                            .await
                             .ok_or(Error::InvalidServerHello)?
-                    {
-                        (hello, pos)
-                    } else {
-                        return Err(Error::InvalidServerHello);
-                    };
+                        {
+                            hello
+                        } else {
+                            return Err(Error::InvalidServerHello);
+                        };
+
+                    l0g::info!(
+                        "Client transcript after server hello: {:02x?}",
+                        transcript_hasher.clone().finalize()
+                    );
 
                     // Update key schedule to Handshake Secret using public keys.
                     let their_public_key = server_hello
                         .validate()
                         .map_err(|_| Error::InvalidServerHello)?;
 
-                    drop(server_hello);
-
-                    (positions, secret_key.diffie_hellman(&their_public_key))
+                    secret_key.diffie_hellman(&their_public_key)
                 };
 
-                let data_left = parse_buffer.len();
-
-                transcript_hasher.update(
-                    positions
-                        .into_slice(resp)
-                        .ok_or(Error::InvalidServerHello)?,
-                );
                 key_schedule.initialize_handshake_secret(
                     shared_secret.as_bytes(),
                     &transcript_hasher.clone().finalize(),
@@ -297,18 +301,16 @@ pub mod client {
 
                 // Check if we got more datagrams, we're expecting a finished.
                 let finished = {
-                    let buf = if data_left == 0 {
+                    let mut buf = if resp.is_empty() {
                         // Wait for finished.
                         socket.recv(buf).await.map_err(|e| Error::Recv(e))?
                     } else {
-                        // l0g::error!("More! {}, {:02x?}", parse_buffer.len(), parse_buffer);
-                        // parse_buffer.pop_rest()
-                        let parsed_len = resp.len() - data_left;
-                        &mut resp[parsed_len..]
+                        resp
                     };
 
-                    if let (ServerRecord::Handshake(ServerHandshake::ServerFinished(fin), _), _) =
-                        ServerRecord::parse(&mut ParseBufferMut::new(buf), &mut key_schedule)
+                    if let ServerRecord::Handshake(ServerHandshake::ServerFinished(fin), _) =
+                        ServerRecord::parse::<CipherSuite::Hash>(&mut buf, None, &mut key_schedule)
+                            .await
                             .ok_or(Error::InvalidServerFinished)?
                     {
                         fin
@@ -316,13 +318,16 @@ pub mod client {
                         return Err(Error::InvalidServerFinished);
                     }
                 };
+
+                if transcript_hasher.clone().finalize().as_ref() != finished.verify {
+                    l0g::error!("Server finished does not match transcript");
+                    return Err(Error::InvalidServerFinished);
+                }
+
+                l0g::trace!("Server finished MATCHES transcript");
             }
 
             todo!();
-            // let handshake_traffic_secrets = key_schedule
-            //     .create_handshake_traffic_secrets::<CipherSuite::Cipher>(
-            //         &transcript_hasher.clone().finalize(),
-            //     );
 
             // l0g::error!("Client handshake traffic secrets: {handshake_traffic_secrets:02x?}");
 
@@ -438,6 +443,11 @@ pub mod server {
             let binders_transcript_hash = transcript_hasher.clone().finalize();
             transcript_hasher.update(binders_and_rest);
 
+            l0g::info!(
+                "Server transcript after client hello: {:02x?}",
+                transcript_hasher.clone().finalize()
+            );
+
             let their_public_key = client_hello
                 .validate_and_initialize_keyschedule(
                     &mut key_schedule,
@@ -472,7 +482,14 @@ pub mod server {
             .map_err(|_| Error::InsufficientSpace)?;
 
             // TODO: Check that this is correct, I think this hashes the plaintext header.
-            transcript_hasher.update(&enc_buf);
+
+            // TODO: Replace constant
+            transcript_hasher.update(&enc_buf[13..]);
+
+            l0g::info!(
+                "Server transcript after server hello: {:02x?}",
+                transcript_hasher.clone().finalize()
+            );
 
             key_schedule.initialize_handshake_secret(
                 shared_secret.as_bytes(),
@@ -575,11 +592,11 @@ pub mod server {
             }
         }
 
-        async fn decrypt_record(
+        async fn decrypt_record<'a>(
             &mut self,
             ciphertext_header: &DTlsCiphertextHeader<'_>,
-            args: CipherArguments<'_>,
-        ) -> aead::Result<()> {
+            args: CipherArguments<'a>,
+        ) -> aead::Result<&'a [u8]> {
             match self {
                 ServerKeySchedule::Chacha20Poly1305Sha256(cipher) => {
                     cipher.decrypt_record(ciphertext_header, args).await
@@ -593,9 +610,17 @@ pub mod server {
             }
         }
 
-        fn write_record_number(&mut self) -> u64 {
+        fn write_record_number(&self) -> u64 {
             match self {
                 ServerKeySchedule::Chacha20Poly1305Sha256(cipher) => cipher.write_record_number(),
+            }
+        }
+
+        fn increment_write_record_number(&mut self) {
+            match self {
+                ServerKeySchedule::Chacha20Poly1305Sha256(cipher) => {
+                    cipher.increment_write_record_number()
+                }
             }
         }
 
