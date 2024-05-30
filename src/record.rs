@@ -8,7 +8,7 @@ use crate::{
             NewServerExtensions, OfferedPsks, PskKeyExchangeMode, PskKeyExchangeModes, SelectedPsk,
             ServerSupportedVersion,
         },
-        ClientHandshake, ClientHello, Finished, ServerHandshake, ServerHello,
+        ClientHandshake, ClientHello, Finished, Random, ServerHandshake, ServerHello,
     },
     integers::U48,
     key_schedule::KeySchedule,
@@ -24,6 +24,29 @@ use x25519_dalek::PublicKey;
 pub enum Encryption {
     Enabled,
     Disabled,
+}
+
+#[allow(unused)]
+struct NoRandom {}
+
+impl rand::CryptoRng for NoRandom {}
+
+impl rand::RngCore for NoRandom {
+    fn next_u32(&mut self) -> u32 {
+        panic!()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        panic!()
+    }
+
+    fn fill_bytes(&mut self, _dest: &mut [u8]) {
+        panic!()
+    }
+
+    fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), rand::Error> {
+        panic!()
+    }
 }
 
 /// Helper when something needs to encode or parse something differently.
@@ -117,22 +140,26 @@ pub enum ClientRecord<'a> {
 
 impl<'a> ClientRecord<'a> {
     /// Create a client hello handshake.
-    pub fn encode_client_hello<CipherSuite: DtlsCipherSuite, Rng: RngCore + CryptoRng>(
-        buf: &mut EncodingBuffer,
+    pub async fn encode_client_hello<CipherSuite: DtlsCipherSuite, Rng: RngCore + CryptoRng>(
+        buf: &mut EncodingBuffer<'_>,
         config: &'a ClientConfig<'a>,
         public_key: &PublicKey,
         rng: &mut Rng,
         key_schedule: &mut KeySchedule<CipherSuite>,
-        transcript_hasher: &mut CipherSuite::Hash,
-    ) -> Result<(), ()>
+    ) -> Result<RecordPayloadPositions, ()>
     where
         Rng: RngCore + CryptoRng,
     {
         let identities = &[config.psk.clone()];
+
+        let mut random = Random::default();
+        rng.fill_bytes(&mut random);
+
         let client_hello = ClientHello {
             version: LEGACY_DTLS_VERSION,
             legacy_session_id: &[],
             cipher_suites: &(<CipherSuite as DtlsCipherSuite>::CODE_POINT as u16).to_be_bytes(),
+            random: &random,
             extensions: ClientExtensions {
                 psk_key_exchange_modes: Some(PskKeyExchangeModes {
                     ke_modes: PskKeyExchangeMode::PskDheKe,
@@ -159,61 +186,69 @@ impl<'a> ClientRecord<'a> {
             ClientHandshake::ClientHello(client_hello),
             Encryption::Disabled,
         )
-        .encode::<CipherSuite, Rng>(buf, key_schedule, transcript_hasher, rng)
+        .encode(buf, key_schedule)
+        .await
     }
 
-    /// Encode the record into a buffer.
-    pub fn encode<'buf, CipherSuite: DtlsCipherSuite, Rng: RngCore + CryptoRng>(
-        &self,
-        buf: &'buf mut EncodingBuffer,
+    /// Create a server's finished message.
+    pub async fn encode_finished<CipherSuite: DtlsCipherSuite>(
+        buf: &mut EncodingBuffer<'_>,
         key_schedule: &mut KeySchedule<CipherSuite>,
-        transcript_hasher: &mut CipherSuite::Hash,
-        rng: &mut Rng,
+        transcript_hash: &'a [u8],
     ) -> Result<(), ()> {
-        if !self.is_encrypted() {
-            let header = DTlsPlaintextHeader {
-                type_: self.content_type(),
-                epoch: 0,
-                sequence_number: 0.into(),
-                length: 0, // To be encoded later.
-            };
+        let finished = Finished {
+            verify: transcript_hash,
+        };
 
-            // ------ Start record
+        l0g::debug!("Sending client finished: {finished:02x?}");
 
-            // Create record header.
-            let length_allocation = header.encode(buf)?;
-            let content_length = {
-                let mut inner_buf = buf.new_from_existing();
+        ClientRecord::Handshake(
+            ClientHandshake::ClientFinished(finished),
+            Encryption::Enabled,
+        )
+        .encode(buf, key_schedule)
+        .await
+        .map(|_| ())
+    }
 
-                // ------ Encode payload
+    /// Encode the record into a buffer. Returns (packet to send, content to hash).
+    pub async fn encode<'buf>(
+        &self,
+        buf: &'buf mut EncodingBuffer<'_>,
+        cipher: &mut impl GenericCipher,
+    ) -> Result<RecordPayloadPositions, ()> {
+        encode_record(
+            buf,
+            cipher,
+            self.is_encrypted(),
+            self.content_type(),
+            |buf| self.encode_content(buf),
+        )
+        .await
+    }
 
-                match self {
-                    // NOTE: Each record encoder needs to update the transcript hash at their end.
-                    ClientRecord::Handshake(handshake, _) => {
-                        handshake.encode::<Rng, CipherSuite>(
-                            &mut inner_buf,
-                            key_schedule,
-                            transcript_hasher,
-                            rng,
-                        )?;
-                    }
-                    ClientRecord::Alert(_, _) => todo!(),
-                    ClientRecord::Ack(_, _) => todo!(),
-                    ClientRecord::Heartbeat(_) => todo!(),
-                    ClientRecord::ApplicationData() => todo!(),
-                }
+    fn encode_content<'buf>(
+        &self,
+        buf: &'buf mut EncodingBuffer<'_>,
+    ) -> Result<RecordPayloadPositions, ()> {
+        let start = buf.current_pos_ptr();
 
-                inner_buf.len()
-            };
+        let binders = match self {
+            // NOTE: Each record encoder needs to update the transcript hash at their end.
+            ClientRecord::Handshake(handshake, _) => handshake.encode(buf)?,
+            ClientRecord::Alert(_, _) => todo!(),
+            ClientRecord::Heartbeat(_) => todo!(),
+            ClientRecord::Ack(_, _) => todo!(),
+            ClientRecord::ApplicationData() => todo!(),
+        };
 
-            length_allocation.set(buf, content_length as u16);
+        let end = buf.current_pos_ptr();
 
-            // ------ Finish record
-
-            Ok(())
-        } else {
-            todo!()
-        }
+        Ok(RecordPayloadPositions {
+            start,
+            binders,
+            end,
+        })
     }
 
     pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, RecordPayloadPositions)> {
@@ -378,34 +413,14 @@ impl<'a> ServerRecord<'a> {
         buf: &'buf mut EncodingBuffer<'_>,
         cipher: &mut impl GenericCipher,
     ) -> Result<(), ()> {
-        let epoch = cipher.epoch_number();
-        let record_number = cipher.write_record_number();
-
-        l0g::error!("encoding record with record_number {record_number}");
-
-        if self.is_encrypted() {
-            encode_ciphertext(
-                buf,
-                cipher,
-                self.content_type(),
-                epoch as u8,
-                CiphertextSequenceNumber::Long(record_number as u16),
-                |buf| self.encode_content(buf),
-            )
-            .await?;
-        } else {
-            encode_plaintext(
-                buf,
-                self.content_type(),
-                epoch as u16,
-                record_number.into(), // TODO: Check if we should protect here
-                |buf| self.encode_content(buf),
-            )?;
-        }
-
-        cipher.increment_write_record_number();
-
-        Ok(())
+        encode_record(
+            buf,
+            cipher,
+            self.is_encrypted(),
+            self.content_type(),
+            |buf| self.encode_content(buf),
+        )
+        .await
     }
 
     fn encode_content<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<(), ()> {
@@ -928,14 +943,52 @@ pub enum ContentType {
     Ack = 26,
 }
 
+/// Encode the record into a buffer. Returns (packet to send, content to hash).
+pub async fn encode_record<'buf, Ret>(
+    buf: &'buf mut EncodingBuffer<'_>,
+    cipher: &mut impl GenericCipher,
+    is_encrypted: bool,
+    content_type: ContentType,
+    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<Ret, ()>,
+) -> Result<Ret, ()> {
+    let epoch = cipher.epoch_number();
+    let record_number = cipher.write_record_number();
+
+    l0g::error!("encoding record with record_number {record_number}");
+
+    let r = if is_encrypted {
+        encode_ciphertext(
+            buf,
+            cipher,
+            content_type,
+            epoch as u8,
+            CiphertextSequenceNumber::Long(record_number as u16),
+            encode_content,
+        )
+        .await?
+    } else {
+        encode_plaintext(
+            buf,
+            content_type,
+            epoch as u16,
+            record_number.into(), // TODO: Check if we should protect here
+            encode_content,
+        )?
+    };
+
+    cipher.increment_write_record_number();
+
+    Ok(r)
+}
+
 /// Encode a plaintext.
-fn encode_plaintext<'buf>(
+fn encode_plaintext<'buf, Ret>(
     buf: &'buf mut EncodingBuffer,
     content_type: ContentType,
     epoch: u16,
     sequence_number: U48,
-    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<(), ()>,
-) -> Result<(), ()> {
+    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<Ret, ()>,
+) -> Result<Ret, ()> {
     let header = DTlsPlaintextHeader {
         type_: content_type,
         epoch,
@@ -947,30 +1000,30 @@ fn encode_plaintext<'buf>(
 
     // ------ Start record
 
-    let content_length = {
+    let (r, content_length) = {
         let mut inner_buf = buf.new_from_existing();
 
         // ------ Encode payload
-        encode_content(&mut inner_buf)?;
+        let r = encode_content(&mut inner_buf)?;
 
-        inner_buf.len()
+        (r, inner_buf.len())
     };
 
     length_allocation.set(buf, content_length as u16);
 
     // ------ Finish record
-    Ok(())
+    Ok(r)
 }
 
 /// Encode a ciphertext.
-async fn encode_ciphertext<'buf>(
+async fn encode_ciphertext<'buf, Ret>(
     buf: &'buf mut EncodingBuffer<'_>,
     cipher: &mut impl GenericCipher,
     content_type: ContentType,
     epoch: u8,
     sequence_number: CiphertextSequenceNumber,
-    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<(), ()>,
-) -> Result<(), ()> {
+    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<Ret, ()>,
+) -> Result<Ret, ()> {
     let buf = &mut buf.new_from_existing();
 
     let header_start = buf.len();
@@ -992,7 +1045,7 @@ async fn encode_ciphertext<'buf>(
     let header_position = header_start..content_start;
 
     // ------ Encode payload
-    encode_content(buf)?;
+    let r = encode_content(buf)?;
 
     let content_length = buf.len() - content_start;
 
@@ -1032,7 +1085,7 @@ async fn encode_ciphertext<'buf>(
     // ------ Finish record
     l0g::debug!("encoded record = {:02x?}", buf);
 
-    Ok(())
+    Ok(r)
 }
 
 fn parse_plaintext<'a, Content>(

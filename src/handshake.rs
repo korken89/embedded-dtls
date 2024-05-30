@@ -5,11 +5,11 @@ use crate::{
     handshake::extensions::PskKeyExchangeMode,
     integers::U24,
     key_schedule::KeySchedule,
-    record::{EncodeOrParse, ProtocolVersion, LEGACY_DTLS_VERSION},
+    record::{EncodeOrParse, ProtocolVersion, RecordPayloadPositions, LEGACY_DTLS_VERSION},
     server::ServerKeySchedule,
     server_config::{Identity, ServerConfig},
 };
-use digest::Digest;
+use digest::{core_api::BufferKindUser, Digest};
 use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::PublicKey;
@@ -27,13 +27,7 @@ pub enum ClientHandshake<'a> {
 }
 
 impl<'a> ClientHandshake<'a> {
-    pub fn encode<Rng: RngCore + CryptoRng, CipherSuite: DtlsCipherSuite>(
-        &self,
-        buf: &mut EncodingBuffer,
-        key_schedule: &mut KeySchedule<CipherSuite>,
-        transcript_hasher: &mut CipherSuite::Hash,
-        rng: &mut Rng,
-    ) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<Option<usize>, ()> {
         // Encode client handshake.
         let header = HandshakeHeader::encode(self.handshake_type(), buf)?;
 
@@ -44,11 +38,19 @@ impl<'a> ClientHandshake<'a> {
         let content_start = buf.len();
 
         let binders = match self {
-            ClientHandshake::ClientHello(hello) => hello.encode(rng, buf)?,
+            ClientHandshake::ClientHello(hello) => hello.encode(buf)?,
             ClientHandshake::ClientFinished(finished) => {
                 finished.encode(buf)?;
                 None
             }
+        };
+
+        let binders_position = if let Some(binders) = binders {
+            let binders_start = binders.start_pos_ptr(buf);
+            binders.fill(buf, 0);
+            Some(binders_start)
+        } else {
+            None
         };
 
         let content_length = (buf.len() - content_start) as u32;
@@ -58,29 +60,29 @@ impl<'a> ClientHandshake<'a> {
         header.fragment_offset.set(buf, 0.into());
         header.fragment_length.set(buf, content_length.into());
 
-        // The Handshake is finished, ready for transcript hash and binders.
-        if let Some(binders) = binders {
-            // Update the transcript with everything up until the binder itself.
-            transcript_hasher.update(binders.slice_up_until(buf));
+        // // The Handshake is finished, ready for transcript hash and binders.
+        // if let Some(binders) = binders {
+        //     // Update the transcript with everything up until the binder itself.
+        //     transcript_hasher.update(binders.slice_up_until(buf));
 
-            // Calculate the binder entry.
-            let binder_entry = key_schedule
-                .create_binder(&transcript_hasher.clone().finalize())
-                .expect("Unable to generate binder");
+        //     // Calculate the binder entry.
+        //     let binder_entry = key_schedule
+        //         .create_binder(&transcript_hasher.clone().finalize())
+        //         .expect("Unable to generate binder");
 
-            // Save the binder entry to the correct location.
-            // TODO: For each binder.
-            let buf = binders.into_buffer(buf);
-            buf[0] = binder_entry.len() as u8;
-            buf[1..].copy_from_slice(&binder_entry);
+        //     // Save the binder entry to the correct location.
+        //     // TODO: For each binder.
+        //     let buf = binders.into_buffer(buf);
+        //     buf[0] = binder_entry.len() as u8;
+        //     buf[1..].copy_from_slice(&binder_entry);
 
-            // Add the binder entry to the transcript.
-            transcript_hasher.update(&buf);
-        } else {
-            transcript_hasher.update(buf);
-        }
+        //     // Add the binder entry to the transcript.
+        //     transcript_hasher.update(&buf);
+        // } else {
+        //     transcript_hasher.update(buf);
+        // }
 
-        Ok(())
+        Ok(binders_position.flatten())
     }
 
     /// Parse a handshake message.
@@ -279,6 +281,7 @@ pub struct ClientHello<'a> {
     pub version: ProtocolVersion,
     pub legacy_session_id: &'a [u8],
     pub cipher_suites: &'a [u8],
+    pub random: &'a [u8],
     pub extensions: ClientExtensions<'a>,
 }
 
@@ -286,11 +289,7 @@ impl<'a> ClientHello<'a> {
     /// Encode a client hello payload in a Handshake. RFC 9147 section 5.3.
     ///
     /// Returns the allocated position for binders.
-    pub fn encode<Rng: RngCore + CryptoRng>(
-        &self,
-        rng: &mut Rng,
-        buf: &mut EncodingBuffer,
-    ) -> Result<Option<AllocSliceHandle>, ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<Option<AllocSliceHandle>, ()> {
         // struct {
         //     ProtocolVersion legacy_version = { 254,253 }; // DTLSv1.2
         //     Random random;
@@ -305,9 +304,10 @@ impl<'a> ClientHello<'a> {
         buf.extend_from_slice(&LEGACY_DTLS_VERSION)?;
 
         // Random.
-        let mut random = Random::default();
-        rng.fill_bytes(&mut random);
-        buf.extend_from_slice(&random)?;
+        if self.random.len() != 32 {
+            return Err(());
+        }
+        buf.extend_from_slice(&self.random)?;
 
         // Legacy Session ID.
         buf.push_u8(0)?;
@@ -339,8 +339,7 @@ impl<'a> ClientHello<'a> {
     /// Parse a ClientHello.
     pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, Option<usize>)> {
         let version = buf.pop_u16_be()?.to_be_bytes();
-        let _random = buf.pop_slice(32)?;
-        // TODO: Should random be checked somehow?
+        let random = buf.pop_slice(32)?;
 
         //     opaque legacy_session_id<0..32>;
         //     opaque legacy_cookie<0..2^8-1>;                  // DTLS
@@ -378,6 +377,7 @@ impl<'a> ClientHello<'a> {
                 version,
                 legacy_session_id,
                 cipher_suites,
+                random,
                 extensions,
             },
             binders_start,

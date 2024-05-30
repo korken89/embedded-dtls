@@ -239,14 +239,14 @@ pub mod client {
             // Send ClientHello.
             {
                 let ser_buf = &mut EncodingBuffer::new(buf);
-                ClientRecord::encode_client_hello::<CipherSuite, _>(
+                let positions = ClientRecord::encode_client_hello::<CipherSuite, _>(
                     ser_buf,
                     config,
                     &our_public_key,
                     rng,
                     &mut key_schedule,
-                    &mut transcript_hasher,
                 )
+                .await
                 .map_err(|_| Error::InsufficientSpace)?;
 
                 l0g::info!(
@@ -327,17 +327,25 @@ pub mod client {
                 l0g::trace!("Server finished MATCHES transcript");
             }
 
-            todo!();
-
-            // l0g::error!("Client handshake traffic secrets: {handshake_traffic_secrets:02x?}");
-
             // TODO: Send finished.
+            {
+                let ser_buf = &mut EncodingBuffer::new(buf);
+
+                // Add the Finished message to this datagram.
+                ClientRecord::encode_finished(
+                    ser_buf,
+                    &mut key_schedule,
+                    &transcript_hasher.clone().finalize(),
+                )
+                .await
+                .map_err(|_| Error::InsufficientSpace)?;
+            }
+
+            todo!();
 
             // TODO: Update key schedule to Master Secret using public keys.
 
             // TODO: Wait for server ACK.
-
-            todo!();
 
             Ok(ClientConnection {
                 socket,

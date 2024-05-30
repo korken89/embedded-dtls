@@ -272,6 +272,11 @@ mod encoding_buffer {
             self.idx
         }
 
+        /// Get the current position as a pointer without popping.
+        pub fn current_pos_ptr(&self) -> usize {
+            self.buf.as_ptr() as usize + self.idx
+        }
+
         /// Extend with a slice.
         pub fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), ()> {
             self.buf
@@ -530,6 +535,11 @@ mod encoding_buffer {
         pub fn at(&self) -> Range<usize> {
             let start = self.index;
             start..start + self.len
+        }
+
+        /// Get the start position as a pointer.
+        pub fn start_pos_ptr(&self, buf: &mut EncodingBuffer) -> Option<usize> {
+            Some(buf.buf.get_mut(self.index)? as *mut u8 as usize)
         }
     }
 
