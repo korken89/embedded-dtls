@@ -140,6 +140,8 @@ pub enum Error<D: Datagram> {
     Parse,
     /// The client hello was invalid.
     InvalidClientHello,
+    /// The client finished was invalid.
+    InvalidClientFinished,
     /// The server hello was invalid.
     InvalidServerHello,
     /// The server finished was invalid.
@@ -250,30 +252,25 @@ pub mod client {
                 .map_err(|_| Error::InsufficientSpace)?;
 
                 // Write binders.
-                if let Some((up_to_binders, binders)) =
-                    positions.into_pre_post_binders_mut(&mut ser_buf)
+                if let Some((up_to_binders, binders)) = positions.pre_post_binders_mut(&mut ser_buf)
                 {
-                    l0g::error!("up to binders: {up_to_binders:02x?}");
-                    l0g::error!("binders: ({}) {binders:02x?}", binders.len());
-
                     transcript_hasher.update(up_to_binders);
                     let binder_entry = key_schedule
                         .create_binder(&transcript_hasher.clone().finalize())
                         .expect("UNREACHABLE");
 
-                    // TODO: Write binders.
                     let mut binders_enc = EncodingBuffer::new(binders);
                     binders_enc.push_u8(binder_entry.len() as u8).unwrap();
                     binders_enc.extend_from_slice(&binder_entry).unwrap();
 
                     transcript_hasher.update(&binders_enc);
-
-                    l0g::error!("binders: {binders_enc:02x?}");
                 } else {
-                    // TODO: No PSKs.
+                    // TODO: As we only support PSK right now, we don't really exercise this path.
+                    let buf = positions.as_slice(&ser_buf).expect("UNREACHABLE");
+                    transcript_hasher.update(buf);
                 }
 
-                l0g::info!(
+                l0g::trace!(
                     "Client transcript after client hello: {:02x?}",
                     transcript_hasher.clone().finalize()
                 );
@@ -305,7 +302,7 @@ pub mod client {
                             return Err(Error::InvalidServerHello);
                         };
 
-                    l0g::info!(
+                    l0g::trace!(
                         "Client transcript after server hello: {:02x?}",
                         transcript_hasher.clone().finalize()
                     );
@@ -363,6 +360,8 @@ pub mod client {
                 )
                 .await
                 .map_err(|_| Error::InsufficientSpace)?;
+
+                socket.send(&ser_buf).await.map_err(|e| Error::Send(e))?;
             }
 
             todo!();
@@ -467,88 +466,114 @@ pub mod server {
             // At this point we know the selected cipher suite, and hence also the hash function.
             // Now we can generate transcript hashes for binders and the message in total.
             let mut transcript_hasher = key_schedule.new_transcript_hasher();
+            {
+                let binders_transcript_hash = {
+                    l0g::error!("Here 1");
+                    let (up_to_binders, binders_and_rest) = positions
+                        .pre_post_binders(buffer_that_was_parsed)
+                        .ok_or(Error::InvalidClientHello)?;
+                    l0g::error!("Here 2");
 
-            let binders_transcript_hash = {
-                l0g::error!("Here 1");
-                let (up_to_binders, binders_and_rest) = positions
-                    .into_pre_post_binders(buffer_that_was_parsed)
-                    .ok_or(Error::InvalidClientHello)?;
-                l0g::error!("Here 2");
+                    transcript_hasher.update(up_to_binders);
+                    let binders_transcript_hash = transcript_hasher.clone().finalize();
+                    transcript_hasher.update(binders_and_rest);
+                    binders_transcript_hash
+                };
 
-                transcript_hasher.update(up_to_binders);
-                let binders_transcript_hash = transcript_hasher.clone().finalize();
-                transcript_hasher.update(binders_and_rest);
-                binders_transcript_hash
-            };
+                l0g::trace!(
+                    "Server transcript after client hello: {:02x?}",
+                    transcript_hasher.clone().finalize()
+                );
 
-            l0g::info!(
-                "Server transcript after client hello: {:02x?}",
-                transcript_hasher.clone().finalize()
-            );
+                let their_public_key = client_hello
+                    .validate_and_initialize_keyschedule(
+                        &mut key_schedule,
+                        server_config,
+                        &binders_transcript_hash,
+                    )
+                    .map_err(|_| Error::InvalidClientHello)?;
 
-            let their_public_key = client_hello
-                .validate_and_initialize_keyschedule(
+                l0g::debug!("Got valid ClientHello!");
+
+                // Perform ECDHE -> Handshake Secret with Key Schedule
+                // TODO: For now we assume X25519.
+                let secret = EphemeralSecret::random();
+                let our_public_key = PublicKey::from(&secret);
+                let shared_secret = secret.diffie_hellman(&their_public_key);
+
+                // Send server hello.
+                let legacy_session_id: Vec<_> = client_hello.legacy_session_id.into();
+
+                // TODO: Can we move this up somehow?
+                if !resp.is_empty() {
+                    l0g::error!("More data after client hello");
+                    return Err(Error::InvalidClientHello);
+                }
+
+                // TODO: We hardcode the selected PSK as the first one for now.
+                let mut enc_buf = EncodingBuffer::new(buf);
+                ServerRecord::encode_server_hello(
+                    &legacy_session_id,
+                    DtlsVersions::V1_3,
+                    our_public_key,
+                    selected_cipher_suite as u16,
+                    0,
                     &mut key_schedule,
-                    server_config,
-                    &binders_transcript_hash,
+                    &mut enc_buf,
                 )
-                .map_err(|_| Error::InvalidClientHello)?;
-
-            l0g::debug!("Got valid ClientHello!");
-
-            // Perform ECDHE -> Handshake Secret with Key Schedule
-            // TODO: For now we assume X25519.
-            let secret = EphemeralSecret::random();
-            let our_public_key = PublicKey::from(&secret);
-            let shared_secret = secret.diffie_hellman(&their_public_key);
-
-            // Send server hello.
-            let legacy_session_id: Vec<_> = client_hello.legacy_session_id.into();
-
-            // TODO: Can we move this up somehow?
-            if !resp.is_empty() {
-                l0g::error!("More data after client hello");
-                return Err(Error::InvalidClientHello);
-            }
-
-            // TODO: We hardcode the selected PSK as the first one for now.
-            let mut enc_buf = EncodingBuffer::new(buf);
-            ServerRecord::encode_server_hello(
-                &legacy_session_id,
-                DtlsVersions::V1_3,
-                our_public_key,
-                selected_cipher_suite as u16,
-                0,
-                &mut key_schedule,
-                &mut enc_buf,
-            )
-            .await
-            .map_err(|_| Error::InsufficientSpace)?;
-
-            // TODO: Check that this is correct, I think this hashes the plaintext header.
-
-            // TODO: Replace constant
-            transcript_hasher.update(&enc_buf[13..]);
-
-            l0g::info!(
-                "Server transcript after server hello: {:02x?}",
-                transcript_hasher.clone().finalize()
-            );
-
-            key_schedule.initialize_handshake_secret(
-                shared_secret.as_bytes(),
-                &transcript_hasher.clone().finalize(),
-            );
-
-            // Add the Finished message to this datagram.
-            ServerRecord::finished(&transcript_hasher.clone().finalize())
-                .encode(&mut enc_buf, &mut key_schedule)
                 .await
                 .map_err(|_| Error::InsufficientSpace)?;
 
-            socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
+                // TODO: Check that this is correct, I think this hashes the plaintext header.
 
-            // TODO: Finished from client
+                // TODO: Replace constant
+                transcript_hasher.update(&enc_buf[13..]);
+
+                l0g::trace!(
+                    "Server transcript after server hello: {:02x?}",
+                    transcript_hasher.clone().finalize()
+                );
+
+                key_schedule.initialize_handshake_secret(
+                    shared_secret.as_bytes(),
+                    &transcript_hasher.clone().finalize(),
+                );
+
+                // Add the Finished message to this datagram.
+                ServerRecord::finished(&transcript_hasher.clone().finalize())
+                    .encode(&mut enc_buf, &mut key_schedule)
+                    .await
+                    .map_err(|_| Error::InsufficientSpace)?;
+
+                socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
+            }
+
+            // Finished from client
+            {
+                let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+
+                // Check if we got more datagrams, we're expecting a finished.
+                let finished = {
+                    if let (
+                        (ClientRecord::Handshake(ClientHandshake::ClientFinished(fin), _), _),
+                        _,
+                    ) = ClientRecord::parse(&mut resp, Some(&mut key_schedule))
+                        .await
+                        .ok_or(Error::InvalidClientFinished)?
+                    {
+                        fin
+                    } else {
+                        return Err(Error::InvalidClientFinished);
+                    }
+                };
+
+                if transcript_hasher.clone().finalize() != finished.verify {
+                    l0g::error!("Client finished does not match transcript");
+                    return Err(Error::InvalidServerFinished);
+                }
+
+                l0g::trace!("Client finished MATCHES transcript");
+            }
 
             // TODO: Update key schedule to Master Secret.
 
@@ -727,8 +752,15 @@ mod test {
         type ReceiveError = ();
 
         async fn send(&self, buf: &[u8]) -> Result<(), Self::SendError> {
-            l0g::trace!("{} send ({}): {:02x?}", self.who, buf.len(), buf);
-            self.tx.send(buf.into()).await.map_err(|_| ())
+            let r = self.tx.send(buf.into()).await;
+            l0g::trace!(
+                "{} send ({}) (r = {r:?}): {:02x?}",
+                self.who,
+                buf.len(),
+                buf
+            );
+
+            r.map_err(|_| ())
         }
 
         async fn recv<'a>(&self, buf: &'a mut [u8]) -> Result<&'a mut [u8], Self::ReceiveError> {

@@ -107,7 +107,13 @@ impl<'a> ClientHandshake<'a> {
 
                 Some((Self::ClientHello(client_hello), binders_pos))
             }
-            HandshakeType::Finished => todo!(),
+            HandshakeType::Finished => {
+                let client_finished = Finished::parse(&mut ParseBuffer::new(handshake_payload));
+
+                l0g::trace!("Got client finished: {:02x?}", client_finished);
+
+                Some((Self::ClientFinished(client_finished), None))
+            }
             HandshakeType::KeyUpdate => todo!(),
             _ => None,
         }

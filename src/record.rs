@@ -104,7 +104,7 @@ pub struct RecordPayloadPositions {
 }
 
 impl RecordPayloadPositions {
-    fn indexes(self, buf: &[u8]) -> Option<(usize, usize, usize)> {
+    fn indexes(&self, buf: &[u8]) -> Option<(usize, usize, usize)> {
         // Calculate indices
         let start = self.start.checked_sub(buf.as_ptr() as usize)?;
         let middle = self.binders?.checked_sub(buf.as_ptr() as usize)?;
@@ -118,20 +118,27 @@ impl RecordPayloadPositions {
         Some((start, middle, end))
     }
 
-    pub fn into_pre_post_binders(self, buf: &[u8]) -> Option<(&[u8], &[u8])> {
+    pub fn pre_post_binders<'a>(&self, buf: &'a [u8]) -> Option<(&'a [u8], &'a [u8])> {
         let (start, middle, end) = self.indexes(buf)?;
 
         // Create the sub-slices around the middle element
         Some((buf.get(start..middle)?, buf.get(middle..end)?))
     }
 
-    pub fn into_pre_post_binders_mut(self, buf: &mut [u8]) -> Option<(&[u8], &mut [u8])> {
+    pub fn pre_post_binders_mut<'a>(&self, buf: &'a mut [u8]) -> Option<(&'a [u8], &'a mut [u8])> {
         let (start, middle, end) = self.indexes(buf)?;
 
         // Create the sub-slices around the middle element
         let buf = buf.get_mut(start..end)?;
         let (pre, post) = buf.split_at_mut(middle - start);
         Some((pre, post))
+    }
+
+    pub fn as_slice<'a>(&self, buf: &'a [u8]) -> Option<&'a [u8]> {
+        let start = self.start.checked_sub(buf.as_ptr() as usize)?;
+        let end = self.end.checked_sub(buf.as_ptr() as usize)?;
+
+        buf.get(start..end)
     }
 }
 
@@ -281,7 +288,7 @@ impl<'a> ClientRecord<'a> {
         .await;
 
         if let Some(out) = &r {
-            l0g::error!("Parsed {out:?}");
+            l0g::trace!("Parsed {out:?}");
         }
 
         r
@@ -575,7 +582,7 @@ impl<'a> ServerRecord<'a> {
         .await;
 
         if let Some(out) = &r {
-            l0g::error!("Parsed {out:?}");
+            l0g::trace!("Parsed {out:?}");
         }
 
         r.map(|s| s.0)
@@ -962,7 +969,7 @@ pub async fn encode_record<'buf, Ret>(
     let epoch = cipher.epoch_number();
     let record_number = cipher.write_record_number();
 
-    l0g::error!("encoding record with record_number {record_number}");
+    l0g::debug!("encoding record with record_number {record_number}");
 
     let r = if is_encrypted {
         encode_ciphertext(
@@ -1008,7 +1015,7 @@ where
             let pb = &mut ParseBuffer::new(buf);
             let header = DTlsCiphertextHeader::parse(pb)?;
             let header_length = buf.len() - pb.len();
-            l0g::error!(
+            l0g::trace!(
                 "ciphertext header len = {header_length}, payload length = {:?}",
                 header.length
             );
@@ -1042,7 +1049,6 @@ where
         //     parse_content,
         // )
         // .await?;
-        l0g::error!("before decryption");
 
         let payload_without_tag = cipher
             .decrypt_record(
@@ -1058,7 +1064,7 @@ where
         let inner_plaintext =
             DtlsInnerPlaintext::parse(&mut ParseBuffer::new(payload_without_tag))?;
 
-        l0g::error!("parsed plaintext: {inner_plaintext:02x?}");
+        l0g::trace!("Parsed plaintext: {inner_plaintext:02x?}");
 
         let ret = parse_content(
             inner_plaintext.type_,
@@ -1073,7 +1079,7 @@ where
             let pb = &mut ParseBuffer::new(buf);
             let header = DTlsPlaintextHeader::parse(pb)?;
             let header_length = buf.len() - pb.len();
-            l0g::error!(
+            l0g::trace!(
                 "plaintext header len = {header_length}, payload length = {}",
                 header.length
             );
@@ -1156,7 +1162,7 @@ async fn encode_ciphertext<'buf, Ret>(
     }
     .encode(buf)?;
 
-    l0g::debug!("encoded header = {:02x?}", buf);
+    l0g::trace!("encoded header = {:02x?}", buf);
 
     // ------ Start record
 
@@ -1202,7 +1208,7 @@ async fn encode_ciphertext<'buf, Ret>(
     }
 
     // ------ Finish record
-    l0g::debug!("encoded record = {:02x?}", buf);
+    l0g::trace!("encoded record = {:02x?}", buf);
 
     Ok(r)
 }

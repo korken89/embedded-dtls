@@ -294,7 +294,7 @@ where
             ),
         }
 
-        l0g::info!(
+        l0g::trace!(
             "Crate handshake secrets ecdhe {ecdhe_secret:02x?}, transcript {transcript:02x?}"
         );
 
@@ -598,11 +598,11 @@ where
             .await
             .is_err()
         {
-            l0g::debug!("Applying mask failed");
+            l0g::trace!("Applying mask failed");
         }
 
         let sequence_number = unified_hdr.sequence_number();
-        l0g::debug!("Got sequence number: {sequence_number:?}");
+        l0g::trace!("Got sequence number: {sequence_number:?}");
         let estimated_read_record_number =
             find_closest_record_number(self.read_record_number, sequence_number);
         l0g::debug!(
@@ -618,7 +618,7 @@ where
             )
             .await?;
 
-        l0g::debug!("Decryption successful");
+        l0g::trace!("Decryption successful");
 
         // Decryption successful, store the read_record_number if it is larger.
         self.read_record_number = self.read_record_number.max(estimated_read_record_number);
@@ -634,13 +634,13 @@ where
     fn write_record_number(&self) -> u64 {
         let r = self.write_record_number;
 
-        l0g::error!("using write record number: {}", r);
+        l0g::trace!("using write record number: {}", r);
         r
     }
 
     fn increment_write_record_number(&mut self) {
         self.write_record_number += 1;
-        l0g::error!(
+        l0g::debug!(
             "incremented write record number to: {} ({})",
             self.write_record_number,
             if self.is_server { "server" } else { "client" }
