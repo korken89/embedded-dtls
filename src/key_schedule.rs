@@ -421,13 +421,13 @@ where
             KeyScheduleState::EarlySecret(_) => unreachable!(),
             KeyScheduleState::HandshakeSecret(s) => {
                 if self.is_server {
-                    l0g::debug!(
+                    l0g::trace!(
                         "Creating server handshake encryption nonce {}",
                         self.write_record_number
                     );
                     &s.traffic_secrets.server
                 } else {
-                    l0g::debug!(
+                    l0g::trace!(
                         "Creating client handshake encryption nonce {}",
                         self.write_record_number
                     );
@@ -436,13 +436,13 @@ where
             }
             KeyScheduleState::MasterSecret(s) => {
                 if self.is_server {
-                    l0g::debug!(
+                    l0g::trace!(
                         "Creating server master encryption nonce {}",
                         self.write_record_number
                     );
                     &s.traffic_secrets.server
                 } else {
-                    l0g::debug!(
+                    l0g::trace!(
                         "Creating client master encryption nonce {}",
                         self.write_record_number
                     );
@@ -462,19 +462,19 @@ where
             KeyScheduleState::EarlySecret(_) => unreachable!(),
             KeyScheduleState::HandshakeSecret(s) => {
                 if self.is_server {
-                    l0g::debug!("Creating server handshake decryption nonce {record_number}");
+                    l0g::trace!("Creating server handshake decryption nonce {record_number}");
                     &s.traffic_secrets.client
                 } else {
-                    l0g::debug!("Creating client handshake decryption nonce {record_number}");
+                    l0g::trace!("Creating client handshake decryption nonce {record_number}");
                     &s.traffic_secrets.server
                 }
             }
             KeyScheduleState::MasterSecret(s) => {
                 if self.is_server {
-                    l0g::debug!("Creating client master decryption nonce {record_number}");
+                    l0g::trace!("Creating client master decryption nonce {record_number}");
                     &s.traffic_secrets.client
                 } else {
-                    l0g::debug!("Creating server master decryption nonce {record_number}");
+                    l0g::trace!("Creating server master decryption nonce {record_number}");
                     &s.traffic_secrets.server
                 }
             }
@@ -573,7 +573,7 @@ where
         } = args;
 
         if payload_with_tag.len() < 16.max(self.tag_size()) {
-            l0g::debug!("Invalid record");
+            l0g::debug!("Invalid record, too short");
             // Invalid record, 16 bytes minimum for record number max and tag size to make sure
             // there is a tag.
             return Err(aead::Error);
@@ -582,7 +582,6 @@ where
         // Check the epoch, early return if wrong.
         if ciphertext_header.epoch & 0b11 != self.epoch_number as u8 & 0b11 {
             l0g::debug!("Wrong epoch");
-            // TODO: Log?
             return Err(aead::Error);
         }
 
@@ -598,14 +597,14 @@ where
             .await
             .is_err()
         {
-            l0g::trace!("Applying mask failed");
+            l0g::debug!("Applying sequence number mask failed");
         }
 
         let sequence_number = unified_hdr.sequence_number();
         l0g::trace!("Got sequence number: {sequence_number:?}");
         let estimated_read_record_number =
             find_closest_record_number(self.read_record_number, sequence_number);
-        l0g::debug!(
+        l0g::trace!(
             "Estimated read record number: {estimated_read_record_number:?} ({})",
             if self.is_server { "server" } else { "client" }
         );
@@ -640,7 +639,7 @@ where
 
     fn increment_write_record_number(&mut self) {
         self.write_record_number += 1;
-        l0g::debug!(
+        l0g::trace!(
             "incremented write record number to: {} ({})",
             self.write_record_number,
             if self.is_server { "server" } else { "client" }

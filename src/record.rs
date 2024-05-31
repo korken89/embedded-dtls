@@ -113,8 +113,6 @@ impl RecordPayloadPositions {
         debug_assert!(start < middle);
         debug_assert!(middle < end);
 
-        l0g::error!("indexes: {:?}", (start, middle, end));
-
         Some((start, middle, end))
     }
 
@@ -969,8 +967,6 @@ pub async fn encode_record<'buf, Ret>(
     let epoch = cipher.epoch_number();
     let record_number = cipher.write_record_number();
 
-    l0g::debug!("encoding record with record_number {record_number}");
-
     let r = if is_encrypted {
         encode_ciphertext(
             buf,
@@ -1187,7 +1183,7 @@ async fn encode_ciphertext<'buf, Ret>(
     // Write the ciphertext length to the header.
     let ciphertext_length = buf.len() - content_start;
     if let Some(length_allocation) = length_allocation {
-        l0g::debug!("ciphertext length: {ciphertext_length}, {ciphertext_length:02x}, {length_allocation:?}");
+        l0g::trace!("ciphertext length: {ciphertext_length}, {ciphertext_length:02x}, {length_allocation:?}");
         length_allocation.set(buf, ciphertext_length as u16);
     }
 

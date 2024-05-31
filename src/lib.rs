@@ -345,7 +345,7 @@ pub mod client {
                     return Err(Error::InvalidServerFinished);
                 }
 
-                l0g::trace!("Server finished MATCHES transcript");
+                l0g::debug!("Server finished MATCHES transcript");
             }
 
             // TODO: Send finished.
@@ -468,11 +468,9 @@ pub mod server {
             let mut transcript_hasher = key_schedule.new_transcript_hasher();
             {
                 let binders_transcript_hash = {
-                    l0g::error!("Here 1");
                     let (up_to_binders, binders_and_rest) = positions
                         .pre_post_binders(buffer_that_was_parsed)
                         .ok_or(Error::InvalidClientHello)?;
-                    l0g::error!("Here 2");
 
                     transcript_hasher.update(up_to_binders);
                     let binders_transcript_hash = transcript_hasher.clone().finalize();
@@ -492,8 +490,6 @@ pub mod server {
                         &binders_transcript_hash,
                     )
                     .map_err(|_| Error::InvalidClientHello)?;
-
-                l0g::debug!("Got valid ClientHello!");
 
                 // Perform ECDHE -> Handshake Secret with Key Schedule
                 // TODO: For now we assume X25519.
@@ -572,7 +568,7 @@ pub mod server {
                     return Err(Error::InvalidServerFinished);
                 }
 
-                l0g::trace!("Client finished MATCHES transcript");
+                l0g::debug!("Client finished MATCHES transcript");
             }
 
             // TODO: Update key schedule to Master Secret.
@@ -792,7 +788,7 @@ mod test {
 
     #[tokio::test]
     async fn open_connection() {
-        simple_logger::SimpleLogger::new().init().unwrap();
+        simple_logger::SimpleLogger::new().env().init().unwrap();
 
         let (server_socket, client_socket) = make_server_client_channel();
 

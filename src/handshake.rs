@@ -495,7 +495,7 @@ impl<'a> ClientHello<'a> {
         let their_public_key =
             PublicKey::from(TryInto::<[u8; 32]>::try_into(key_share.opaque).unwrap());
 
-        l0g::trace!("ClientHello VALID");
+        l0g::debug!("ClientHello VALID");
 
         Ok(their_public_key)
     }
@@ -647,7 +647,7 @@ impl<'a> ServerHello<'a> {
         let their_public_key =
             PublicKey::from(TryInto::<[u8; 32]>::try_into(key_share.opaque).unwrap());
 
-        l0g::trace!("ServerHello VALID");
+        l0g::debug!("ServerHello VALID");
 
         Ok(their_public_key)
     }
