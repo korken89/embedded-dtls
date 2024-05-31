@@ -19,7 +19,7 @@ use rand_core::{CryptoRng, RngCore};
 use std::ops::Range;
 use x25519_dalek::PublicKey;
 
-#[derive(Clone, Debug, PartialOrd, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Encryption {
     Enabled,
@@ -33,19 +33,19 @@ impl rand::CryptoRng for NoRandom {}
 
 impl rand::RngCore for NoRandom {
     fn next_u32(&mut self) -> u32 {
-        panic!()
+        unreachable!()
     }
 
     fn next_u64(&mut self) -> u64 {
-        panic!()
+        unreachable!()
     }
 
     fn fill_bytes(&mut self, _dest: &mut [u8]) {
-        panic!()
+        unreachable!()
     }
 
     fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), rand::Error> {
-        panic!()
+        unreachable!()
     }
 }
 
@@ -96,6 +96,7 @@ impl<'a> UnifiedHeader<'a> {
 }
 
 /// Holds positions of key positions in the payload data. Used for transcript hashing.
+#[derive(Debug)]
 pub struct RecordPayloadPositions {
     pub start: usize,
     pub binders: Option<usize>,
@@ -103,7 +104,7 @@ pub struct RecordPayloadPositions {
 }
 
 impl RecordPayloadPositions {
-    pub fn into_pre_post_binders(self, buf: &[u8]) -> Option<(&[u8], &[u8])> {
+    fn indexes(self, buf: &[u8]) -> Option<(usize, usize, usize)> {
         // Calculate indices
         let start = self.start.checked_sub(buf.as_ptr() as usize)?;
         let middle = self.binders?.checked_sub(buf.as_ptr() as usize)?;
@@ -112,18 +113,25 @@ impl RecordPayloadPositions {
         debug_assert!(start < middle);
         debug_assert!(middle < end);
 
+        l0g::error!("indexes: {:?}", (start, middle, end));
+
+        Some((start, middle, end))
+    }
+
+    pub fn into_pre_post_binders(self, buf: &[u8]) -> Option<(&[u8], &[u8])> {
+        let (start, middle, end) = self.indexes(buf)?;
+
         // Create the sub-slices around the middle element
         Some((buf.get(start..middle)?, buf.get(middle..end)?))
     }
 
-    pub fn into_slice(self, buf: &[u8]) -> Option<&[u8]> {
-        // Calculate indices
-        let start = self.start.checked_sub(buf.as_ptr() as usize)?;
-        let end = self.end.checked_sub(buf.as_ptr() as usize)?;
+    pub fn into_pre_post_binders_mut(self, buf: &mut [u8]) -> Option<(&[u8], &mut [u8])> {
+        let (start, middle, end) = self.indexes(buf)?;
 
-        debug_assert!(start < end);
-
-        buf.get(start..end)
+        // Create the sub-slices around the middle element
+        let buf = buf.get_mut(start..end)?;
+        let (pre, post) = buf.split_at_mut(middle - start);
+        Some((pre, post))
     }
 }
 
@@ -251,7 +259,65 @@ impl<'a> ClientRecord<'a> {
         })
     }
 
-    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<(Self, RecordPayloadPositions)> {
+    /// Parse a `ServerRecord`. The incoming `buf` will be reduced to not include what's been
+    /// parsed after finishing, allowing for parse to be called multiple times.
+    ///
+    /// If a transcript hasher is supplied, then the hashing will be performed over the plaintext.
+    pub async fn parse<Cipher>(
+        buf: &mut &'a mut [u8],
+        cipher: Option<&mut Cipher>,
+    ) -> Option<((ClientRecord<'a>, RecordPayloadPositions), &'a [u8])>
+    where
+        Cipher: GenericCipher,
+    {
+        let r = parse_record(buf, cipher, |content_type, encryption, buf| {
+            // // Perform transcript hashing.
+            // if let Some(hasher) = transcript_hasher {
+            //     hasher.update(buf.as_ref())
+            // }
+
+            Self::parse_content(content_type, encryption, buf)
+        })
+        .await;
+
+        if let Some(out) = &r {
+            l0g::error!("Parsed {out:?}");
+        }
+
+        r
+    }
+
+    fn parse_content(
+        content_type: ContentType,
+        encryption: Encryption,
+        buf: &mut ParseBuffer<'a>,
+    ) -> Option<(Self, RecordPayloadPositions)> {
+        let start = buf.current_pos_ptr();
+        let (ret, binders) = match content_type {
+            ContentType::Handshake => {
+                let (handshake, binders_pos) = ClientHandshake::parse(buf)?;
+
+                (ClientRecord::Handshake(handshake, encryption), binders_pos)
+            }
+            ContentType::Ack => todo!(),
+            ContentType::Heartbeat => todo!(),
+            ContentType::Alert => todo!(),
+            ContentType::ApplicationData => todo!(),
+            ContentType::ChangeCipherSpec => todo!(),
+        };
+        let end = buf.current_pos_ptr();
+
+        Some((
+            ret,
+            RecordPayloadPositions {
+                start,
+                binders,
+                end,
+            },
+        ))
+    }
+
+    pub fn parse_old(buf: &mut ParseBuffer<'a>) -> Option<(Self, RecordPayloadPositions)> {
         // Parse record.
 
         let record_header = DTlsPlaintextHeader::parse(buf)?;
@@ -332,6 +398,39 @@ pub(crate) trait GenericCipher {
 
     /// Get the current epoch number.
     fn epoch_number(&self) -> u64;
+}
+
+/// No cipher marker.
+pub struct NoCipher {}
+
+impl GenericCipher for NoCipher {
+    async fn encrypt_record(&mut self, _args: CipherArguments<'_>) -> aead::Result<()> {
+        unreachable!()
+    }
+
+    async fn decrypt_record<'a>(
+        &mut self,
+        _ciphertext_header: &DTlsCiphertextHeader<'_>,
+        _args: CipherArguments<'a>,
+    ) -> aead::Result<&'a [u8]> {
+        unreachable!()
+    }
+
+    fn tag_size(&self) -> usize {
+        unreachable!()
+    }
+
+    fn write_record_number(&self) -> u64 {
+        unreachable!()
+    }
+
+    fn increment_write_record_number(&mut self) {
+        unreachable!()
+    }
+
+    fn epoch_number(&self) -> u64 {
+        unreachable!()
+    }
 }
 
 #[derive(Debug)]
@@ -465,114 +564,32 @@ impl<'a> ServerRecord<'a> {
     where
         Hash: Digest,
     {
-        let is_ciphertext = buf.first()? >> 5 == 0b001;
+        let r = parse_record(buf, Some(cipher), |content_type, encryption, buf| {
+            // Perform transcript hashing.
+            if let Some(hasher) = transcript_hasher {
+                hasher.update(buf.as_ref())
+            }
 
-        let r = if is_ciphertext {
-            let (unified_hdr, payload, header) = {
-                // Find payload size.
-                let pb = &mut ParseBuffer::new(buf);
-                let header = DTlsCiphertextHeader::parse(pb)?;
-                let header_length = buf.len() - pb.len();
-                l0g::error!(
-                    "ciphertext header len = {header_length}, payload length = {:?}",
-                    header.length
-                );
-
-                // If the length is not specified, then the payload is the full datagram.
-                let payload_length = if let Some(payload_length) = header.length {
-                    if pb.len() < payload_length as usize {
-                        return None;
-                    }
-
-                    payload_length as usize
-                } else {
-                    pb.len()
-                };
-
-                // Split the buffer into what should be parsed.
-                let b = core::mem::replace(buf, &mut []);
-                let (to_parse, next_datagram) =
-                    b.split_at_mut(header_length + payload_length as usize);
-                let _ = core::mem::replace(buf, next_datagram);
-
-                // Split into header and payload.
-                let (unified_hdr, payload) = to_parse.split_at_mut(header_length);
-                (unified_hdr, payload, header)
-            };
-
-            let r = parse_ciphertext(
-                header,
-                UnifiedHeader::new(unified_hdr),
-                payload,
-                cipher,
-                |content_type, buf| {
-                    // Perform transcript hashing.
-                    if let Some(hasher) = transcript_hasher {
-                        hasher.update(buf.as_ref())
-                    }
-
-                    Self::parse_content(content_type, buf)
-                },
-            )
-            .await?;
-
-            Some(r)
-        } else {
-            let (to_parse, header, header_length) = {
-                // Find payload size.
-                let pb = &mut ParseBuffer::new(buf);
-                let header = DTlsPlaintextHeader::parse(pb)?;
-                let header_length = buf.len() - pb.len();
-                l0g::error!(
-                    "plaintext header len = {header_length}, payload length = {}",
-                    header.length
-                );
-
-                if pb.len() < header.length as usize {
-                    return None;
-                }
-
-                // Split the buffer into what should be parsed.
-                let b = core::mem::replace(buf, &mut []);
-                let (to_parse, next_datagram) =
-                    b.split_at_mut(header_length + header.length as usize);
-                let _ = core::mem::replace(buf, next_datagram);
-
-                (to_parse, header, header_length)
-            };
-
-            // Remove the header from future parsing.
-            let mut pb = ParseBuffer::new(to_parse);
-            pb.pop_slice(header_length);
-
-            let r = parse_plaintext(header, &mut pb, |content_type, buf| {
-                l0g::info!(
-                    "Client transcript after server hello input: {:02x?}",
-                    buf.as_ref()
-                );
-                // Perform transcript hashing.
-                if let Some(hasher) = transcript_hasher {
-                    hasher.update(buf.as_ref())
-                }
-
-                Self::parse_content(content_type, buf)
-            })?;
-
-            Some(r)
-        };
+            Self::parse_content(content_type, encryption, buf)
+        })
+        .await;
 
         if let Some(out) = &r {
             l0g::error!("Parsed {out:?}");
         }
 
-        r
+        r.map(|s| s.0)
     }
 
-    fn parse_content(content_type: ContentType, buf: &mut ParseBuffer<'a>) -> Option<Self> {
+    fn parse_content(
+        content_type: ContentType,
+        encryption: Encryption,
+        buf: &mut ParseBuffer<'a>,
+    ) -> Option<Self> {
         Some(match content_type {
             ContentType::Handshake => {
                 let handshake = ServerHandshake::parse(buf)?;
-                ServerRecord::Handshake(handshake, Encryption::Disabled)
+                ServerRecord::Handshake(handshake, encryption)
             }
             ContentType::Ack => todo!(),
             ContentType::Heartbeat => todo!(),
@@ -581,15 +598,6 @@ impl<'a> ServerRecord<'a> {
             ContentType::ChangeCipherSpec => todo!(),
         })
     }
-}
-
-fn truncate_slice(mut buf: &mut [u8], new_len: usize) {
-    let b = core::mem::replace(&mut buf, &mut []);
-    let (_used, left) = b.split_at_mut(new_len);
-    core::mem::replace(&mut buf, left);
-
-    // let (used, _) = buf.split_at_mut(new_len);
-    // *buf = used;
 }
 
 fn to_header_and_payload_with_tag(
@@ -981,6 +989,117 @@ pub async fn encode_record<'buf, Ret>(
     Ok(r)
 }
 
+/// Parses a record and returns the parsed content and the payload buffer that was used for parsing.
+pub async fn parse_record<'a, Content>(
+    buf: &mut &'a mut [u8],
+    cipher: Option<&mut impl GenericCipher>,
+    parse_content: impl FnOnce(ContentType, Encryption, &mut ParseBuffer<'a>) -> Option<Content>,
+) -> Option<(Content, &'a [u8])>
+where
+    Content: 'a,
+{
+    let is_ciphertext = buf.first()? >> 5 == 0b001;
+
+    if is_ciphertext {
+        let cipher = cipher?;
+
+        let (unified_hdr, payload_with_tag, header) = {
+            // Find payload size.
+            let pb = &mut ParseBuffer::new(buf);
+            let header = DTlsCiphertextHeader::parse(pb)?;
+            let header_length = buf.len() - pb.len();
+            l0g::error!(
+                "ciphertext header len = {header_length}, payload length = {:?}",
+                header.length
+            );
+
+            // If the length is not specified, then the payload is the full datagram.
+            let payload_length = if let Some(payload_length) = header.length {
+                if pb.len() < payload_length as usize {
+                    return None;
+                }
+
+                payload_length as usize
+            } else {
+                pb.len()
+            };
+
+            // Split the buffer into what should be parsed.
+            let b = core::mem::replace(buf, &mut []);
+            let (to_parse, next_datagram) = b.split_at_mut(header_length + payload_length as usize);
+            let _ = core::mem::replace(buf, next_datagram);
+
+            // Split into header and payload.
+            let (unified_hdr, payload) = to_parse.split_at_mut(header_length);
+            (unified_hdr, payload, header)
+        };
+
+        // let r = parse_ciphertext(
+        //     header,
+        //     UnifiedHeader::new(unified_hdr),
+        //     payload,
+        //     cipher,
+        //     parse_content,
+        // )
+        // .await?;
+        l0g::error!("before decryption");
+
+        let payload_without_tag = cipher
+            .decrypt_record(
+                &header,
+                CipherArguments {
+                    unified_hdr: UnifiedHeader::new(unified_hdr),
+                    payload_with_tag,
+                },
+            )
+            .await
+            .ok()?;
+
+        let inner_plaintext =
+            DtlsInnerPlaintext::parse(&mut ParseBuffer::new(payload_without_tag))?;
+
+        l0g::error!("parsed plaintext: {inner_plaintext:02x?}");
+
+        let ret = parse_content(
+            inner_plaintext.type_,
+            Encryption::Enabled,
+            &mut ParseBuffer::new(inner_plaintext.content),
+        )?;
+
+        Some((ret, payload_without_tag))
+    } else {
+        let (to_parse, header, header_length) = {
+            // Find payload size.
+            let pb = &mut ParseBuffer::new(buf);
+            let header = DTlsPlaintextHeader::parse(pb)?;
+            let header_length = buf.len() - pb.len();
+            l0g::error!(
+                "plaintext header len = {header_length}, payload length = {}",
+                header.length
+            );
+
+            if pb.len() < header.length as usize {
+                return None;
+            }
+
+            // Split the buffer into what should be parsed.
+            let b = core::mem::replace(buf, &mut []);
+            let (to_parse, next_datagram) = b.split_at_mut(header_length + header.length as usize);
+            let _ = core::mem::replace(buf, next_datagram);
+
+            (to_parse, header, header_length)
+        };
+
+        // Remove the header from future parsing.
+        let mut pb = ParseBuffer::new(to_parse);
+        pb.pop_slice(header_length);
+
+        let r = parse_plaintext(header, &mut pb, parse_content)?;
+
+        Some((r, to_parse))
+    }
+}
+
 /// Encode a plaintext.
 fn encode_plaintext<'buf, Ret>(
     buf: &'buf mut EncodingBuffer,
@@ -1091,11 +1210,11 @@ async fn encode_ciphertext<'buf, Ret>(
 fn parse_plaintext<'a, Content>(
     header: DTlsPlaintextHeader,
     buf: &mut ParseBuffer<'a>,
-    parse_content: impl FnOnce(ContentType, &mut ParseBuffer<'a>) -> Option<Content>,
+    parse_content: impl FnOnce(ContentType, Encryption, &mut ParseBuffer<'a>) -> Option<Content>,
 ) -> Option<Content> {
     let record_payload = buf.pop_slice(header.length.into())?;
     let mut buf = ParseBuffer::new(record_payload);
-    let ret = parse_content(header.type_, &mut buf)?;
+    let ret = parse_content(header.type_, Encryption::Disabled, &mut buf)?;
 
     Some(ret)
 }
@@ -1105,7 +1224,7 @@ async fn parse_ciphertext<'a, Content>(
     unified_hdr: UnifiedHeader<'a>,
     payload_with_tag: &'a mut [u8],
     cipher: &mut impl GenericCipher,
-    parse_content: impl FnOnce(ContentType, &mut ParseBuffer<'a>) -> Option<Content>, // TODO: Maybe have it return the parse buffer instead.
+    parse_content: impl FnOnce(ContentType, Encryption, &mut ParseBuffer<'a>) -> Option<Content>, // TODO: Maybe have it return the parse buffer instead.
 ) -> Option<Content> {
     // TODO: Parse encrypted record
 
@@ -1128,6 +1247,7 @@ async fn parse_ciphertext<'a, Content>(
 
     parse_content(
         inner_plaintext.type_,
+        Encryption::Enabled,
         &mut ParseBuffer::new(inner_plaintext.content),
     )
 }

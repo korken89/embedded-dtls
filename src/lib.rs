@@ -238,9 +238,9 @@ pub mod client {
 
             // Send ClientHello.
             {
-                let ser_buf = &mut EncodingBuffer::new(buf);
+                let mut ser_buf = EncodingBuffer::new(buf);
                 let positions = ClientRecord::encode_client_hello::<CipherSuite, _>(
-                    ser_buf,
+                    &mut ser_buf,
                     config,
                     &our_public_key,
                     rng,
@@ -248,6 +248,30 @@ pub mod client {
                 )
                 .await
                 .map_err(|_| Error::InsufficientSpace)?;
+
+                // Write binders.
+                if let Some((up_to_binders, binders)) =
+                    positions.into_pre_post_binders_mut(&mut ser_buf)
+                {
+                    l0g::error!("up to binders: {up_to_binders:02x?}");
+                    l0g::error!("binders: ({}) {binders:02x?}", binders.len());
+
+                    transcript_hasher.update(up_to_binders);
+                    let binder_entry = key_schedule
+                        .create_binder(&transcript_hasher.clone().finalize())
+                        .expect("UNREACHABLE");
+
+                    // TODO: Write binders.
+                    let mut binders_enc = EncodingBuffer::new(binders);
+                    binders_enc.push_u8(binder_entry.len() as u8).unwrap();
+                    binders_enc.extend_from_slice(&binder_entry).unwrap();
+
+                    transcript_hasher.update(&binders_enc);
+
+                    l0g::error!("binders: {binders_enc:02x?}");
+                } else {
+                    // TODO: No PSKs.
+                }
 
                 l0g::info!(
                     "Client transcript after client hello: {:02x?}",
@@ -366,7 +390,8 @@ pub mod server {
         },
         key_schedule::KeySchedule,
         record::{
-            CipherArguments, ClientRecord, DTlsCiphertextHeader, GenericCipher, ServerRecord,
+            CipherArguments, ClientRecord, DTlsCiphertextHeader, GenericCipher, NoCipher,
+            ServerRecord,
         },
         server_config::{Identity, Key, ServerConfig},
         Datagram, Error,
@@ -399,21 +424,20 @@ pub mod server {
             // TODO: If any part fails with error, make sure to send the correct ALERT.
             let buf = &mut vec![0; 16 * 1024];
 
-            let resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+            let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
             l0g::trace!("Got datagram!");
 
-            let (client_hello, positions) = {
-                let mut buf = ParseBuffer::new(resp);
+            let (client_hello, positions, buffer_that_was_parsed) = {
+                let record = ClientRecord::parse::<NoCipher>(&mut resp, None)
+                    .await
+                    .ok_or(Error::InvalidClientHello)?;
 
-                let (record, pos) =
-                    ClientRecord::parse(&mut buf).ok_or(Error::InvalidClientHello)?;
-
-                if !buf.pop_rest().is_empty() {
-                    return Err(Error::InvalidClientHello);
-                }
-
-                if let ClientRecord::Handshake(ClientHandshake::ClientHello(hello), _) = record {
-                    (hello, pos)
+                if let (
+                    (ClientRecord::Handshake(ClientHandshake::ClientHello(hello), _), pos),
+                    buf,
+                ) = record
+                {
+                    (hello, pos, buf)
                 } else {
                     return Err(Error::InvalidClientHello);
                 }
@@ -443,13 +467,19 @@ pub mod server {
             // At this point we know the selected cipher suite, and hence also the hash function.
             // Now we can generate transcript hashes for binders and the message in total.
             let mut transcript_hasher = key_schedule.new_transcript_hasher();
-            let (up_to_binders, binders_and_rest) = positions
-                .into_pre_post_binders(resp)
-                .ok_or(Error::InvalidClientHello)?;
 
-            transcript_hasher.update(up_to_binders);
-            let binders_transcript_hash = transcript_hasher.clone().finalize();
-            transcript_hasher.update(binders_and_rest);
+            let binders_transcript_hash = {
+                l0g::error!("Here 1");
+                let (up_to_binders, binders_and_rest) = positions
+                    .into_pre_post_binders(buffer_that_was_parsed)
+                    .ok_or(Error::InvalidClientHello)?;
+                l0g::error!("Here 2");
+
+                transcript_hasher.update(up_to_binders);
+                let binders_transcript_hash = transcript_hasher.clone().finalize();
+                transcript_hasher.update(binders_and_rest);
+                binders_transcript_hash
+            };
 
             l0g::info!(
                 "Server transcript after client hello: {:02x?}",
@@ -474,6 +504,12 @@ pub mod server {
 
             // Send server hello.
             let legacy_session_id: Vec<_> = client_hello.legacy_session_id.into();
+
+            // TODO: Can we move this up somehow?
+            if !resp.is_empty() {
+                l0g::error!("More data after client hello");
+                return Err(Error::InvalidClientHello);
+            }
 
             // TODO: We hardcode the selected PSK as the first one for now.
             let mut enc_buf = EncodingBuffer::new(buf);
