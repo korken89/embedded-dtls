@@ -298,7 +298,8 @@ where
         secret
     }
 
-    /// Calculate a binder. The hash must be the same size as the output for the hash function.
+    /// Calculate a binder.
+    /// The hash must be the same size as the output for the hash function.
     pub fn create_binder(
         &self,
         transcript_hash: &[u8],
@@ -316,27 +317,60 @@ where
             }
         };
 
-        let binder_hkdf =
-            SimpleHkdf::<<CipherSuite as DtlsCipherSuite>::Hash>::from_prk(&secret.binder_key)
-                .unwrap();
-        let mut binder_key = HashArray::<<CipherSuite as DtlsCipherSuite>::Hash>::default();
+        Some(Self::finished_hmac(&secret.binder_key, transcript_hash))
+    }
+
+    /// Calculate verify data for Finished.
+    /// The hash must be the same size as the output for the hash function.
+    pub fn create_verify_data(
+        &self,
+        transcript_hash: &[u8],
+        use_server_key: bool,
+    ) -> Option<HashArray<<CipherSuite as DtlsCipherSuite>::Hash>> {
+        if transcript_hash.len()
+            != <<CipherSuite as DtlsCipherSuite>::Hash as Digest>::output_size()
+        {
+            return None;
+        }
+
+        let key = match &self.keyschedule_state {
+            KeyScheduleState::HandshakeSecret(secret) => {
+                if use_server_key {
+                    &secret.traffic_secrets.server.write_key
+                } else {
+                    &secret.traffic_secrets.client.write_key
+                }
+            }
+            _ => {
+                unreachable!("Internal error! `create_binder` was called when not in early secret")
+            }
+        };
+
+        Some(Self::finished_hmac(key, transcript_hash))
+    }
+
+    fn finished_hmac(
+        base_key: &[u8],
+        transcript_hash: &[u8],
+    ) -> HashArray<<CipherSuite as DtlsCipherSuite>::Hash> {
+        let hkdf =
+            SimpleHkdf::<<CipherSuite as DtlsCipherSuite>::Hash>::from_prk(base_key).unwrap();
+        let mut key = HashArray::<<CipherSuite as DtlsCipherSuite>::Hash>::default();
         hkdf_make_expanded_label::<<CipherSuite as DtlsCipherSuite>::Hash>(
-            &binder_hkdf,
+            &hkdf,
             HkdfLabelContext {
                 label: b"finished",
                 context: &[],
             },
-            &mut binder_key,
+            &mut key,
         );
 
         let mut hmac =
-            <SimpleHmac<<CipherSuite as DtlsCipherSuite>::Hash> as KeyInit>::new_from_slice(
-                &binder_key,
-            )
-            .unwrap();
-        Mac::update(&mut hmac, &transcript_hash);
+            <SimpleHmac<<CipherSuite as DtlsCipherSuite>::Hash> as KeyInit>::new_from_slice(&key)
+                .unwrap();
+        Mac::update(&mut hmac, transcript_hash);
 
-        Some(hmac.finalize().into_bytes())
+        hmac.finalize().into_bytes()
     }
 
     /// Move to the next step in the secrets.
@@ -458,17 +492,51 @@ where
             Some(&self.derived()),
             &HashArray::<<CipherSuite as DtlsCipherSuite>::Hash>::default(), // The input key material is the "0" string
         );
-        let traffic_secrets = todo!();
 
-        self.keyschedule_state = KeyScheduleState::MasterSecret(Secret {
-            hkdf,
-            traffic_secrets,
-        });
+        todo!()
+        // let traffic_secrets = Self::create_master_traffic_secrets(&hkdf, transcript);
+
+        // self.keyschedule_state = KeyScheduleState::MasterSecret(Secret {
+        // hkdf,
+        // traffic_secrets,
+        // });
 
         // TODO: Create application traffic secrets
 
         // TODO: Create sn_key for record number encryption (section 4.2.3, RFC9147)
     }
+
+    // /// Get the handshake traffic secrets.
+    // /// The transcript hash is over the ClientHello and ServerHello.
+    // fn create_master_traffic_secrets(
+    //     hkdf: &SimpleHkdf<<CipherSuite as DtlsCipherSuite>::Hash>,
+    // ) -> TrafficSecrets<<CipherSuite as DtlsCipherSuite>::Cipher> {
+    //     // This follows Section 7.3. Traffic Key Calculation in RFC8446.
+    //     let mut client = HashArray::<<CipherSuite as DtlsCipherSuite>::Hash>::default();
+    //     hkdf_make_expanded_label::<<CipherSuite as DtlsCipherSuite>::Hash>(
+    //         hkdf,
+    //         HkdfLabelContext {
+    //             label: b"c ap traffic",
+    //             context: transcript_hash,
+    //         },
+    //         &mut client,
+    //     );
+
+    //     let mut server = HashArray::<<CipherSuite as DtlsCipherSuite>::Hash>::default();
+    //     hkdf_make_expanded_label::<<CipherSuite as DtlsCipherSuite>::Hash>(
+    //         hkdf,
+    //         HkdfLabelContext {
+    //             label: b"s ap traffic",
+    //             context: transcript_hash,
+    //         },
+    //         &mut server,
+    //     );
+
+    //     TrafficSecrets {
+    //         client: Self::create_traffic_keying_material(&client),
+    //         server: Self::create_traffic_keying_material(&server),
+    //     }
+    // }
 
     fn create_traffic_keying_material<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>>(
         secret: &HashArray<<CipherSuite as DtlsCipherSuite>::Hash>,

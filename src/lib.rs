@@ -183,7 +183,7 @@ pub trait Datagram {
 // Lives in no_std land.
 pub mod client {
     use crate::{
-        buffer::{EncodingBuffer, ParseBuffer, ParseBufferMut},
+        buffer::EncodingBuffer,
         cipher_suites::DtlsCipherSuite,
         client_config::ClientConfig,
         handshake::ServerHandshake,
@@ -219,7 +219,6 @@ pub mod client {
             buf: &mut [u8],
             socket: Socket,
             cipher: <CipherSuite as DtlsCipherSuite>::Cipher, // TODO: Should this be &mut ?
-            // transcript_hasher: <CipherSuite as DtlsCipherSuite>::Hash,     // TODO: Should this be &mut ?
             config: &ClientConfig<'_>,
         ) -> Result<Self, Error<Socket>>
         where
@@ -321,6 +320,9 @@ pub mod client {
                 );
 
                 // Check if we got more datagrams, we're expecting a finished.
+                let expected_verify = key_schedule
+                    .create_verify_data(&transcript_hasher.clone().finalize(), true)
+                    .expect("UNREACHABLE");
                 let finished = {
                     let mut buf = if resp.is_empty() {
                         // Wait for finished.
@@ -330,9 +332,13 @@ pub mod client {
                     };
 
                     if let ServerRecord::Handshake(ServerHandshake::ServerFinished(fin), _) =
-                        ServerRecord::parse::<CipherSuite::Hash>(&mut buf, None, &mut key_schedule)
-                            .await
-                            .ok_or(Error::InvalidServerFinished)?
+                        ServerRecord::parse::<CipherSuite::Hash>(
+                            &mut buf,
+                            Some(&mut transcript_hasher),
+                            &mut key_schedule,
+                        )
+                        .await
+                        .ok_or(Error::InvalidServerFinished)?
                     {
                         fin
                     } else {
@@ -340,7 +346,7 @@ pub mod client {
                     }
                 };
 
-                if transcript_hasher.clone().finalize().as_ref() != finished.verify {
+                if expected_verify.as_ref() != finished.verify {
                     l0g::error!("Server finished does not match transcript");
                     return Err(Error::InvalidServerFinished);
                 }
@@ -348,27 +354,28 @@ pub mod client {
                 l0g::debug!("Server finished MATCHES transcript");
             }
 
-            // TODO: Send finished.
+            // Send finished.
             {
                 let ser_buf = &mut EncodingBuffer::new(buf);
 
+                let verify = key_schedule
+                    .create_verify_data(&transcript_hasher.clone().finalize(), false)
+                    .expect("UNREACHABLE");
+
                 // Add the Finished message to this datagram.
-                ClientRecord::encode_finished(
-                    ser_buf,
-                    &mut key_schedule,
-                    &transcript_hasher.clone().finalize(),
-                )
-                .await
-                .map_err(|_| Error::InsufficientSpace)?;
+                ClientRecord::encode_finished(ser_buf, &mut key_schedule, &verify)
+                    .await
+                    .map_err(|_| Error::InsufficientSpace)?;
 
                 socket.send(&ser_buf).await.map_err(|e| Error::Send(e))?;
             }
 
-            todo!();
-
-            // TODO: Update key schedule to Master Secret using public keys.
+            // Update key schedule to Master Secret.
+            key_schedule.initialize_master_secret();
 
             // TODO: Wait for server ACK.
+
+            todo!();
 
             Ok(ClientConnection {
                 socket,
@@ -389,8 +396,8 @@ pub mod server {
         },
         key_schedule::KeySchedule,
         record::{
-            CipherArguments, ClientRecord, DTlsCiphertextHeader, GenericCipher, NoCipher,
-            ServerRecord,
+            CipherArguments, ClientRecord, DTlsCiphertextHeader, GenericCipher, GenericHasher,
+            NoCipher, ServerRecord,
         },
         server_config::{Identity, Key, ServerConfig},
         Datagram, Error,
@@ -515,15 +522,11 @@ pub mod server {
                     selected_cipher_suite as u16,
                     0,
                     &mut key_schedule,
+                    &mut transcript_hasher,
                     &mut enc_buf,
                 )
                 .await
                 .map_err(|_| Error::InsufficientSpace)?;
-
-                // TODO: Check that this is correct, I think this hashes the plaintext header.
-
-                // TODO: Replace constant
-                transcript_hasher.update(&enc_buf[13..]);
 
                 l0g::trace!(
                     "Server transcript after server hello: {:02x?}",
@@ -536,10 +539,27 @@ pub mod server {
                 );
 
                 // Add the Finished message to this datagram.
-                ServerRecord::finished(&transcript_hasher.clone().finalize())
-                    .encode(&mut enc_buf, &mut key_schedule)
+                let verify =
+                    key_schedule.create_verify_data(&transcript_hasher.clone().finalize(), true);
+                ServerRecord::finished(&verify)
+                    .encode(
+                        &mut enc_buf,
+                        Some(&mut transcript_hasher),
+                        &mut key_schedule,
+                    )
                     .await
                     .map_err(|_| Error::InsufficientSpace)?;
+
+                // Add ServerFinished to transcript. TODO: This is encrypted......
+                // {
+                //     let buf = positions.as_slice(&enc_buf).expect("UNREACHABLE");
+                //     transcript_hasher.update(buf);
+                //     l0g::error!(
+                //         "Data added to hash (server): ENCRYPTED ({}) {:02x?}",
+                //         buf.len(),
+                //         buf
+                //     );
+                // }
 
                 socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
             }
@@ -549,6 +569,9 @@ pub mod server {
                 let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
 
                 // Check if we got more datagrams, we're expecting a finished.
+                let expected_verify =
+                    key_schedule.create_verify_data(&transcript_hasher.clone().finalize(), false);
+
                 let finished = {
                     if let (
                         (ClientRecord::Handshake(ClientHandshake::ClientFinished(fin), _), _),
@@ -563,7 +586,7 @@ pub mod server {
                     }
                 };
 
-                if transcript_hasher.clone().finalize() != finished.verify {
+                if expected_verify != finished.verify {
                     l0g::error!("Client finished does not match transcript");
                     return Err(Error::InvalidServerFinished);
                 }
@@ -571,7 +594,8 @@ pub mod server {
                 l0g::debug!("Client finished MATCHES transcript");
             }
 
-            // TODO: Update key schedule to Master Secret.
+            // Update key schedule to Master Secret.
+            key_schedule.initialize_master_secret();
 
             // TODO: Send ACK.
 
@@ -627,7 +651,7 @@ pub mod server {
             }
         }
 
-        pub fn create_binders(&self, transcript_hash: &[u8]) -> Vec<u8> {
+        pub fn create_binder(&self, transcript_hash: &[u8]) -> Vec<u8> {
             match self {
                 ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => Vec::from(
                     key_schedule
@@ -638,10 +662,29 @@ pub mod server {
             }
         }
 
+        pub fn create_verify_data(&self, transcript_hash: &[u8], use_server_key: bool) -> Vec<u8> {
+            match self {
+                ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => Vec::from(
+                    key_schedule
+                        .create_verify_data(transcript_hash, use_server_key)
+                        .expect("Unable to generate binder")
+                        .as_slice(),
+                ),
+            }
+        }
+
         pub fn initialize_handshake_secret(&mut self, ecdhe: &[u8], transcript: &[u8]) {
             match self {
                 ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => {
                     key_schedule.initialize_handshake_secret(ecdhe, transcript);
+                }
+            }
+        }
+
+        fn initialize_master_secret(&mut self) {
+            match self {
+                ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => {
+                    key_schedule.initialize_master_secret();
                 }
             }
         }
@@ -702,10 +745,16 @@ pub mod server {
         Sha256(Sha256),
     }
 
+    impl GenericHasher for TranscriptHasher {
+        fn update(&mut self, data: &[u8]) {
+            self.update(data);
+        }
+    }
+
     impl TranscriptHasher {
         pub fn update(&mut self, data: impl AsRef<[u8]>) {
             match self {
-                TranscriptHasher::Sha256(h) => h.update(data),
+                TranscriptHasher::Sha256(h) => Digest::update(h, data),
             }
         }
 

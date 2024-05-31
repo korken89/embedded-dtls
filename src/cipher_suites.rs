@@ -133,13 +133,13 @@ pub trait DtlsReKeyInPlace: KeySizeUser {
 
 impl DtlsReKeyInPlace for ChaCha20Poly1305Cipher {
     fn rekey_aead(&mut self, key: &aead::Key<Self>) {
-        l0g::trace!("New aead key: {key:02x?}");
+        l0g::debug!("New aead key: {key:02x?}");
         // The ChaCha20Poly1305 allows for creation from the key.
         self.aead = ChaCha20Poly1305::new(key);
     }
 
     fn rekey_mask(&mut self, key: &aead::Key<Self>) {
-        l0g::trace!("New mask key: {key:02x?}");
+        l0g::debug!("New mask key: {key:02x?}");
         // The ChaCha20 stream cipher does not allow for creation from the key, it also needs the
         // IV. The cipher is created on the fly in `apply_mask_for_record_number` instead where
         // the IV is available.
@@ -154,7 +154,7 @@ impl DtlsCipher for ChaCha20Poly1305Cipher {
         plaintext_with_tag: &mut CryptoBuffer<'_>,
         unified_hdr: &[u8],
     ) -> aead::Result<()> {
-        l0g::trace!("Encrypting with nonce: {nonce:02x?}");
+        l0g::debug!("Encrypting with nonce: {nonce:02x?}");
 
         self.aead
             .encrypt_in_place(nonce, unified_hdr, plaintext_with_tag)
@@ -166,7 +166,7 @@ impl DtlsCipher for ChaCha20Poly1305Cipher {
         ciphertext_with_tag: &mut CryptoBuffer<'_>,
         unified_hdr: &[u8],
     ) -> aead::Result<()> {
-        l0g::trace!("Decrypting with nonce: {nonce:02x?}");
+        l0g::debug!("Decrypting with nonce: {nonce:02x?}");
 
         self.aead
             .decrypt_in_place(nonce, &unified_hdr, ciphertext_with_tag)

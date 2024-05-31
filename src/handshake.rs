@@ -60,28 +60,6 @@ impl<'a> ClientHandshake<'a> {
         header.fragment_offset.set(buf, 0.into());
         header.fragment_length.set(buf, content_length.into());
 
-        // // The Handshake is finished, ready for transcript hash and binders.
-        // if let Some(binders) = binders {
-        //     // Update the transcript with everything up until the binder itself.
-        //     transcript_hasher.update(binders.slice_up_until(buf));
-
-        //     // Calculate the binder entry.
-        //     let binder_entry = key_schedule
-        //         .create_binder(&transcript_hasher.clone().finalize())
-        //         .expect("Unable to generate binder");
-
-        //     // Save the binder entry to the correct location.
-        //     // TODO: For each binder.
-        //     let buf = binders.into_buffer(buf);
-        //     buf[0] = binder_entry.len() as u8;
-        //     buf[1..].copy_from_slice(&binder_entry);
-
-        //     // Add the binder entry to the transcript.
-        //     transcript_hasher.update(&buf);
-        // } else {
-        //     transcript_hasher.update(buf);
-        // }
-
         Ok(binders_position.flatten())
     }
 
@@ -483,7 +461,7 @@ impl<'a> ClientHello<'a> {
             key_schedule.initialize_early_secret(Some((&psk_identity, psk)));
 
             // Verify binders with Early Secret
-            let binder = key_schedule.create_binders(binders_hash);
+            let binder = key_schedule.create_binder(binders_hash);
 
             if binder != pre_shared_key.binder {
                 l0g::error!("ClientHello: Psk binder mismatch");

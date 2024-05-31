@@ -322,45 +322,6 @@ impl<'a> ClientRecord<'a> {
         ))
     }
 
-    pub fn parse_old(buf: &mut ParseBuffer<'a>) -> Option<(Self, RecordPayloadPositions)> {
-        // Parse record.
-
-        let record_header = DTlsPlaintextHeader::parse(buf)?;
-
-        // TODO: Check if encrypted.
-        let encrypted = Encryption::Disabled;
-
-        let record_payload = buf.pop_slice(record_header.length.into())?;
-        l0g::trace!("Got record: {:?}", record_header);
-
-        let mut buf = ParseBuffer::new(record_payload);
-        let start = buf.current_pos_ptr();
-
-        let (ret, binders_pos) = match record_header.type_ {
-            ContentType::Handshake => {
-                let (handshake, binders_pos) = ClientHandshake::parse(&mut buf)?;
-
-                (ClientRecord::Handshake(handshake, encrypted), binders_pos)
-            }
-            ContentType::Ack => todo!(),
-            ContentType::Heartbeat => todo!(),
-            ContentType::Alert => todo!(),
-            ContentType::ApplicationData => todo!(),
-            ContentType::ChangeCipherSpec => todo!(),
-        };
-
-        let end = buf.current_pos_ptr();
-
-        Some((
-            ret,
-            RecordPayloadPositions {
-                start,
-                binders: binders_pos,
-                end,
-            },
-        ))
-    }
-
     fn is_encrypted(&self) -> bool {
         match self {
             ClientRecord::Handshake(_, Encryption::Disabled) => false,
@@ -378,6 +339,20 @@ impl<'a> ClientRecord<'a> {
             ClientRecord::Heartbeat(_) => ContentType::Heartbeat,
             ClientRecord::ApplicationData() => ContentType::ApplicationData,
         }
+    }
+}
+
+pub(crate) trait GenericHasher {
+    /// Add the input buffer to the hasher.
+    fn update(&mut self, data: &[u8]);
+}
+
+impl<T> GenericHasher for T
+where
+    T: Digest,
+{
+    fn update(&mut self, data: &[u8]) {
+        Digest::update(self, data)
     }
 }
 
@@ -467,6 +442,7 @@ impl<'a> ServerRecord<'a> {
         selected_cipher_suite: u16,
         selected_psk_identity: u16,
         key_schedule: &mut impl GenericCipher,
+        transcript_hasher: &mut impl GenericHasher,
         buf: &'buf mut EncodingBuffer<'_>,
     ) -> Result<(), ()> {
         let server_hello = ServerHello {
@@ -493,16 +469,14 @@ impl<'a> ServerRecord<'a> {
             ServerHandshake::ServerHello(server_hello),
             Encryption::Disabled,
         )
-        .encode(buf, key_schedule)
+        .encode(buf, Some(transcript_hasher), key_schedule)
         .await
     }
 
     /// Create a server's finished message.
-    pub fn finished(transcript_hash: &'a [u8]) -> Self {
+    pub fn finished(verify: &'a [u8]) -> Self {
         let finished = ServerRecord::Handshake(
-            ServerHandshake::ServerFinished(Finished {
-                verify: transcript_hash,
-            }),
+            ServerHandshake::ServerFinished(Finished { verify }),
             Encryption::Enabled,
         );
 
@@ -515,6 +489,7 @@ impl<'a> ServerRecord<'a> {
     pub async fn encode<'buf>(
         &self,
         buf: &'buf mut EncodingBuffer<'_>,
+        transcript_hasher: Option<&mut impl GenericHasher>,
         cipher: &mut impl GenericCipher,
     ) -> Result<(), ()> {
         encode_record(
@@ -522,20 +497,42 @@ impl<'a> ServerRecord<'a> {
             cipher,
             self.is_encrypted(),
             self.content_type(),
-            |buf| self.encode_content(buf),
+            |buf| self.encode_content(transcript_hasher, buf),
         )
         .await
     }
 
-    fn encode_content<'buf>(&self, buf: &'buf mut EncodingBuffer) -> Result<(), ()> {
+    fn encode_content<'buf>(
+        &self,
+        transcript_hasher: Option<&mut impl GenericHasher>,
+        buf: &'buf mut EncodingBuffer,
+    ) -> Result<(), ()> {
+        let start = buf.current_pos_ptr();
+
         match self {
             // NOTE: Each record encoder needs to update the transcript hash at their end.
-            ServerRecord::Handshake(handshake, _) => handshake.encode(buf),
+            ServerRecord::Handshake(handshake, _) => handshake.encode(buf)?,
             ServerRecord::Alert(_, _) => todo!(),
             ServerRecord::Heartbeat(_) => todo!(),
             ServerRecord::Ack(_, _) => todo!(),
             ServerRecord::ApplicationData() => todo!(),
         }
+
+        let end = buf.current_pos_ptr();
+
+        if let Some(hasher) = transcript_hasher {
+            hasher.update(
+                RecordPayloadPositions {
+                    start,
+                    binders: None,
+                    end,
+                }
+                .as_slice(&buf)
+                .ok_or(())?,
+            );
+        }
+
+        Ok(())
     }
 
     fn is_encrypted(&self) -> bool {
@@ -1037,15 +1034,6 @@ where
             (unified_hdr, payload, header)
         };
 
-        // let r = parse_ciphertext(
-        //     header,
-        //     UnifiedHeader::new(unified_hdr),
-        //     payload,
-        //     cipher,
-        //     parse_content,
-        // )
-        // .await?;
-
         let payload_without_tag = cipher
             .decrypt_record(
                 &header,
@@ -1219,39 +1207,6 @@ fn parse_plaintext<'a, Content>(
     let ret = parse_content(header.type_, Encryption::Disabled, &mut buf)?;
 
     Some(ret)
-}
-
-async fn parse_ciphertext<'a, Content>(
-    header: DTlsCiphertextHeader<'_>,
-    unified_hdr: UnifiedHeader<'a>,
-    payload_with_tag: &'a mut [u8],
-    cipher: &mut impl GenericCipher,
-    parse_content: impl FnOnce(ContentType, Encryption, &mut ParseBuffer<'a>) -> Option<Content>, // TODO: Maybe have it return the parse buffer instead.
-) -> Option<Content> {
-    // TODO: Parse encrypted record
-
-    l0g::error!("before decryption");
-
-    let payload_without_tag = cipher
-        .decrypt_record(
-            &header,
-            CipherArguments {
-                unified_hdr,
-                payload_with_tag,
-            },
-        )
-        .await
-        .ok()?;
-
-    let inner_plaintext = DtlsInnerPlaintext::parse(&mut ParseBuffer::new(payload_without_tag))?;
-
-    l0g::error!("parsed plaintext: {inner_plaintext:02x?}");
-
-    parse_content(
-        inner_plaintext.type_,
-        Encryption::Enabled,
-        &mut ParseBuffer::new(inner_plaintext.content),
-    )
 }
 
 #[cfg(test)]
