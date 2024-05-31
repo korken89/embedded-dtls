@@ -605,7 +605,10 @@ where
         l0g::debug!("Got sequence number: {sequence_number:?}");
         let estimated_read_record_number =
             find_closest_record_number(self.read_record_number, sequence_number);
-        l0g::debug!("Estimated read record number: {estimated_read_record_number:?}");
+        l0g::debug!(
+            "Estimated read record number: {estimated_read_record_number:?} ({})",
+            if self.is_server { "server" } else { "client" }
+        );
 
         self.cipher
             .decrypt_ciphertext(
@@ -638,8 +641,9 @@ where
     fn increment_write_record_number(&mut self) {
         self.write_record_number += 1;
         l0g::error!(
-            "incremented write record number to: {}",
-            self.write_record_number
+            "incremented write record number to: {} ({})",
+            self.write_record_number,
+            if self.is_server { "server" } else { "client" }
         );
     }
 
