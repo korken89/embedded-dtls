@@ -158,7 +158,7 @@ impl<'a> ClientRecord<'a> {
         config: &'a ClientConfig<'a>,
         public_key: &PublicKey,
         rng: &mut Rng,
-        key_schedule: &mut KeySchedule<CipherSuite>,
+        key_schedule: &mut KeySchedule<CipherSuite, false>,
     ) -> Result<RecordPayloadPositions, ()>
     where
         Rng: RngCore + CryptoRng,
@@ -206,7 +206,7 @@ impl<'a> ClientRecord<'a> {
     /// Create a server's finished message.
     pub async fn encode_finished<CipherSuite: DtlsCipherSuite>(
         buf: &mut EncodingBuffer<'_>,
-        key_schedule: &mut KeySchedule<CipherSuite>,
+        key_schedule: &mut KeySchedule<CipherSuite, false>,
         transcript_hash: &'a [u8],
     ) -> Result<(), ()> {
         let finished = Finished {

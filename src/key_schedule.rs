@@ -15,8 +15,8 @@
 //                        Transcript-Hash(Messages), Hash.length)
 
 use crate::{
-    buffer::{CryptoBuffer, EncodingBuffer, ParseBuffer},
-    cipher_suites::{DtlsCipher, DtlsCipherSuite},
+    buffer::{CryptoBuffer, EncodingBuffer},
+    cipher_suites::{DtlsCipher, DtlsCipherSuite, DtlsReKeyInPlace},
     handshake::extensions::Psk,
     record::{CipherArguments, CiphertextSequenceNumber, DTlsCiphertextHeader, GenericCipher},
 };
@@ -120,7 +120,7 @@ struct Secret<CipherSuite: DtlsCipherSuite> {
     // server_handshake_traffic_secret: Key<D>,
 }
 
-enum KeyScheduleState<CipherSuite: DtlsCipherSuite> {
+enum KeyScheduleState<CipherSuite: DtlsCipherSuite, const IS_SERVER: bool> {
     /// Not initialized.
     Uninitialized,
     /// Optional PSK initialization is done.
@@ -131,21 +131,107 @@ enum KeyScheduleState<CipherSuite: DtlsCipherSuite> {
     MasterSecret(Secret<CipherSuite>),
 }
 
+impl<CipherSuite: DtlsCipherSuite, const IS_SERVER: bool> KeyScheduleState<CipherSuite, IS_SERVER> {
+    fn create_encryption_nonce(
+        &self,
+        record_number: u64,
+    ) -> GenericArray<u8, <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize> {
+        let traffic_secrets = self.traffic_secrets();
+
+        if IS_SERVER {
+            &traffic_secrets.server
+        } else {
+            &traffic_secrets.client
+        }
+        .create_nonce(record_number)
+    }
+
+    fn create_decryption_nonce(
+        &self,
+        record_number: u64,
+    ) -> GenericArray<u8, <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize> {
+        let traffic_secrets = self.traffic_secrets();
+
+        if IS_SERVER {
+            &traffic_secrets.client
+        } else {
+            &traffic_secrets.server
+        }
+        .create_nonce(record_number)
+    }
+
+    fn encryption_mask_key(
+        &self,
+    ) -> &GenericArray<u8, <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize> {
+        let traffic_secrets = self.traffic_secrets();
+
+        if IS_SERVER {
+            &traffic_secrets.server.sn_key
+        } else {
+            &traffic_secrets.client.sn_key
+        }
+    }
+
+    fn decryption_mask_key(
+        &self,
+    ) -> &GenericArray<u8, <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize> {
+        let traffic_secrets = self.traffic_secrets();
+
+        if IS_SERVER {
+            &traffic_secrets.client.sn_key
+        } else {
+            &traffic_secrets.server.sn_key
+        }
+    }
+
+    fn encryption_aead_key(
+        &self,
+    ) -> &GenericArray<u8, <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize> {
+        let traffic_secrets = self.traffic_secrets();
+
+        if IS_SERVER {
+            &traffic_secrets.server.write_key
+        } else {
+            &traffic_secrets.client.write_key
+        }
+    }
+
+    fn decryption_aead_key(
+        &self,
+    ) -> &GenericArray<u8, <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize> {
+        let traffic_secrets = self.traffic_secrets();
+
+        if IS_SERVER {
+            &traffic_secrets.client.write_key
+        } else {
+            &traffic_secrets.server.write_key
+        }
+    }
+
+    fn traffic_secrets(&self) -> &TrafficSecrets<<CipherSuite as DtlsCipherSuite>::Cipher> {
+        match self {
+            KeyScheduleState::Uninitialized => unreachable!(),
+            KeyScheduleState::EarlySecret(_) => unreachable!(),
+            KeyScheduleState::HandshakeSecret(s) => &s.traffic_secrets,
+            KeyScheduleState::MasterSecret(s) => &s.traffic_secrets,
+        }
+    }
+}
+
 /// This tracks the state of the shared secrets.
 // The HKDF can be seen as state that goes through many tranformations.
 // Check the flow-chart in RFC8446 section 7.1, page 93 to see the entire flow.
 // This means that the HKDF needs to be tracked as continous state for the entire lifetime of the
 // connection.
-pub struct KeySchedule<CipherSuite: DtlsCipherSuite> {
-    keyschedule_state: KeyScheduleState<CipherSuite>,
+pub struct KeySchedule<CipherSuite: DtlsCipherSuite, const IS_SERVER: bool> {
+    keyschedule_state: KeyScheduleState<CipherSuite, IS_SERVER>,
     cipher: CipherSuite::Cipher,
     write_record_number: u64,
     read_record_number: u64,
     epoch_number: u64,
-    is_server: bool,
 }
 
-impl<CipherSuite> KeySchedule<CipherSuite>
+impl<CipherSuite> KeySchedule<CipherSuite, true>
 where
     CipherSuite: DtlsCipherSuite,
 {
@@ -157,10 +243,14 @@ where
             write_record_number: 0,
             read_record_number: 0,
             epoch_number: 0,
-            is_server: true,
         }
     }
+}
 
+impl<CipherSuite> KeySchedule<CipherSuite, false>
+where
+    CipherSuite: DtlsCipherSuite,
+{
     /// Create a new key schedule for a client.
     pub fn new_client(cipher: CipherSuite::Cipher) -> Self {
         Self {
@@ -169,10 +259,16 @@ where
             write_record_number: 0,
             read_record_number: 0,
             epoch_number: 0,
-            is_server: false,
         }
     }
+}
 
+impl<CipherSuite, const IS_SERVER: bool> KeySchedule<CipherSuite, IS_SERVER>
+where
+    CipherSuite: DtlsCipherSuite,
+    <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize: std::fmt::Debug,
+    <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
+{
     /// Check if the key schedule is uninitialized.
     pub fn is_uninitialized(&self) -> bool {
         match &self.keyschedule_state {
@@ -306,6 +402,9 @@ where
 
         let traffic_secrets = Self::create_handshake_traffic_secrets(&hkdf, transcript);
 
+        // According to Figure 13, RFC9147 epoch is now 2.
+        self.epoch_number = 2;
+
         self.keyschedule_state = KeyScheduleState::HandshakeSecret(Secret {
             hkdf,
             traffic_secrets,
@@ -412,75 +511,6 @@ where
             sn_key,
         }
     }
-
-    fn create_encryption_nonce(
-        &self,
-    ) -> GenericArray<u8, <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize> {
-        match &self.keyschedule_state {
-            KeyScheduleState::Uninitialized => unreachable!(),
-            KeyScheduleState::EarlySecret(_) => unreachable!(),
-            KeyScheduleState::HandshakeSecret(s) => {
-                if self.is_server {
-                    l0g::trace!(
-                        "Creating server handshake encryption nonce {}",
-                        self.write_record_number
-                    );
-                    &s.traffic_secrets.server
-                } else {
-                    l0g::trace!(
-                        "Creating client handshake encryption nonce {}",
-                        self.write_record_number
-                    );
-                    &s.traffic_secrets.client
-                }
-            }
-            KeyScheduleState::MasterSecret(s) => {
-                if self.is_server {
-                    l0g::trace!(
-                        "Creating server master encryption nonce {}",
-                        self.write_record_number
-                    );
-                    &s.traffic_secrets.server
-                } else {
-                    l0g::trace!(
-                        "Creating client master encryption nonce {}",
-                        self.write_record_number
-                    );
-                    &s.traffic_secrets.client
-                }
-            }
-        }
-        .create_nonce(self.write_record_number)
-    }
-
-    fn create_decryption_nonce(
-        &self,
-        record_number: u64,
-    ) -> GenericArray<u8, <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize> {
-        match &self.keyschedule_state {
-            KeyScheduleState::Uninitialized => unreachable!(),
-            KeyScheduleState::EarlySecret(_) => unreachable!(),
-            KeyScheduleState::HandshakeSecret(s) => {
-                if self.is_server {
-                    l0g::trace!("Creating server handshake decryption nonce {record_number}");
-                    &s.traffic_secrets.client
-                } else {
-                    l0g::trace!("Creating client handshake decryption nonce {record_number}");
-                    &s.traffic_secrets.server
-                }
-            }
-            KeyScheduleState::MasterSecret(s) => {
-                if self.is_server {
-                    l0g::trace!("Creating client master decryption nonce {record_number}");
-                    &s.traffic_secrets.client
-                } else {
-                    l0g::trace!("Creating server master decryption nonce {record_number}");
-                    &s.traffic_secrets.server
-                }
-            }
-        }
-        .create_nonce(record_number)
-    }
 }
 
 struct HkdfLabelContext<'a, 'b> {
@@ -520,7 +550,7 @@ where
     hkdf.expand(&hkdf_label, okm).expect("Internal error");
 }
 
-impl<CipherSuite> GenericCipher for KeySchedule<CipherSuite>
+impl<CipherSuite, const IS_SERVER: bool> GenericCipher for KeySchedule<CipherSuite, IS_SERVER>
 where
     CipherSuite: DtlsCipherSuite,
 {
@@ -543,13 +573,25 @@ where
             buf
         };
 
+        // Set the key for AEAD cipher. We re-key for every time as encryption and decryption
+        // shares the underlying cipher.
+        self.cipher
+            .rekey_aead(self.keyschedule_state.encryption_aead_key());
+
         self.cipher
             .encrypt_plaintext(
-                &self.create_encryption_nonce(),
+                &self
+                    .keyschedule_state
+                    .create_encryption_nonce(self.write_record_number),
                 &mut payload_with_tag,
                 unified_hdr.full_header(),
             )
             .await?;
+
+        // Set the key for mask cipher. We re-key for every time as encryption and decryption
+        // shares the underlying cipher.
+        self.cipher
+            .rekey_mask(self.keyschedule_state.encryption_mask_key());
 
         self.cipher
             .apply_mask_for_record_number(
@@ -585,6 +627,11 @@ where
             return Err(aead::Error);
         }
 
+        // Set the key for mask cipher. We re-key for every time as encryption and decryption
+        // shares the underlying cipher.
+        self.cipher
+            .rekey_mask(self.keyschedule_state.decryption_mask_key());
+
         let mut payload_with_tag_buffer = CryptoBuffer::new(payload_with_tag);
 
         if self
@@ -606,12 +653,19 @@ where
             find_closest_record_number(self.read_record_number, sequence_number);
         l0g::trace!(
             "Estimated read record number: {estimated_read_record_number:?} ({})",
-            if self.is_server { "server" } else { "client" }
+            if IS_SERVER { "server" } else { "client" }
         );
+
+        // Set the key for AEAD cipher. We re-key for every time as encryption and decryption
+        // shares the underlying cipher.
+        self.cipher
+            .rekey_aead(self.keyschedule_state.decryption_aead_key());
 
         self.cipher
             .decrypt_ciphertext(
-                &self.create_decryption_nonce(estimated_read_record_number),
+                &self
+                    .keyschedule_state
+                    .create_decryption_nonce(estimated_read_record_number),
                 &mut payload_with_tag_buffer,
                 unified_hdr.full_header(),
             )
@@ -642,7 +696,7 @@ where
         l0g::trace!(
             "incremented write record number to: {} ({})",
             self.write_record_number,
-            if self.is_server { "server" } else { "client" }
+            if IS_SERVER { "server" } else { "client" }
         );
     }
 

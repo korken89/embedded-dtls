@@ -202,7 +202,7 @@ pub mod client {
         /// Sender/receiver of data.
         socket: Socket,
         /// TODO: Keys for client->server and server->client. Also called "key schedule".
-        key_schedule: KeySchedule<CipherSuite>,
+        key_schedule: KeySchedule<CipherSuite, false>,
     }
 
     impl<Socket, CipherSuite> ClientConnection<Socket, CipherSuite>
@@ -381,7 +381,7 @@ pub mod client {
 // Lives in std land.
 pub mod server {
     use crate::{
-        buffer::{EncodingBuffer, ParseBuffer},
+        buffer::EncodingBuffer,
         cipher_suites::{ChaCha20Poly1305Cipher, DtlsEcdhePskWithChacha20Poly1305Sha256},
         handshake::{
             extensions::{DtlsVersions, Psk},
@@ -586,7 +586,7 @@ pub mod server {
 
     pub enum ServerKeySchedule {
         /// Key schedule for the Chacha20Poly1305 cipher suite.
-        Chacha20Poly1305Sha256(KeySchedule<DtlsEcdhePskWithChacha20Poly1305Sha256>),
+        Chacha20Poly1305Sha256(KeySchedule<DtlsEcdhePskWithChacha20Poly1305Sha256, true>),
     }
 
     impl ServerKeySchedule {
