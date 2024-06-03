@@ -212,9 +212,8 @@ mod encoding_buffer {
     use crate::integers::{U24, U48};
     use core::{
         fmt,
-        ops::{Deref, DerefMut},
+        ops::{Deref, DerefMut, Range},
     };
-    use std::ops::Range;
 
     /// A buffer handler wrapping a mutable slice.
     pub struct EncodingBuffer<'a> {

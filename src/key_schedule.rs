@@ -61,10 +61,10 @@ where
 impl<Cipher> core::fmt::Debug for TrafficSecrets<Cipher>
 where
     Cipher: DtlsCipher + KeySizeUser,
-    <Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
-    <Cipher as AeadCore>::NonceSize: std::fmt::Debug,
+    <Cipher as KeySizeUser>::KeySize: core::fmt::Debug,
+    <Cipher as AeadCore>::NonceSize: core::fmt::Debug,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "TrafficSecrets {{ client: {:02x?}, server: {:02x?} }}",
@@ -266,8 +266,8 @@ where
 impl<CipherSuite, const IS_SERVER: bool> KeySchedule<CipherSuite, IS_SERVER>
 where
     CipherSuite: DtlsCipherSuite,
-    <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize: std::fmt::Debug,
-    <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
+    <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize: core::fmt::Debug,
+    <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize: core::fmt::Debug,
 {
     /// Check if the key schedule is uninitialized.
     pub fn is_uninitialized(&self) -> bool {

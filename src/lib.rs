@@ -10,7 +10,7 @@
 //! Heavily inspired by [`embedded-tls`].
 //! [`embedded-tls`]: https://github.com/drogue-iot/embedded-tls
 
-// #![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_std)]
 #![allow(async_fn_in_trait)]
 
 pub(crate) mod buffer;
@@ -19,33 +19,6 @@ pub(crate) mod handshake;
 pub(crate) mod integers;
 pub(crate) mod key_schedule;
 pub(crate) mod record;
-
-#[allow(unused)]
-struct FakeRandom {
-    val: u8,
-}
-
-impl rand::CryptoRng for FakeRandom {}
-
-impl rand::RngCore for FakeRandom {
-    fn next_u32(&mut self) -> u32 {
-        u32::from_be_bytes([self.val; 4])
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        u64::from_be_bytes([self.val; 8])
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        dest.fill(self.val);
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
-        dest.fill(self.val);
-
-        Ok(())
-    }
-}
 
 pub mod client_config {
     use crate::handshake::extensions::Psk;
@@ -82,7 +55,7 @@ pub mod server_config {
 
     impl<'a> core::fmt::Debug for Identity<'a> {
         fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-            match std::str::from_utf8(self.0) {
+            match core::str::from_utf8(self.0) {
                 Ok(string) => f.write_str(string),
                 Err(_) => {
                     for b in self.0 {
@@ -222,9 +195,9 @@ pub mod client {
         ) -> Result<Self, Error<Socket>>
         where
             Rng: RngCore + CryptoRng,
-            <CipherSuite as DtlsCipherSuite>::Hash: std::fmt::Debug,
-            <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize: std::fmt::Debug,
-            <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize: std::fmt::Debug,
+            <CipherSuite as DtlsCipherSuite>::Hash: core::fmt::Debug,
+            <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize: core::fmt::Debug,
+            <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize: core::fmt::Debug,
         {
             let mut key_schedule = KeySchedule::new_client(cipher);
             let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
@@ -458,9 +431,9 @@ pub mod server {
         pub async fn open_server(
             socket: Socket,
             server_config: &ServerConfig<'_, '_>,
+            buf: &mut [u8],
         ) -> Result<Self, Error<Socket>> {
             // TODO: If any part fails with error, make sure to send the correct ALERT.
-            let buf = &mut vec![0; 16 * 1024];
 
             let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
             l0g::trace!("Got datagram!");
@@ -931,8 +904,10 @@ mod test {
 
             let server_config = ServerConfig { psk: &psk };
 
+            let buf = &mut vec![0; 16 * 1024];
+
             let mut server_connection =
-                ServerConnection::open_server(server_socket, &server_config)
+                ServerConnection::open_server(server_socket, &server_config, buf)
                     .await
                     .unwrap();
 

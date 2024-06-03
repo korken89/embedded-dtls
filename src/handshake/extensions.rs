@@ -667,7 +667,7 @@ pub struct Psk<'a> {
 }
 
 impl<'a> core::fmt::Debug for Psk<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Psk")
             .field("identity", &self.identity)
             .field("key", &"REDACTED")

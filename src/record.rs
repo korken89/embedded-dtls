@@ -13,10 +13,10 @@ use crate::{
     integers::U48,
     key_schedule::KeySchedule,
 };
+use core::ops::Range;
 use digest::{Digest, OutputSizeUser};
 use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
-use std::ops::Range;
 use x25519_dalek::PublicKey;
 
 #[derive(Copy, Clone, Debug, PartialOrd, PartialEq)]
