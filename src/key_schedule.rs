@@ -442,6 +442,7 @@ where
 
         // According to Figure 13, RFC9147 epoch is now 2.
         self.epoch_number = 2;
+        self.write_record_number = 0;
 
         self.keyschedule_state = KeyScheduleState::HandshakeSecret(Secret {
             hkdf,
@@ -483,7 +484,7 @@ where
     }
 
     /// Initialize the master secret.
-    pub fn initialize_master_secret(&mut self) {
+    pub fn initialize_master_secret(&mut self, transcript_hash: &[u8]) {
         match self.keyschedule_state {
             KeyScheduleState::HandshakeSecret(_) => {}
             _ => unreachable!(
@@ -497,50 +498,50 @@ where
             &HashArray::<<CipherSuite as DtlsCipherSuite>::Hash>::default(), // The input key material is the "0" string
         );
 
-        todo!()
-        // let traffic_secrets = Self::create_master_traffic_secrets(&hkdf, transcript);
+        let traffic_secrets = Self::create_master_traffic_secrets(&hkdf, transcript_hash);
 
-        // self.keyschedule_state = KeyScheduleState::MasterSecret(Secret {
-        // hkdf,
-        // traffic_secrets,
-        // });
+        // According to Figure 13, RFC9147 epoch is now 3.
+        self.epoch_number = 3;
+        self.write_record_number = 0;
 
-        // TODO: Create application traffic secrets
-
-        // TODO: Create sn_key for record number encryption (section 4.2.3, RFC9147)
+        self.keyschedule_state = KeyScheduleState::MasterSecret(Secret {
+            hkdf,
+            traffic_secrets,
+        });
     }
 
-    // /// Get the handshake traffic secrets.
-    // /// The transcript hash is over the ClientHello and ServerHello.
-    // fn create_master_traffic_secrets(
-    //     hkdf: &SimpleHkdf<<CipherSuite as DtlsCipherSuite>::Hash>,
-    // ) -> TrafficSecrets<<CipherSuite as DtlsCipherSuite>::Cipher> {
-    //     // This follows Section 7.3. Traffic Key Calculation in RFC8446.
-    //     let mut client = HashArray::<<CipherSuite as DtlsCipherSuite>::Hash>::default();
-    //     hkdf_make_expanded_label::<<CipherSuite as DtlsCipherSuite>::Hash>(
-    //         hkdf,
-    //         HkdfLabelContext {
-    //             label: b"c ap traffic",
-    //             context: transcript_hash,
-    //         },
-    //         &mut client,
-    //     );
+    /// Get the handshake traffic secrets.
+    /// The transcript hash is over the ClientHello and ServerHello.
+    fn create_master_traffic_secrets(
+        hkdf: &SimpleHkdf<<CipherSuite as DtlsCipherSuite>::Hash>,
+        transcript_hash: &[u8],
+    ) -> TrafficSecrets<<CipherSuite as DtlsCipherSuite>::Cipher> {
+        // This follows Section 7.3. Traffic Key Calculation in RFC8446.
+        let mut client = HashArray::<<CipherSuite as DtlsCipherSuite>::Hash>::default();
+        hkdf_make_expanded_label::<<CipherSuite as DtlsCipherSuite>::Hash>(
+            hkdf,
+            HkdfLabelContext {
+                label: b"c ap traffic",
+                context: transcript_hash,
+            },
+            &mut client,
+        );
 
-    //     let mut server = HashArray::<<CipherSuite as DtlsCipherSuite>::Hash>::default();
-    //     hkdf_make_expanded_label::<<CipherSuite as DtlsCipherSuite>::Hash>(
-    //         hkdf,
-    //         HkdfLabelContext {
-    //             label: b"s ap traffic",
-    //             context: transcript_hash,
-    //         },
-    //         &mut server,
-    //     );
+        let mut server = HashArray::<<CipherSuite as DtlsCipherSuite>::Hash>::default();
+        hkdf_make_expanded_label::<<CipherSuite as DtlsCipherSuite>::Hash>(
+            hkdf,
+            HkdfLabelContext {
+                label: b"s ap traffic",
+                context: transcript_hash,
+            },
+            &mut server,
+        );
 
-    //     TrafficSecrets {
-    //         client: Self::create_traffic_keying_material(&client),
-    //         server: Self::create_traffic_keying_material(&server),
-    //     }
-    // }
+        TrafficSecrets {
+            client: Self::create_traffic_keying_material(&client),
+            server: Self::create_traffic_keying_material(&server),
+        }
+    }
 
     fn create_traffic_keying_material<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>>(
         secret: &HashArray<<CipherSuite as DtlsCipherSuite>::Hash>,
@@ -770,6 +771,10 @@ where
             self.write_record_number,
             if IS_SERVER { "server" } else { "client" }
         );
+    }
+
+    fn read_record_number(&self) -> u64 {
+        self.read_record_number
     }
 
     fn epoch_number(&self) -> u64 {

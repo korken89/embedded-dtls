@@ -141,6 +141,8 @@ pub enum Error<D: Datagram> {
     InvalidServerHello,
     /// The server finished was invalid.
     InvalidServerFinished,
+    /// The server ACK was invalid.
+    InvalidServerAck,
     /// An error related to sending on the socket.
     Send(D::SendError),
     /// An error related to receivnig on the socket.
@@ -183,7 +185,7 @@ pub mod client {
         client_config::ClientConfig,
         handshake::ServerHandshake,
         key_schedule::KeySchedule,
-        record::{ClientRecord, ServerRecord},
+        record::{ClientRecord, EncodeOrParse, GenericCipher, ServerRecord},
         Datagram, Error,
     };
     use chacha20poly1305::{AeadCore, KeySizeUser};
@@ -363,11 +365,40 @@ pub mod client {
             }
 
             // Update key schedule to Master Secret.
-            key_schedule.initialize_master_secret();
+            key_schedule.initialize_master_secret(&transcript_hasher.clone().finalize());
 
-            // TODO: Wait for server ACK.
+            // Wait for server ACK.
+            {
+                let mut ack = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
 
-            todo!();
+                let ack = if let ServerRecord::Ack(ack, _) =
+                    ServerRecord::parse::<CipherSuite::Hash>(&mut ack, None, &mut key_schedule)
+                        .await
+                        .ok_or(Error::InvalidServerFinished)?
+                {
+                    ack
+                } else {
+                    return Err(Error::InvalidServerFinished);
+                };
+
+                l0g::debug!("Got server ACK: {ack:?}");
+                let EncodeOrParse::Parse(record_numbers) = ack.record_numbers else {
+                    panic!("ACK: Expected parse, got encode");
+                };
+
+                if record_numbers.is_empty() {
+                    l0g::error!("There was no record number in the handshake ACK");
+                    return Err(Error::InvalidServerAck);
+                }
+
+                for record_number in record_numbers {
+                    if record_number.epoch != key_schedule.epoch_number() {
+                        return Err(Error::InvalidServerAck);
+                    }
+
+                    // TODO: Should we check sequence number?
+                }
+            }
 
             Ok(ClientConnection {
                 socket,
@@ -389,7 +420,7 @@ pub mod server {
         key_schedule::KeySchedule,
         record::{
             CipherArguments, ClientRecord, DTlsCiphertextHeader, GenericCipher, GenericHasher,
-            NoCipher, ServerRecord,
+            NoCipher, RecordNumber, ServerRecord,
         },
         server_config::{Identity, Key, ServerConfig},
         Datagram, Error,
@@ -408,8 +439,8 @@ pub mod server {
     pub struct ServerConnection<Socket> {
         /// Sender/receiver of data.
         socket: Socket,
-        // / TODO: Keys for client->server and server->client. Also called "key schedule".
-        // key_schedule: KeySchedule<CipherSuite>,
+        /// Keys for client->server and server->client. Also called "key schedule".
+        key_schedule: ServerKeySchedule,
     }
 
     impl<Socket> ServerConnection<Socket>
@@ -540,25 +571,14 @@ pub mod server {
                 // Add the Finished message to this datagram.
                 let verify =
                     key_schedule.create_verify_data(&transcript_hasher.clone().finalize(), true);
-                ServerRecord::finished(&verify)
-                    .encode(
-                        &mut enc_buf,
-                        Some(&mut transcript_hasher),
-                        &mut key_schedule,
-                    )
-                    .await
-                    .map_err(|_| Error::InsufficientSpace)?;
-
-                // Add ServerFinished to transcript. TODO: This is encrypted......
-                // {
-                //     let buf = positions.as_slice(&enc_buf).expect("UNREACHABLE");
-                //     transcript_hasher.update(buf);
-                //     l0g::error!(
-                //         "Data added to hash (server): ENCRYPTED ({}) {:02x?}",
-                //         buf.len(),
-                //         buf
-                //     );
-                // }
+                ServerRecord::encode_finished(
+                    &verify,
+                    &mut key_schedule,
+                    &mut transcript_hasher,
+                    &mut enc_buf,
+                )
+                .await
+                .map_err(|_| Error::InsufficientSpace)?;
 
                 socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
             }
@@ -594,15 +614,33 @@ pub mod server {
             }
 
             // Update key schedule to Master Secret.
-            key_schedule.initialize_master_secret();
+            key_schedule.initialize_master_secret(&transcript_hasher.clone().finalize());
 
-            // TODO: Send ACK.
+            // Send ACK.
+            {
+                let mut enc_buf = EncodingBuffer::new(buf);
+                let sequence_number = key_schedule.read_record_number();
+                let epoch = key_schedule.epoch_number();
 
-            todo!();
+                ServerRecord::encode_ack(
+                    &[RecordNumber {
+                        epoch,
+                        sequence_number,
+                    }],
+                    &mut key_schedule,
+                    &mut enc_buf,
+                )
+                .await
+                .map_err(|_| Error::InsufficientSpace)?;
+
+                socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
+            }
+
+            // Handshake complete!
 
             Ok(ServerConnection {
                 socket,
-                // key_schedule,
+                key_schedule,
             })
         }
     }
@@ -682,10 +720,10 @@ pub mod server {
             }
         }
 
-        fn initialize_master_secret(&mut self) {
+        fn initialize_master_secret(&mut self, transcript: &[u8]) {
             match self {
                 ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => {
-                    key_schedule.initialize_master_secret();
+                    key_schedule.initialize_master_secret(transcript);
                 }
             }
         }
@@ -730,6 +768,12 @@ pub mod server {
                 ServerKeySchedule::Chacha20Poly1305Sha256(cipher) => {
                     cipher.increment_write_record_number()
                 }
+            }
+        }
+
+        fn read_record_number(&self) -> u64 {
+            match self {
+                ServerKeySchedule::Chacha20Poly1305Sha256(cipher) => cipher.read_record_number(),
             }
         }
 

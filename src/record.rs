@@ -65,6 +65,114 @@ pub struct UnifiedHeader<'a> {
     data: &'a mut [u8],
 }
 
+/// An ACK message.
+#[derive(Debug)]
+pub struct Ack<'a> {
+    pub record_numbers: EncodeOrParse<&'a [RecordNumber], RecordNumberIter<'a>>,
+}
+
+impl<'a> Ack<'a> {
+    /// Encode an ACK.
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+        let EncodeOrParse::Encode(record_numbers) = &self.record_numbers else {
+            l0g::error!("ACK: Expected encode, got parse");
+            return Err(());
+        };
+
+        let size = u16::try_from(record_numbers.len() * 16).map_err(|_| ())?;
+        buf.push_u16_be(size)?;
+
+        for record_number in *record_numbers {
+            record_number.encode(buf)?;
+        }
+
+        Ok(())
+    }
+
+    /// Parse an ACK.
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+        let iter = RecordNumberIter::parse(buf)?;
+
+        Some(Self {
+            record_numbers: EncodeOrParse::Parse(iter),
+        })
+    }
+}
+
+/// Record number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordNumber {
+    pub epoch: u64,
+    pub sequence_number: u64,
+}
+
+impl RecordNumber {
+    /// Encode a record number.
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+        buf.push_u64_be(self.epoch)?;
+        buf.push_u64_be(self.sequence_number)
+    }
+
+    /// Parse a record number.
+    pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        let epoch = buf.pop_u64_be()?;
+        let sequence_number = buf.pop_u64_be()?;
+
+        Some(Self {
+            epoch,
+            sequence_number,
+        })
+    }
+}
+
+/// This iterator gives a `RecordNumber` for each iteration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordNumberIter<'a> {
+    /// The record numbers.
+    record_numbers: ParseBuffer<'a>,
+}
+
+impl<'a> Iterator for RecordNumberIter<'a> {
+    type Item = RecordNumber;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        RecordNumber::parse(&mut self.record_numbers)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len(), Some(self.len()))
+    }
+}
+
+impl<'a> ExactSizeIterator for RecordNumberIter<'a> {}
+
+impl<'a> RecordNumberIter<'a> {
+    /// Checks if it is empty.
+    pub fn is_empty(&self) -> bool {
+        self.record_numbers.is_empty()
+    }
+
+    /// Returns the number of `RecordNumber` that are available.
+    pub fn len(&self) -> usize {
+        self.record_numbers.len() / 16
+    }
+
+    /// Parse a `RecordNumberIter`.
+    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
+        let record_numbers_size = buf.pop_u16_be()?;
+
+        if record_numbers_size % 16 != 0 {
+            return None;
+        }
+
+        let record_numbers = buf.pop_slice(record_numbers_size as usize)?;
+
+        Some(Self {
+            record_numbers: ParseBuffer::new(&record_numbers),
+        })
+    }
+}
+
 impl<'a> UnifiedHeader<'a> {
     fn new(data: &'a mut [u8]) -> Self {
         Self { data }
@@ -146,7 +254,7 @@ impl RecordPayloadPositions {
 pub enum ClientRecord<'a> {
     Handshake(ClientHandshake<'a>, Encryption),
     Alert(/* Alert, */ (), Encryption),
-    Ack((), Encryption),
+    Ack(Ack<'a>, Encryption),
     Heartbeat(()),
     ApplicationData(/* &'a [u8] */),
 }
@@ -203,7 +311,7 @@ impl<'a> ClientRecord<'a> {
         .await
     }
 
-    /// Create a server's finished message.
+    /// Create a client's finished message.
     pub async fn encode_finished<CipherSuite: DtlsCipherSuite>(
         buf: &mut EncodingBuffer<'_>,
         key_schedule: &mut KeySchedule<CipherSuite, false>,
@@ -224,8 +332,26 @@ impl<'a> ClientRecord<'a> {
         .map(|_| ())
     }
 
+    /// Create a client's ACK message.
+    pub async fn encode_ack<CipherSuite: DtlsCipherSuite>(
+        buf: &mut EncodingBuffer<'_>,
+        key_schedule: &mut KeySchedule<CipherSuite, false>,
+        record_numbers: &'a [RecordNumber],
+    ) -> Result<(), ()> {
+        let ack = Ack {
+            record_numbers: EncodeOrParse::Encode(record_numbers),
+        };
+
+        l0g::debug!("Sending client ACK: {ack:?}");
+
+        ClientRecord::Ack(ack, Encryption::Enabled)
+            .encode(buf, key_schedule)
+            .await
+            .map(|_| ())
+    }
+
     /// Encode the record into a buffer. Returns (packet to send, content to hash).
-    pub async fn encode<'buf>(
+    async fn encode<'buf>(
         &self,
         buf: &'buf mut EncodingBuffer<'_>,
         cipher: &mut impl GenericCipher,
@@ -301,10 +427,12 @@ impl<'a> ClientRecord<'a> {
         let (ret, binders) = match content_type {
             ContentType::Handshake => {
                 let (handshake, binders_pos) = ClientHandshake::parse(buf)?;
-
                 (ClientRecord::Handshake(handshake, encryption), binders_pos)
             }
-            ContentType::Ack => todo!(),
+            ContentType::Ack => {
+                let ack = Ack::parse(buf)?;
+                (ClientRecord::Ack(ack, encryption), None)
+            }
             ContentType::Heartbeat => todo!(),
             ContentType::Alert => todo!(),
             ContentType::ApplicationData => todo!(),
@@ -356,6 +484,13 @@ where
     }
 }
 
+/// No hasher marker.
+pub struct NoHasher {}
+
+impl GenericHasher for NoHasher {
+    fn update(&mut self, _data: &[u8]) {}
+}
+
 pub(crate) trait GenericCipher {
     /// Encrypts a record.
     async fn encrypt_record(&mut self, args: CipherArguments) -> aead::Result<()>;
@@ -370,11 +505,14 @@ pub(crate) trait GenericCipher {
     /// Returns the size of the AEAD tag.
     fn tag_size(&self) -> usize;
 
-    /// Get the current record number.
+    /// Get the current write record number.
     fn write_record_number(&self) -> u64;
 
     /// Increment the current write record number.
     fn increment_write_record_number(&mut self);
+
+    /// Get the current read record number.
+    fn read_record_number(&self) -> u64;
 
     /// Get the current epoch number.
     fn epoch_number(&self) -> u64;
@@ -385,7 +523,7 @@ pub struct NoCipher {}
 
 impl GenericCipher for NoCipher {
     async fn encrypt_record(&mut self, _args: CipherArguments<'_>) -> aead::Result<()> {
-        unreachable!()
+        Err(aead::Error)
     }
 
     async fn decrypt_record<'a>(
@@ -393,23 +531,25 @@ impl GenericCipher for NoCipher {
         _ciphertext_header: &DTlsCiphertextHeader<'_>,
         _args: CipherArguments<'a>,
     ) -> aead::Result<&'a [u8]> {
-        unreachable!()
+        Err(aead::Error)
     }
 
     fn tag_size(&self) -> usize {
-        unreachable!()
+        0
     }
 
     fn write_record_number(&self) -> u64 {
-        unreachable!()
+        0
     }
 
-    fn increment_write_record_number(&mut self) {
-        unreachable!()
+    fn increment_write_record_number(&mut self) {}
+
+    fn read_record_number(&self) -> u64 {
+        0
     }
 
     fn epoch_number(&self) -> u64 {
-        unreachable!()
+        0
     }
 }
 
@@ -428,7 +568,7 @@ pub struct CipherArguments<'a> {
 pub enum ServerRecord<'a> {
     Handshake(ServerHandshake<'a>, Encryption),
     Alert(/* Alert, */ (), Encryption),
-    Ack((), Encryption),
+    Ack(Ack<'a>, Encryption),
     Heartbeat(()),
     ApplicationData(/* &'a [u8] */),
 }
@@ -474,7 +614,12 @@ impl<'a> ServerRecord<'a> {
     }
 
     /// Create a server's finished message.
-    pub fn finished(verify: &'a [u8]) -> Self {
+    pub async fn encode_finished(
+        verify: &[u8],
+        key_schedule: &mut impl GenericCipher,
+        transcript_hasher: &mut impl GenericHasher,
+        buf: &mut EncodingBuffer<'_>,
+    ) -> Result<(), ()> {
         let finished = ServerRecord::Handshake(
             ServerHandshake::ServerFinished(Finished { verify }),
             Encryption::Enabled,
@@ -483,13 +628,33 @@ impl<'a> ServerRecord<'a> {
         l0g::debug!("Sending server finished: {finished:02x?}");
 
         finished
+            .encode(buf, Some(transcript_hasher), key_schedule)
+            .await
+    }
+
+    /// Create a server's ACK message.
+    pub async fn encode_ack(
+        record_numbers: &[RecordNumber],
+        key_schedule: &mut impl GenericCipher,
+        buf: &mut EncodingBuffer<'_>,
+    ) -> Result<(), ()> {
+        let ack = Ack {
+            record_numbers: EncodeOrParse::Encode(record_numbers),
+        };
+
+        l0g::debug!("Sending server ACK: {ack:?}");
+
+        ServerRecord::Ack(ack, Encryption::Enabled)
+            .encode::<NoHasher>(buf, None, key_schedule)
+            .await
+            .map(|_| ())
     }
 
     /// Encode the record into a buffer. Returns (packet to send, content to hash).
-    pub async fn encode<'buf>(
+    pub async fn encode<'buf, Hasher: GenericHasher>(
         &self,
         buf: &'buf mut EncodingBuffer<'_>,
-        transcript_hasher: Option<&mut impl GenericHasher>,
+        transcript_hasher: Option<&mut Hasher>,
         cipher: &mut impl GenericCipher,
     ) -> Result<(), ()> {
         encode_record(
@@ -514,7 +679,7 @@ impl<'a> ServerRecord<'a> {
             ServerRecord::Handshake(handshake, _) => handshake.encode(buf)?,
             ServerRecord::Alert(_, _) => todo!(),
             ServerRecord::Heartbeat(_) => todo!(),
-            ServerRecord::Ack(_, _) => todo!(),
+            ServerRecord::Ack(ack, _) => ack.encode(buf)?,
             ServerRecord::ApplicationData() => todo!(),
         }
 
@@ -593,7 +758,10 @@ impl<'a> ServerRecord<'a> {
                 let handshake = ServerHandshake::parse(buf)?;
                 ServerRecord::Handshake(handshake, encryption)
             }
-            ContentType::Ack => todo!(),
+            ContentType::Ack => {
+                let ack = Ack::parse(buf)?;
+                ServerRecord::Ack(ack, encryption)
+            }
             ContentType::Heartbeat => todo!(),
             ContentType::Alert => todo!(),
             ContentType::ApplicationData => todo!(),

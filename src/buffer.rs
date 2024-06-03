@@ -169,6 +169,13 @@ mod parse_buffer {
             Some(r)
         }
 
+        /// Pop a big-endian u64.
+        pub fn pop_u64_be(&mut self) -> Option<u64> {
+            let r = u64::from_be_bytes(self.data.get(0..8)?.try_into().unwrap());
+            self.data = &self.data[8..];
+            Some(r)
+        }
+
         /// Pop a slice.
         pub fn pop_slice(&mut self, size: usize) -> Option<&'a [u8]> {
             let r = &self.data.get(..size)?;
@@ -313,6 +320,11 @@ mod encoding_buffer {
 
         /// Push a u48 in big-endian.
         pub fn push_u48_be(&mut self, val: U48) -> Result<(), ()> {
+            self.extend_from_slice(&val.to_be_bytes())
+        }
+
+        /// Push a u64 in big-endian.
+        pub fn push_u64_be(&mut self, val: u64) -> Result<(), ()> {
             self.extend_from_slice(&val.to_be_bytes())
         }
 
