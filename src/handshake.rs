@@ -450,15 +450,19 @@ impl<'a> ClientHello<'a> {
 
             let pre_shared_key = psk_iter.clone().next().ok_or(())?;
 
-            let psk_identity = Identity::from(pre_shared_key.identity);
-            let Some(psk) = server_config.psk.get(&psk_identity) else {
+            let psk_identity = Identity::from(&pre_shared_key.identity);
+            let Some(psk) = server_config
+                .psk
+                .iter()
+                .find(|&psk| psk_identity.eq(&psk.0))
+            else {
                 l0g::error!("ClientHello: Psk unknown identity: {psk_identity:?}");
                 return Err(());
             };
             l0g::trace!("Psk identity '{:?}' is AVAILABLE", psk_identity);
 
             // Perform PSK -> Early Secret with Key Schedule
-            key_schedule.initialize_early_secret(Some((&psk_identity, psk)));
+            key_schedule.initialize_early_secret(Some((&psk_identity, &psk.1)));
 
             // Verify binders with Early Secret
             let binder = key_schedule.create_binder(binders_hash);

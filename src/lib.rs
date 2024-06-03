@@ -61,69 +61,64 @@ pub mod client_config {
 }
 
 pub mod server_config {
-    use std::collections::HashMap;
-
-    use zeroize::Zeroizing;
-
     /// Pre-shared key identity.
     #[derive(PartialEq, Eq, Hash)]
-    pub struct Identity(Vec<u8>);
+    pub struct Identity<'a>(&'a [u8]);
 
-    impl<T> From<T> for Identity
+    impl<'a, T> From<&'a T> for Identity<'a>
     where
         T: AsRef<[u8]>,
     {
-        fn from(value: T) -> Self {
-            Self(Vec::from(value.as_ref()))
+        fn from(value: &'a T) -> Self {
+            Self(value.as_ref())
         }
     }
 
-    impl Identity {
+    impl<'a> Identity<'a> {
         pub(crate) fn as_slice(&self) -> &[u8] {
-            &self.0
+            self.0
         }
     }
 
-    impl core::fmt::Debug for Identity {
+    impl<'a> core::fmt::Debug for Identity<'a> {
         fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-            match std::str::from_utf8(&self.0) {
+            match std::str::from_utf8(self.0) {
                 Ok(string) => f.write_str(string),
-                Err(_) => f.write_str(
-                    &self
-                        .0
-                        .iter()
-                        .map(|byte| format!("{:02x}", byte))
-                        .collect::<Vec<String>>()
-                        .join(" "),
-                ),
+                Err(_) => {
+                    for b in self.0 {
+                        write!(f, "{:02x}", b)?;
+                    }
+
+                    Ok(())
+                }
             }
         }
     }
 
     /// Pre-shared key value.
-    pub struct Key(Zeroizing<Vec<u8>>);
+    pub struct Key<'a>(&'a [u8]);
 
-    impl<T> From<T> for Key
+    impl<'a, T> From<&'a T> for Key<'a>
     where
         T: AsRef<[u8]>,
     {
-        fn from(value: T) -> Self {
-            Self(Vec::from(value.as_ref()).into())
+        fn from(value: &'a T) -> Self {
+            Self(value.as_ref())
         }
     }
 
-    impl Key {
+    impl<'a> Key<'a> {
         pub(crate) fn as_slice(&self) -> &[u8] {
             &self.0
         }
     }
 
     /// Server configuration.
-    pub struct ServerConfig {
+    pub struct ServerConfig<'a, 'b> {
         /// A list of allowed pre-shared keys.
         ///
         /// The key is the identity and the value is the key.
-        pub psk: HashMap<Identity, Key>,
+        pub psk: &'b [(Identity<'a>, Key<'a>)],
     }
 }
 
@@ -254,9 +249,8 @@ pub mod client {
                 if let Some((up_to_binders, binders)) = positions.pre_post_binders_mut(&mut ser_buf)
                 {
                     transcript_hasher.update(up_to_binders);
-                    let binder_entry = key_schedule
-                        .create_binder(&transcript_hasher.clone().finalize())
-                        .expect("UNREACHABLE");
+                    let binder_entry =
+                        key_schedule.create_binder(&transcript_hasher.clone().finalize());
 
                     let mut binders_enc = EncodingBuffer::new(binders);
                     binders_enc.push_u8(binder_entry.len() as u8).unwrap();
@@ -320,9 +314,8 @@ pub mod client {
                 );
 
                 // Check if we got more datagrams, we're expecting a finished.
-                let expected_verify = key_schedule
-                    .create_verify_data(&transcript_hasher.clone().finalize(), true)
-                    .expect("UNREACHABLE");
+                let expected_verify =
+                    key_schedule.create_verify_data(&transcript_hasher.clone().finalize(), true);
                 let finished = {
                     let mut buf = if resp.is_empty() {
                         // Wait for finished.
@@ -351,16 +344,15 @@ pub mod client {
                     return Err(Error::InvalidServerFinished);
                 }
 
-                l0g::debug!("Server finished MATCHES transcript");
+                l0g::debug!("Server finished MATCHES expected transcript");
             }
 
             // Send finished.
             {
                 let ser_buf = &mut EncodingBuffer::new(buf);
 
-                let verify = key_schedule
-                    .create_verify_data(&transcript_hasher.clone().finalize(), false)
-                    .expect("UNREACHABLE");
+                let verify =
+                    key_schedule.create_verify_data(&transcript_hasher.clone().finalize(), false);
 
                 // Add the Finished message to this datagram.
                 ClientRecord::encode_finished(ser_buf, &mut key_schedule, &verify)
@@ -403,8 +395,13 @@ pub mod server {
         Datagram, Error,
     };
     use digest::Digest;
+    use heapless::Vec as HVec;
     use sha2::Sha256;
     use x25519_dalek::{EphemeralSecret, PublicKey};
+
+    /// The maximum hash size the server supports. If we start using larger hashes, update this
+    /// constant.
+    const MAX_HASH_SIZE: usize = 32;
 
     // TODO: How to select between server and client? Typestate, flag or two separate structs?
     /// A DTLS 1.3 connection.
@@ -425,7 +422,7 @@ pub mod server {
         /// NOTE: This does not do timeout, it's up to the caller to give up.
         pub async fn open_server(
             socket: Socket,
-            server_config: &ServerConfig,
+            server_config: &ServerConfig<'_, '_>,
         ) -> Result<Self, Error<Socket>> {
             // TODO: If any part fails with error, make sure to send the correct ALERT.
             let buf = &mut vec![0; 16 * 1024];
@@ -505,7 +502,9 @@ pub mod server {
                 let shared_secret = secret.diffie_hellman(&their_public_key);
 
                 // Send server hello.
-                let legacy_session_id: Vec<_> = client_hello.legacy_session_id.into();
+                let legacy_session_id: HVec<u8, 32> =
+                    HVec::from_slice(client_hello.legacy_session_id)
+                        .map_err(|_| Error::InsufficientSpace)?;
 
                 // TODO: Can we move this up somehow?
                 if !resp.is_empty() {
@@ -591,7 +590,7 @@ pub mod server {
                     return Err(Error::InvalidServerFinished);
                 }
 
-                l0g::debug!("Client finished MATCHES transcript");
+                l0g::debug!("Client finished MATCHES expected transcript");
             }
 
             // Update key schedule to Master Secret.
@@ -651,25 +650,27 @@ pub mod server {
             }
         }
 
-        pub fn create_binder(&self, transcript_hash: &[u8]) -> Vec<u8> {
+        pub fn create_binder(&self, transcript_hash: &[u8]) -> HVec<u8, MAX_HASH_SIZE> {
             match self {
-                ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => Vec::from(
-                    key_schedule
-                        .create_binder(transcript_hash)
-                        .expect("Unable to generate binder")
-                        .as_slice(),
-                ),
+                ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => {
+                    HVec::from_slice(key_schedule.create_binder(transcript_hash).as_slice())
+                        .unwrap()
+                }
             }
         }
 
-        pub fn create_verify_data(&self, transcript_hash: &[u8], use_server_key: bool) -> Vec<u8> {
+        pub fn create_verify_data(
+            &self,
+            transcript_hash: &[u8],
+            use_server_key: bool,
+        ) -> HVec<u8, MAX_HASH_SIZE> {
             match self {
-                ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => Vec::from(
+                ServerKeySchedule::Chacha20Poly1305Sha256(key_schedule) => HVec::from_slice(
                     key_schedule
                         .create_verify_data(transcript_hash, use_server_key)
-                        .expect("Unable to generate binder")
                         .as_slice(),
-                ),
+                )
+                .unwrap(),
             }
         }
 
@@ -758,9 +759,9 @@ pub mod server {
             }
         }
 
-        pub fn finalize(self) -> Vec<u8> {
+        pub fn finalize(self) -> HVec<u8, MAX_HASH_SIZE> {
             match self {
-                TranscriptHasher::Sha256(h) => Vec::from(h.finalize().as_slice()),
+                TranscriptHasher::Sha256(h) => HVec::from_slice(h.finalize().as_slice()).unwrap(),
             }
         }
     }
@@ -869,12 +870,12 @@ mod test {
 
         // Server
         let s = tokio::spawn(async move {
-            let server_config = ServerConfig {
-                psk: HashMap::from([(
-                    server_config::Identity::from(b"hello world"),
-                    server_config::Key::from(b"1234567890qwertyuiopasdfghjklzxc"),
-                )]),
-            };
+            let psk = [(
+                server_config::Identity::from(b"hello world"),
+                server_config::Key::from(b"1234567890qwertyuiopasdfghjklzxc"),
+            )];
+
+            let server_config = ServerConfig { psk: &psk };
 
             let mut server_connection =
                 ServerConnection::open_server(server_socket, &server_config)

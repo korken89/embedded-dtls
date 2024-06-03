@@ -656,7 +656,7 @@ impl<'a> PskIter<'a> {
 }
 
 /// Pre-shared key entry.
-#[derive(Clone, Debug, PartialOrd, PartialEq)]
+#[derive(Clone, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Psk<'a> {
     /// A label for the key. For instance, a ticket (as defined in Appendix B.3.4) or a label
@@ -664,6 +664,15 @@ pub struct Psk<'a> {
     pub identity: &'a [u8],
     /// The pre-shared key.
     pub key: &'a [u8],
+}
+
+impl<'a> core::fmt::Debug for Psk<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Psk")
+            .field("identity", &self.identity)
+            .field("key", &"REDACTED")
+            .finish()
+    }
 }
 
 impl<'a> Psk<'a> {

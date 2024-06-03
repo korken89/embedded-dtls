@@ -30,6 +30,13 @@ chacha20 = "0.9.1"
 # embedded-io-async = { version = "0.6.1", features = ["defmt-03"] }
 # embedded-io = { version = "0.6.1", features = ["defmt-03"] }
 
+[features]
+default = []
+
+# UNSAFE: This will print encryption keys, pre-shared keys and nonces in plaintext for debuging
+# purposes for built-in ciphers. NEVER have this feature enabled in production.
+unsafe_debug_keys = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 l0g = { version = "1.0.0", features = ["log"] }

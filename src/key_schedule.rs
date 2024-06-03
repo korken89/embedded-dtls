@@ -303,11 +303,11 @@ where
     pub fn create_binder(
         &self,
         transcript_hash: &[u8],
-    ) -> Option<HashArray<<CipherSuite as DtlsCipherSuite>::Hash>> {
+    ) -> HashArray<<CipherSuite as DtlsCipherSuite>::Hash> {
         if transcript_hash.len()
             != <<CipherSuite as DtlsCipherSuite>::Hash as Digest>::output_size()
         {
-            return None;
+            unreachable!("Internal error! `create_binder` was called with wrong length transcript");
         }
 
         let secret = match &self.keyschedule_state {
@@ -317,7 +317,7 @@ where
             }
         };
 
-        Some(Self::finished_hmac(&secret.binder_key, transcript_hash))
+        Self::finished_hmac(&secret.binder_key, transcript_hash)
     }
 
     /// Calculate verify data for Finished.
@@ -326,11 +326,13 @@ where
         &self,
         transcript_hash: &[u8],
         use_server_key: bool,
-    ) -> Option<HashArray<<CipherSuite as DtlsCipherSuite>::Hash>> {
+    ) -> HashArray<<CipherSuite as DtlsCipherSuite>::Hash> {
         if transcript_hash.len()
             != <<CipherSuite as DtlsCipherSuite>::Hash as Digest>::output_size()
         {
-            return None;
+            unreachable!(
+                "Internal error! `create_verify_data` was called with wrong length transcript"
+            );
         }
 
         let key = match &self.keyschedule_state {
@@ -342,11 +344,13 @@ where
                 }
             }
             _ => {
-                unreachable!("Internal error! `create_binder` was called when not in early secret")
+                unreachable!(
+                    "Internal error! `create_verify_data` was called when not in early secret"
+                )
             }
         };
 
-        Some(Self::finished_hmac(key, transcript_hash))
+        Self::finished_hmac(key, transcript_hash)
     }
 
     fn finished_hmac(
