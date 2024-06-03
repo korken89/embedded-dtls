@@ -1,7 +1,9 @@
 use core::ops::{Add, AddAssign};
+use defmt_or_log::maybe_derive_format;
 
 /// Represents a `uint24` in TLS.
-#[derive(Copy, Clone, Debug, defmt::Format, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[maybe_derive_format]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct U24(u32);
 
 impl U24 {
@@ -31,7 +33,8 @@ impl U24 {
 }
 
 /// Represents a `uint48` in TLS.
-#[derive(Copy, Clone, Debug, defmt::Format, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[maybe_derive_format]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct U48(u64);
 
 impl U48 {

@@ -18,12 +18,13 @@ use crate::{
     buffer::{AllocSliceHandle, EncodingBuffer, ParseBuffer},
     record::EncodeOrParse,
 };
+use defmt_or_log::{derive_format_or_debug, error};
 use num_enum::TryFromPrimitive;
 
 /// Version numbers.
 #[repr(u16)]
-#[derive(Copy, Clone, Debug, PartialOrd, PartialEq, TryFromPrimitive)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialOrd, PartialEq, TryFromPrimitive)]
 pub enum DtlsVersions {
     /// DTLS v1.0
     V1_0 = 0xfeff,
@@ -53,8 +54,8 @@ impl<'a> ParseExtension<'a> {
     }
 }
 
-#[derive(Clone, Default, Debug, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Clone, Default, PartialEq)]
 pub struct ClientExtensions<'a> {
     pub psk_key_exchange_modes: Option<PskKeyExchangeModes>,
     pub key_share: Option<KeyShareEntry<'a>>,
@@ -95,7 +96,7 @@ impl<'a> ClientExtensions<'a> {
 
         while let Some(extension) = ParseExtension::parse(&mut extensions) {
             if ret.pre_shared_key.is_some() {
-                l0g::error!("Got more extensions after PreSharedKey!");
+                error!("Got more extensions after PreSharedKey!");
                 return None;
             }
 
@@ -104,12 +105,12 @@ impl<'a> ClientExtensions<'a> {
                     let Some(v) = ClientSupportedVersions::parse(&mut ParseBuffer::new(
                         extension.extension_data,
                     )) else {
-                        l0g::error!("Failed to parse supported version");
+                        error!("Failed to parse supported version");
                         return None;
                     };
 
                     if ret.supported_versions.is_some() {
-                        l0g::error!("Supported version extension already parsed!");
+                        error!("Supported version extension already parsed!");
                         return None;
                     }
 
@@ -119,12 +120,12 @@ impl<'a> ClientExtensions<'a> {
                     let Some(v) =
                         PskKeyExchangeModes::parse(&mut ParseBuffer::new(extension.extension_data))
                     else {
-                        l0g::error!("Failed to parse PskKeyExchange");
+                        error!("Failed to parse PskKeyExchange");
                         return None;
                     };
 
                     if ret.psk_key_exchange_modes.is_some() {
-                        l0g::error!("PskKeyExchangeModes extension already parsed!");
+                        error!("PskKeyExchangeModes extension already parsed!");
                         return None;
                     }
 
@@ -134,12 +135,12 @@ impl<'a> ClientExtensions<'a> {
                     let Some(v) =
                         KeyShareEntry::parse(&mut ParseBuffer::new(extension.extension_data))
                     else {
-                        l0g::error!("Failed to parse PskKeyExchange");
+                        error!("Failed to parse PskKeyExchange");
                         return None;
                     };
 
                     if ret.key_share.is_some() {
-                        l0g::error!("Keyshare extension already parsed!");
+                        error!("Keyshare extension already parsed!");
                         return None;
                     }
 
@@ -149,12 +150,12 @@ impl<'a> ClientExtensions<'a> {
                     let Some((psk, binders_start_pos)) =
                         OfferedPsks::parse(&mut ParseBuffer::new(extension.extension_data))
                     else {
-                        l0g::error!("Failed to parse PreSharedKey");
+                        error!("Failed to parse PreSharedKey");
                         return None;
                     };
 
                     if ret.pre_shared_key.is_some() {
-                        l0g::error!("PreSharedKey extension already parsed!");
+                        error!("PreSharedKey extension already parsed!");
                         return None;
                     }
 
@@ -162,7 +163,7 @@ impl<'a> ClientExtensions<'a> {
                     ret.pre_shared_key = Some(psk);
                 }
                 _ => {
-                    l0g::error!("Got more extensions than what's supported!");
+                    error!("Got more extensions than what's supported!");
                     return None;
                 }
             }
@@ -173,7 +174,8 @@ impl<'a> ClientExtensions<'a> {
 }
 
 /// Helper to parse server extensions.
-#[derive(Debug, Default)]
+#[derive_format_or_debug]
+#[derive(Default)]
 pub struct NewServerExtensions<'a> {
     pub selected_supported_version: Option<ServerSupportedVersion>,
     pub key_share: Option<KeyShareEntry<'a>>,
@@ -212,12 +214,12 @@ impl<'a> NewServerExtensions<'a> {
                     let Some(v) =
                         KeyShareEntry::parse(&mut ParseBuffer::new(extension.extension_data))
                     else {
-                        l0g::error!("Failed to parse PskKeyExchange");
+                        error!("Failed to parse PskKeyExchange");
                         return None;
                     };
 
                     if ret.key_share.is_some() {
-                        l0g::error!("Keyshare extension already parsed!");
+                        error!("Keyshare extension already parsed!");
                         return None;
                     }
 
@@ -227,12 +229,12 @@ impl<'a> NewServerExtensions<'a> {
                     let Some(v) = ServerSupportedVersion::parse(&mut ParseBuffer::new(
                         extension.extension_data,
                     )) else {
-                        l0g::error!("Failed to parse ServerSelectedVersion");
+                        error!("Failed to parse ServerSelectedVersion");
                         return None;
                     };
 
                     if ret.selected_supported_version.is_some() {
-                        l0g::error!("Keyshare extension already parsed!");
+                        error!("Keyshare extension already parsed!");
                         return None;
                     }
 
@@ -242,19 +244,19 @@ impl<'a> NewServerExtensions<'a> {
                     let Some(v) =
                         SelectedPsk::parse(&mut ParseBuffer::new(extension.extension_data))
                     else {
-                        l0g::error!("Failed to parse SelectedPsk");
+                        error!("Failed to parse SelectedPsk");
                         return None;
                     };
 
                     if ret.pre_shared_key.is_some() {
-                        l0g::error!("Keyshare extension already parsed!");
+                        error!("Keyshare extension already parsed!");
                         return None;
                     }
 
                     ret.pre_shared_key = Some(v);
                 }
                 _ => {
-                    l0g::error!("Got more extensions than what's supported!");
+                    error!("Got more extensions than what's supported!");
                     return None;
                 }
             }
@@ -280,8 +282,8 @@ fn encode_extension<R, F: FnOnce(&mut EncodingBuffer) -> R>(
     Ok(r)
 }
 
-#[derive(Clone, Debug, PartialOrd, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Clone, PartialOrd, PartialEq)]
 pub enum ServerExtensions<'a> {
     KeyShare(KeyShareEntry<'a>),
     SelectedSupportedVersion(ServerSupportedVersion),
@@ -319,7 +321,8 @@ impl<'a> ServerExtensions<'a> {
 }
 
 /// Helper to parse server extensions.
-#[derive(Debug, Default)]
+#[derive_format_or_debug]
+#[derive(Default)]
 pub struct ParseServerExtensions<'a> {
     pub selected_supported_version: Option<ServerSupportedVersion>,
     pub key_share: Option<KeyShareEntry<'a>>,
@@ -339,12 +342,12 @@ impl<'a> ParseServerExtensions<'a> {
                     let Some(v) =
                         KeyShareEntry::parse(&mut ParseBuffer::new(extension.extension_data))
                     else {
-                        l0g::error!("Failed to parse PskKeyExchange");
+                        error!("Failed to parse PskKeyExchange");
                         return None;
                     };
 
                     if ret.key_share.is_some() {
-                        l0g::error!("Keyshare extension already parsed!");
+                        error!("Keyshare extension already parsed!");
                         return None;
                     }
 
@@ -354,12 +357,12 @@ impl<'a> ParseServerExtensions<'a> {
                     let Some(v) = ServerSupportedVersion::parse(&mut ParseBuffer::new(
                         extension.extension_data,
                     )) else {
-                        l0g::error!("Failed to parse ServerSelectedVersion");
+                        error!("Failed to parse ServerSelectedVersion");
                         return None;
                     };
 
                     if ret.selected_supported_version.is_some() {
-                        l0g::error!("Keyshare extension already parsed!");
+                        error!("Keyshare extension already parsed!");
                         return None;
                     }
 
@@ -369,19 +372,19 @@ impl<'a> ParseServerExtensions<'a> {
                     let Some(v) =
                         SelectedPsk::parse(&mut ParseBuffer::new(extension.extension_data))
                     else {
-                        l0g::error!("Failed to parse SelectedPsk");
+                        error!("Failed to parse SelectedPsk");
                         return None;
                     };
 
                     if ret.pre_shared_key.is_some() {
-                        l0g::error!("Keyshare extension already parsed!");
+                        error!("Keyshare extension already parsed!");
                         return None;
                     }
 
                     ret.pre_shared_key = Some(v);
                 }
                 _ => {
-                    l0g::error!("Got more extensions than what's supported!");
+                    error!("Got more extensions than what's supported!");
                     return None;
                 }
             }
@@ -392,8 +395,8 @@ impl<'a> ParseServerExtensions<'a> {
 }
 
 /// Pre-Shared Key Exchange Modes.
-#[derive(Clone, Debug, PartialOrd, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Clone, PartialOrd, PartialEq)]
 pub struct PskKeyExchangeModes {
     pub ke_modes: PskKeyExchangeMode,
 }
@@ -420,8 +423,8 @@ impl PskKeyExchangeModes {
 }
 
 /// The `key_share` extension contains the endpoint’s cryptographic parameters.
-#[derive(Clone, Debug, PartialOrd, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Clone, PartialOrd, PartialEq)]
 pub struct KeyShareEntry<'a> {
     pub group: NamedGroup,
     pub opaque: &'a [u8],
@@ -448,7 +451,10 @@ impl<'a> KeyShareEntry<'a> {
         // This can be a list of supported keyshares in the future.
         let expected_size = key_length + 2 + 2;
         if expected_size != size {
-            l0g::error!("The keyshare size does not match only one key, expected {size} got {expected_size}");
+            error!(
+                "The keyshare size does not match only one key, expected {} got {}",
+                size, expected_size
+            );
             return None;
         }
 
@@ -459,8 +465,8 @@ impl<'a> KeyShareEntry<'a> {
 }
 
 /// The supported_versions payload.
-#[derive(Clone, Debug, PartialOrd, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Clone, PartialOrd, PartialEq)]
 pub struct ClientSupportedVersions {
     pub version: DtlsVersions,
 }
@@ -488,8 +494,8 @@ impl ClientSupportedVersions {
 }
 
 /// The supported_versions payload, the one selected by the server.
-#[derive(Clone, Debug, PartialOrd, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Clone, PartialOrd, PartialEq)]
 pub struct ServerSupportedVersion {
     pub version: DtlsVersions,
 }
@@ -510,8 +516,8 @@ impl ServerSupportedVersion {
 }
 
 /// The pre-shared keys the client can offer to use.
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Clone, PartialEq)]
 pub struct OfferedPsks<'a> {
     /// List of identities that can be used. Ticket age is set to 0.
     pub identities: EncodeOrParse<&'a [Psk<'a>], PskIter<'a>>,
@@ -565,14 +571,15 @@ impl<'a> OfferedPsks<'a> {
 }
 
 /// An offered pre-shared key that can be parsed.
-#[derive(Debug)]
+#[derive_format_or_debug]
 pub struct OfferedPreSharedKey<'a> {
     pub identity: &'a [u8],
     pub binder: &'a [u8],
 }
 
 /// This iterator gives an identity and its associated binder for each iteration.
-#[derive(Clone, Debug, PartialEq)]
+#[derive_format_or_debug]
+#[derive(Clone, PartialEq)]
 pub struct PskIter<'a> {
     /// The entire identities slice, including size and length headers.
     identities: ParseBuffer<'a>,
@@ -657,7 +664,6 @@ impl<'a> PskIter<'a> {
 
 /// Pre-shared key entry.
 #[derive(Clone, PartialOrd, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Psk<'a> {
     /// A label for the key. For instance, a ticket (as defined in Appendix B.3.4) or a label
     /// for a pre-shared key established externally.
@@ -672,6 +678,17 @@ impl<'a> core::fmt::Debug for Psk<'a> {
             .field("identity", &self.identity)
             .field("key", &"REDACTED")
             .finish()
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<'a> defmt::Format for Psk<'a> {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(
+            f,
+            "Psk {{ identity: {:x}, psk: <REDACTED> }}",
+            self.identity
+        )
     }
 }
 
@@ -690,8 +707,8 @@ impl<'a> Psk<'a> {
 }
 
 /// The pre-shared keys the server has selected.
-#[derive(Clone, Debug, PartialOrd, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Clone, PartialOrd, PartialEq)]
 pub struct SelectedPsk {
     /// List of identities that can be used. Ticket age is set to 0.
     pub selected_identity: u16,
@@ -713,8 +730,8 @@ impl SelectedPsk {
 
 /// Heartbeat mode.
 #[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialOrd, PartialEq, TryFromPrimitive)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialOrd, PartialEq, TryFromPrimitive)]
 pub enum HeartbeatMode {
     PeerAllowedToSend = 1,
     PeerNotAllowedToSend = 2,
@@ -722,9 +739,8 @@ pub enum HeartbeatMode {
 
 /// Pre-Shared Key Exchange Modes (RFC 8446, 4.2.9)
 #[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialOrd, PartialEq, TryFromPrimitive)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[allow(unused)]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialOrd, PartialEq, TryFromPrimitive)]
 pub enum PskKeyExchangeMode {
     ///  PSK-only key establishment. In this mode, the server MUST NOT supply a `key_share` value.
     PskKe = 0,
@@ -735,8 +751,8 @@ pub enum PskKeyExchangeMode {
 
 /// Named groups which the client supports for key exchange.
 #[repr(u16)]
-#[derive(Copy, Clone, Debug, PartialOrd, PartialEq, TryFromPrimitive)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialOrd, PartialEq, TryFromPrimitive)]
 #[allow(unused)]
 pub enum NamedGroup {
     // Elliptic Curve Groups (ECDHE)
@@ -755,10 +771,9 @@ pub enum NamedGroup {
 }
 
 /// TLS ExtensionType Values registry.
-#[derive(Copy, Clone, Debug, PartialOrd, PartialEq, TryFromPrimitive)]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialOrd, PartialEq, TryFromPrimitive)]
 #[repr(u8)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[allow(unused)]
 pub enum ExtensionType {
     ServerName = 0,
     MaxFragmentLength = 1,

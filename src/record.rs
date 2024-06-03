@@ -14,13 +14,14 @@ use crate::{
     key_schedule::KeySchedule,
 };
 use core::ops::Range;
+use defmt_or_log::{debug, derive_format_or_debug, error, trace};
 use digest::{Digest, OutputSizeUser};
 use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::PublicKey;
 
-#[derive(Copy, Clone, Debug, PartialOrd, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialOrd, PartialEq)]
 pub enum Encryption {
     Enabled,
     Disabled,
@@ -50,7 +51,8 @@ impl rand::RngCore for NoRandom {
 }
 
 /// Helper when something needs to encode or parse something differently.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialEq)]
 pub enum EncodeOrParse<E, P> {
     /// The encoding branch.
     Encode(E),
@@ -59,14 +61,13 @@ pub enum EncodeOrParse<E, P> {
 }
 
 /// A unified header.
-#[derive(Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
 pub struct UnifiedHeader<'a> {
     data: &'a mut [u8],
 }
 
 /// An ACK message.
-#[derive(Debug)]
+#[derive_format_or_debug]
 pub struct Ack<'a> {
     pub record_numbers: EncodeOrParse<&'a [RecordNumber], RecordNumberIter<'a>>,
 }
@@ -75,7 +76,7 @@ impl<'a> Ack<'a> {
     /// Encode an ACK.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
         let EncodeOrParse::Encode(record_numbers) = &self.record_numbers else {
-            l0g::error!("ACK: Expected encode, got parse");
+            error!("ACK: Expected encode, got parse");
             return Err(());
         };
 
@@ -100,7 +101,8 @@ impl<'a> Ack<'a> {
 }
 
 /// Record number.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive_format_or_debug]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RecordNumber {
     pub epoch: u64,
     pub sequence_number: u64,
@@ -126,7 +128,8 @@ impl RecordNumber {
 }
 
 /// This iterator gives a `RecordNumber` for each iteration.
-#[derive(Clone, Debug, PartialEq)]
+#[derive_format_or_debug]
+#[derive(Clone, PartialEq)]
 pub struct RecordNumberIter<'a> {
     /// The record numbers.
     record_numbers: ParseBuffer<'a>,
@@ -204,7 +207,7 @@ impl<'a> UnifiedHeader<'a> {
 }
 
 /// Holds positions of key positions in the payload data. Used for transcript hashing.
-#[derive(Debug)]
+#[derive_format_or_debug]
 pub struct RecordPayloadPositions {
     pub start: usize,
     pub binders: Option<usize>,
@@ -249,8 +252,7 @@ impl RecordPayloadPositions {
 }
 
 /// Supported client records.
-#[derive(Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
 pub enum ClientRecord<'a> {
     Handshake(ClientHandshake<'a>, Encryption),
     Alert(/* Alert, */ (), Encryption),
@@ -261,7 +263,7 @@ pub enum ClientRecord<'a> {
 
 impl<'a> ClientRecord<'a> {
     /// Create a client hello handshake.
-    pub async fn encode_client_hello<CipherSuite: DtlsCipherSuite, Rng: RngCore + CryptoRng>(
+    pub async fn encode_client_hello<CipherSuite, Rng>(
         buf: &mut EncodingBuffer<'_>,
         config: &'a ClientConfig<'a>,
         public_key: &PublicKey,
@@ -270,6 +272,7 @@ impl<'a> ClientRecord<'a> {
     ) -> Result<RecordPayloadPositions, ()>
     where
         Rng: RngCore + CryptoRng,
+        CipherSuite: DtlsCipherSuite,
     {
         let identities = &[config.psk.clone()];
 
@@ -301,7 +304,7 @@ impl<'a> ClientRecord<'a> {
             },
         };
 
-        l0g::debug!("Sending client hello: {:02x?}", client_hello);
+        debug!("Sending client hello: {:?}", client_hello);
 
         ClientRecord::Handshake(
             ClientHandshake::ClientHello(client_hello),
@@ -312,16 +315,19 @@ impl<'a> ClientRecord<'a> {
     }
 
     /// Create a client's finished message.
-    pub async fn encode_finished<CipherSuite: DtlsCipherSuite>(
+    pub async fn encode_finished<CipherSuite>(
         buf: &mut EncodingBuffer<'_>,
         key_schedule: &mut KeySchedule<CipherSuite, false>,
         transcript_hash: &'a [u8],
-    ) -> Result<(), ()> {
+    ) -> Result<(), ()>
+    where
+        CipherSuite: DtlsCipherSuite,
+    {
         let finished = Finished {
             verify: transcript_hash,
         };
 
-        l0g::debug!("Sending client finished: {finished:02x?}");
+        debug!("Sending client finished: {:?}", finished);
 
         ClientRecord::Handshake(
             ClientHandshake::ClientFinished(finished),
@@ -337,12 +343,15 @@ impl<'a> ClientRecord<'a> {
         buf: &mut EncodingBuffer<'_>,
         key_schedule: &mut KeySchedule<CipherSuite, false>,
         record_numbers: &'a [RecordNumber],
-    ) -> Result<(), ()> {
+    ) -> Result<(), ()>
+    where
+        CipherSuite: DtlsCipherSuite,
+    {
         let ack = Ack {
             record_numbers: EncodeOrParse::Encode(record_numbers),
         };
 
-        l0g::debug!("Sending client ACK: {ack:?}");
+        debug!("Sending client ACK: {:?}", ack);
 
         ClientRecord::Ack(ack, Encryption::Enabled)
             .encode(buf, key_schedule)
@@ -412,7 +421,7 @@ impl<'a> ClientRecord<'a> {
         .await;
 
         if let Some(out) = &r {
-            l0g::trace!("Parsed {out:?}");
+            trace!("Parsed {:?}", out);
         }
 
         r
@@ -553,8 +562,7 @@ impl GenericCipher for NoCipher {
     }
 }
 
-#[derive(Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
 pub struct CipherArguments<'a> {
     /// The header of the ciphertext.
     pub unified_hdr: UnifiedHeader<'a>,
@@ -563,8 +571,7 @@ pub struct CipherArguments<'a> {
 }
 
 /// Supported client records.
-#[derive(Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
 pub enum ServerRecord<'a> {
     Handshake(ServerHandshake<'a>, Encryption),
     Alert(/* Alert, */ (), Encryption),
@@ -603,7 +610,7 @@ impl<'a> ServerRecord<'a> {
             },
         };
 
-        l0g::debug!("Sending server hello: {server_hello:02x?}");
+        debug!("Sending server hello: {:?}", server_hello);
 
         ServerRecord::Handshake(
             ServerHandshake::ServerHello(server_hello),
@@ -625,7 +632,7 @@ impl<'a> ServerRecord<'a> {
             Encryption::Enabled,
         );
 
-        l0g::debug!("Sending server finished: {finished:02x?}");
+        debug!("Sending server finished: {:?}", finished);
 
         finished
             .encode(buf, Some(transcript_hasher), key_schedule)
@@ -642,7 +649,7 @@ impl<'a> ServerRecord<'a> {
             record_numbers: EncodeOrParse::Encode(record_numbers),
         };
 
-        l0g::debug!("Sending server ACK: {ack:?}");
+        debug!("Sending server ACK: {:?}", ack);
 
         ServerRecord::Ack(ack, Encryption::Enabled)
             .encode::<NoHasher>(buf, None, key_schedule)
@@ -742,7 +749,7 @@ impl<'a> ServerRecord<'a> {
         .await;
 
         if let Some(out) = &r {
-            l0g::trace!("Parsed {out:?}");
+            trace!("Parsed {:?}", out);
         }
 
         r.map(|s| s.0)
@@ -776,8 +783,11 @@ fn to_header_and_payload_with_tag(
     plaintext_position: Range<usize>,
     tag_position: Range<usize>,
 ) -> (&mut [u8], &mut [u8]) {
-    l0g::trace!(
-        "hp: {header_position:?}, pp: {plaintext_position:?}, tp: {tag_position:?}, bl: {}",
+    trace!(
+        "hp: {:?}, pp: {:?}, tp: {:?}, bl: {}",
+        header_position,
+        plaintext_position,
+        tag_position,
         buf.len()
     );
 
@@ -826,7 +836,7 @@ pub type ProtocolVersion = [u8; 2];
 pub const LEGACY_DTLS_VERSION: ProtocolVersion = [254, 253];
 
 /// Helper to parse DTLS headers.
-#[derive(Debug)]
+#[derive_format_or_debug]
 pub enum DTlsHeader<'a> {
     Plaintext(DTlsPlaintextHeader),
     Ciphertext(DTlsCiphertextHeader<'a>),
@@ -848,7 +858,8 @@ impl<'a> DTlsHeader<'a> {
 }
 
 /// DTls 1.3 plaintext header.
-#[derive(Debug, PartialEq, Eq)]
+#[derive_format_or_debug]
+#[derive(PartialEq, Eq)]
 pub struct DTlsPlaintextHeader {
     pub type_: ContentType,
     pub epoch: u16,
@@ -897,8 +908,8 @@ impl DTlsPlaintextHeader {
 }
 
 /// DTlsCiphertext unified header.
-#[derive(Copy, Clone, Debug, PartialOrd, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialOrd, PartialEq)]
 pub struct DTlsCiphertextHeader<'a> {
     /// The shortened 2-bit epoch number of this record.
     // TODO: Make epoc only representable as 2 bits.
@@ -982,14 +993,14 @@ impl<'a> DTlsCiphertextHeader<'a> {
 
         // Check the header bits that this is actually a ciphertext.
         if header >> 5 != 0b001 {
-            l0g::error!("Not a ciphertext, header = {header:02x}");
+            error!("Not a ciphertext, header = {:x}", header);
             return None;
         }
 
         let epoch = header & 0b11;
         let connection_id = if (header >> 4) & 1 != 0 {
             // TODO: No support for CID for now.
-            l0g::error!("Ciphertext specified CID, we don't support that");
+            error!("Ciphertext specified CID, we don't support that");
             return None;
         } else {
             None
@@ -1021,7 +1032,7 @@ impl<'a> DTlsCiphertextHeader<'a> {
 // } DTLSInnerPlaintext;
 
 /// The payload within the `encrypted_record` in a DTLSCiphertext.
-#[derive(Debug)]
+#[derive_format_or_debug]
 pub struct DtlsInnerPlaintext<'a> {
     pub content: &'a [u8], // Only filled on decode.
     pub type_: ContentType,
@@ -1075,8 +1086,8 @@ impl<'a> DtlsInnerPlaintext<'a> {
 }
 
 /// The two types of sequence numbers supported by the DTls ciphertext unified header.
-#[derive(Copy, Clone, Debug, PartialOrd, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialOrd, PartialEq)]
 pub enum CiphertextSequenceNumber {
     /// Short single byte sequence number.
     Short(u8),
@@ -1109,8 +1120,8 @@ impl From<CiphertextSequenceNumber> for u64 {
 
 /// TLS content type. RFC 9147 - Appendix A.1
 #[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialOrd, PartialEq, Eq, TryFromPrimitive)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialOrd, PartialEq, Eq, TryFromPrimitive)]
 pub enum ContentType {
     ChangeCipherSpec = 20,
     Alert = 21,
@@ -1176,8 +1187,9 @@ where
             let pb = &mut ParseBuffer::new(buf);
             let header = DTlsCiphertextHeader::parse(pb)?;
             let header_length = buf.len() - pb.len();
-            l0g::trace!(
-                "ciphertext header len = {header_length}, payload length = {:?}",
+            trace!(
+                "ciphertext header len = {}, payload length = {:?}",
+                header_length,
                 header.length
             );
 
@@ -1216,7 +1228,7 @@ where
         let inner_plaintext =
             DtlsInnerPlaintext::parse(&mut ParseBuffer::new(payload_without_tag))?;
 
-        l0g::trace!("Parsed plaintext: {inner_plaintext:02x?}");
+        trace!("Parsed plaintext: {:?}", inner_plaintext);
 
         let ret = parse_content(
             inner_plaintext.type_,
@@ -1231,8 +1243,9 @@ where
             let pb = &mut ParseBuffer::new(buf);
             let header = DTlsPlaintextHeader::parse(pb)?;
             let header_length = buf.len() - pb.len();
-            l0g::trace!(
-                "plaintext header len = {header_length}, payload length = {}",
+            trace!(
+                "plaintext header len = {}, payload length = {}",
+                header_length,
                 header.length
             );
 
@@ -1314,7 +1327,7 @@ async fn encode_ciphertext<'buf, Ret>(
     }
     .encode(buf)?;
 
-    l0g::trace!("encoded header = {:02x?}", buf);
+    trace!("encoded header = {:?}", buf);
 
     // ------ Start record
 
@@ -1339,7 +1352,11 @@ async fn encode_ciphertext<'buf, Ret>(
     // Write the ciphertext length to the header.
     let ciphertext_length = buf.len() - content_start;
     if let Some(length_allocation) = length_allocation {
-        l0g::trace!("ciphertext length: {ciphertext_length}, {ciphertext_length:02x}, {length_allocation:?}");
+        trace!(
+            "ciphertext length: {}, {:?}",
+            ciphertext_length,
+            length_allocation
+        );
         length_allocation.set(buf, ciphertext_length as u16);
     }
 
@@ -1360,7 +1377,7 @@ async fn encode_ciphertext<'buf, Ret>(
     }
 
     // ------ Finish record
-    l0g::trace!("encoded record = {:02x?}", buf);
+    trace!("encoded record = {:?}", buf);
 
     Ok(r)
 }

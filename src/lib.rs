@@ -13,6 +13,8 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(async_fn_in_trait)]
 
+use defmt_or_log::{derive_format_or_debug, FormatOrDebug};
+
 pub(crate) mod buffer;
 pub(crate) mod cipher_suites;
 pub(crate) mod handshake;
@@ -22,9 +24,10 @@ pub(crate) mod record;
 
 pub mod client_config {
     use crate::handshake::extensions::Psk;
+    use defmt_or_log::derive_format_or_debug;
 
     /// Client configuration.
-    #[derive(Debug)]
+    #[derive_format_or_debug]
     pub struct ClientConfig<'a> {
         /// Preshared key.
         /// TODO: Support a list of PSKs. Needs work in how to calculate binders and track all the
@@ -34,7 +37,10 @@ pub mod client_config {
 }
 
 pub mod server_config {
+    use defmt_or_log::{derive_format_or_debug, maybe_derive_format};
+
     /// Pre-shared key identity.
+    #[maybe_derive_format]
     #[derive(PartialEq, Eq, Hash)]
     pub struct Identity<'a>(&'a [u8]);
 
@@ -69,6 +75,7 @@ pub mod server_config {
     }
 
     /// Pre-shared key value.
+    #[derive_format_or_debug]
     pub struct Key<'a>(&'a [u8]);
 
     impl<'a, T> From<&'a T> for Key<'a>
@@ -100,7 +107,8 @@ pub mod server_config {
 // 1. Record layer (fragmentation and such)
 // 2. The payload (Handshake, ChangeCipherSpec, Alert, ApplicationData)
 
-#[derive(Debug, Copy, Clone)]
+#[derive_format_or_debug]
+#[derive(Copy, Clone)]
 pub enum Error<D: Endpoint> {
     /// The backing buffer ran out of space.
     InsufficientSpace,
@@ -123,16 +131,16 @@ pub enum Error<D: Endpoint> {
 }
 
 // TODO: Make this not hard-implemented.
-impl<D> defmt::Format for Error<D>
-where
-    D: Endpoint,
-    <D as Endpoint>::SendError: defmt::Format,
-    <D as Endpoint>::ReceiveError: defmt::Format,
-{
-    fn format(&self, fmt: defmt::Formatter) {
-        defmt::write!(fmt, "{}", self);
-    }
-}
+// impl<D> defmt::Format for Error<D>
+// where
+//     D: Endpoint,
+//     <D as Endpoint>::SendError: defmt::Format,
+//     <D as Endpoint>::ReceiveError: defmt::Format,
+// {
+//     fn format(&self, fmt: defmt::Formatter) {
+//         defmt::write!(fmt, "{}", self);
+//     }
+// }
 
 /// Datagram trait, send and receives datagrams from/to a single endpoint.
 ///
@@ -140,11 +148,11 @@ where
 /// sender/receiver pair which splits the incoming packets based on IP or similar.
 ///
 /// The debug implementation should indicate the identifier for this endpoint.
-pub trait Endpoint: core::fmt::Debug {
+pub trait Endpoint: FormatOrDebug {
     /// Error type for sending.
-    type SendError;
+    type SendError: FormatOrDebug;
     /// Error type for receiving.
-    type ReceiveError;
+    type ReceiveError: FormatOrDebug;
 
     /// Send a complete datagram.
     async fn send(&self, buf: &[u8]) -> Result<(), Self::SendError>;
@@ -163,14 +171,17 @@ pub mod client {
         record::{ClientRecord, EncodeOrParse, GenericCipher, ServerRecord},
         Endpoint, Error,
     };
-    use chacha20poly1305::{AeadCore, KeySizeUser};
+    use defmt_or_log::{debug, error, info, trace, FormatOrDebug};
     use digest::Digest;
     use rand_core::{CryptoRng, RngCore};
     use x25519_dalek::{EphemeralSecret, PublicKey};
 
     // TODO: How to select between server and client? Typestate, flag or two separate structs?
     /// A DTLS 1.3 connection.
-    pub struct ClientConnection<Socket, CipherSuite: DtlsCipherSuite> {
+    pub struct ClientConnection<Socket, CipherSuite>
+    where
+        CipherSuite: DtlsCipherSuite,
+    {
         /// Sender/receiver of data.
         socket: Socket,
         /// TODO: Keys for client->server and server->client. Also called "key schedule".
@@ -180,7 +191,7 @@ pub mod client {
     impl<Socket, CipherSuite> ClientConnection<Socket, CipherSuite>
     where
         Socket: Endpoint,
-        CipherSuite: DtlsCipherSuite + core::fmt::Debug,
+        CipherSuite: DtlsCipherSuite + FormatOrDebug,
     {
         /// Open a DTLS 1.3 client connection.
         /// This returns an active connection after handshake is completed.
@@ -195,9 +206,6 @@ pub mod client {
         ) -> Result<Self, Error<Socket>>
         where
             Rng: RngCore + CryptoRng,
-            <CipherSuite as DtlsCipherSuite>::Hash: core::fmt::Debug,
-            <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize: core::fmt::Debug,
-            <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize: core::fmt::Debug,
         {
             let mut key_schedule = KeySchedule::new_client(cipher);
             let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
@@ -240,8 +248,8 @@ pub mod client {
                     transcript_hasher.update(buf);
                 }
 
-                l0g::trace!(
-                    "Client transcript after client hello: {:02x?}",
+                trace!(
+                    "Client transcript after client hello: {:?}",
                     transcript_hasher.clone().finalize()
                 );
 
@@ -251,7 +259,7 @@ pub mod client {
             // Wait for response (ServerHello and Finished).
             {
                 let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
-                l0g::trace!("Got datagram!");
+                trace!("Got datagram!");
 
                 // Parse and validate ServerHello.
                 // let mut parse_buffer = ParseBufferMut::new(resp);
@@ -272,8 +280,8 @@ pub mod client {
                             return Err(Error::InvalidServerHello);
                         };
 
-                    l0g::trace!(
-                        "Client transcript after server hello: {:02x?}",
+                    trace!(
+                        "Client transcript after server hello: {:?}",
                         transcript_hasher.clone().finalize()
                     );
 
@@ -317,11 +325,11 @@ pub mod client {
                 };
 
                 if expected_verify.as_ref() != finished.verify {
-                    l0g::error!("Server finished does not match transcript");
+                    error!("Server finished does not match transcript");
                     return Err(Error::InvalidServerFinished);
                 }
 
-                l0g::debug!("Server finished MATCHES expected transcript");
+                debug!("Server finished MATCHES expected transcript");
             }
 
             // Send finished.
@@ -356,13 +364,13 @@ pub mod client {
                     return Err(Error::InvalidServerFinished);
                 };
 
-                l0g::debug!("Got server ACK: {ack:?}");
+                debug!("Got server ACK: {:?}", ack);
                 let EncodeOrParse::Parse(record_numbers) = ack.record_numbers else {
                     panic!("ACK: Expected parse, got encode");
                 };
 
                 if record_numbers.is_empty() {
-                    l0g::error!("There was no record number in the handshake ACK");
+                    error!("There was no record number in the handshake ACK");
                     return Err(Error::InvalidServerAck);
                 }
 
@@ -375,7 +383,7 @@ pub mod client {
                 }
             }
 
-            l0g::info!("New client connection created for {socket:?}");
+            info!("New client connection created for {:?}", socket);
 
             Ok(ClientConnection {
                 socket,
@@ -402,6 +410,7 @@ pub mod server {
         server_config::{Identity, Key, ServerConfig},
         Endpoint, Error,
     };
+    use defmt_or_log::{debug, error, info, trace};
     use digest::Digest;
     use heapless::Vec as HVec;
     use sha2::Sha256;
@@ -436,7 +445,7 @@ pub mod server {
             // TODO: If any part fails with error, make sure to send the correct ALERT.
 
             let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
-            l0g::trace!("Got datagram!");
+            trace!("Got datagram!");
 
             let (client_hello, positions, buffer_that_was_parsed) = {
                 let record = ClientRecord::parse::<NoCipher>(&mut resp, None)
@@ -490,8 +499,8 @@ pub mod server {
                     binders_transcript_hash
                 };
 
-                l0g::trace!(
-                    "Server transcript after client hello: {:02x?}",
+                trace!(
+                    "Server transcript after client hello: {:?}",
                     transcript_hasher.clone().finalize()
                 );
 
@@ -516,7 +525,7 @@ pub mod server {
 
                 // TODO: Can we move this up somehow?
                 if !resp.is_empty() {
-                    l0g::error!("More data after client hello");
+                    error!("More data after client hello");
                     return Err(Error::InvalidClientHello);
                 }
 
@@ -535,8 +544,8 @@ pub mod server {
                 .await
                 .map_err(|_| Error::InsufficientSpace)?;
 
-                l0g::trace!(
-                    "Server transcript after server hello: {:02x?}",
+                trace!(
+                    "Server transcript after server hello: {:?}",
                     transcript_hasher.clone().finalize()
                 );
 
@@ -583,11 +592,11 @@ pub mod server {
                 };
 
                 if expected_verify != finished.verify {
-                    l0g::error!("Client finished does not match transcript");
+                    error!("Client finished does not match transcript");
                     return Err(Error::InvalidServerFinished);
                 }
 
-                l0g::debug!("Client finished MATCHES expected transcript");
+                debug!("Client finished MATCHES expected transcript");
             }
 
             // Update key schedule to Master Secret.
@@ -614,7 +623,7 @@ pub mod server {
             }
 
             // Handshake complete!
-            l0g::info!("New server connection created for {socket:?}");
+            info!("New server connection created for {:?}", socket);
 
             Ok(ServerConnection {
                 socket,
@@ -650,7 +659,7 @@ pub mod server {
                     ChaCha20Poly1305Cipher::default(),
                 )),
                 _ => {
-                    l0g::trace!("Detected unsupported cipher suite {cipher_suites:04x}");
+                    trace!("Detected unsupported cipher suite {:?}", cipher_suites);
                     return None;
                 }
             })
@@ -802,6 +811,7 @@ mod test {
         server::ServerConnection,
         server_config::ServerConfig,
     };
+    use defmt_or_log::trace;
     use rand::{rngs::StdRng, SeedableRng};
     use tokio::sync::{
         mpsc::{channel, Receiver, Sender},
@@ -826,7 +836,7 @@ mod test {
 
         async fn send(&self, buf: &[u8]) -> Result<(), Self::SendError> {
             let r = self.tx.send(buf.into()).await;
-            l0g::trace!(
+            trace!(
                 "{} send ({}) (r = {r:?}): {:02x?}",
                 self.who,
                 buf.len(),

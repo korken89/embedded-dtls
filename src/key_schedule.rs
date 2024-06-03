@@ -22,6 +22,7 @@ use crate::{
 };
 use aead::Buffer;
 use chacha20poly1305::{AeadCore, KeySizeUser};
+use defmt_or_log::{debug, derive_format_or_debug, trace};
 use digest::{
     core_api::BlockSizeUser,
     generic_array::{ArrayLength, GenericArray},
@@ -45,6 +46,7 @@ struct EarlySecret<Hash: Digest + OutputSizeUser + BlockSizeUser + Clone> {
 }
 
 /// A pair of traffic secrets.
+#[derive_format_or_debug]
 #[derive(Zeroize)]
 pub struct TrafficSecrets<Cipher>
 where
@@ -58,28 +60,42 @@ where
         TrafficKeyingMaterial<<Cipher as KeySizeUser>::KeySize, <Cipher as AeadCore>::NonceSize>,
 }
 
-impl<Cipher> core::fmt::Debug for TrafficSecrets<Cipher>
-where
-    Cipher: DtlsCipher + KeySizeUser,
-    <Cipher as KeySizeUser>::KeySize: core::fmt::Debug,
-    <Cipher as AeadCore>::NonceSize: core::fmt::Debug,
-{
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "TrafficSecrets {{ client: {:02x?}, server: {:02x?} }}",
-            self.client, self.server
-        )
-    }
-}
-
 /// A single direction keying material. Holds the symmetric encryption key and the initialization
 /// vector.
-#[derive(Zeroize, Debug)]
+#[derive(Zeroize)]
 pub struct TrafficKeyingMaterial<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>> {
     pub write_key: GenericArray<u8, KeySize>,
     pub write_iv: GenericArray<u8, IvSize>,
     pub sn_key: GenericArray<u8, KeySize>,
+}
+
+impl<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>> core::fmt::Debug
+    for TrafficKeyingMaterial<KeySize, IvSize>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "TrafficKeyingMaterial {{ write_key: {:02x?}, write_iv: {:02x?}, sn_key: {:02x?} }}",
+            self.write_key.as_slice(),
+            self.write_iv.as_slice(),
+            self.sn_key.as_slice(),
+        )
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>> defmt::Format
+    for TrafficKeyingMaterial<KeySize, IvSize>
+{
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(
+            f,
+            "TrafficKeyingMaterial {{ write_key: {:x}, write_iv: {:x}, sn_key: {:x} }}",
+            self.write_key.as_slice(),
+            self.write_iv.as_slice(),
+            self.sn_key.as_slice(),
+        )
+    }
 }
 
 impl<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>> TrafficKeyingMaterial<KeySize, IvSize> {
@@ -108,7 +124,17 @@ pub struct Iv<N: ArrayLength<u8>> {
     key: GenericArray<u8, N>,
 }
 
-struct Secret<CipherSuite: DtlsCipherSuite> {
+#[cfg(feature = "defmt")]
+impl<N: ArrayLength<u8>> defmt::Format for Iv<N> {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(f, "Iv {{ key: {:x} }}", self.key.as_slice(),)
+    }
+}
+
+struct Secret<CipherSuite>
+where
+    CipherSuite: DtlsCipherSuite,
+{
     // TODO: This is not used as the `secret` is stored in the hkdf.
     // /// Extract secret.
     // secret: HashArray<D>,
@@ -120,7 +146,10 @@ struct Secret<CipherSuite: DtlsCipherSuite> {
     // server_handshake_traffic_secret: Key<D>,
 }
 
-enum KeyScheduleState<CipherSuite: DtlsCipherSuite, const IS_SERVER: bool> {
+enum KeyScheduleState<CipherSuite, const IS_SERVER: bool>
+where
+    CipherSuite: DtlsCipherSuite,
+{
     /// Not initialized.
     Uninitialized,
     /// Optional PSK initialization is done.
@@ -131,7 +160,10 @@ enum KeyScheduleState<CipherSuite: DtlsCipherSuite, const IS_SERVER: bool> {
     MasterSecret(Secret<CipherSuite>),
 }
 
-impl<CipherSuite: DtlsCipherSuite, const IS_SERVER: bool> KeyScheduleState<CipherSuite, IS_SERVER> {
+impl<CipherSuite: DtlsCipherSuite, const IS_SERVER: bool> KeyScheduleState<CipherSuite, IS_SERVER>
+where
+    CipherSuite: DtlsCipherSuite,
+{
     fn create_encryption_nonce(
         &self,
         record_number: u64,
@@ -223,7 +255,10 @@ impl<CipherSuite: DtlsCipherSuite, const IS_SERVER: bool> KeyScheduleState<Ciphe
 // Check the flow-chart in RFC8446 section 7.1, page 93 to see the entire flow.
 // This means that the HKDF needs to be tracked as continous state for the entire lifetime of the
 // connection.
-pub struct KeySchedule<CipherSuite: DtlsCipherSuite, const IS_SERVER: bool> {
+pub struct KeySchedule<CipherSuite, const IS_SERVER: bool>
+where
+    CipherSuite: DtlsCipherSuite,
+{
     keyschedule_state: KeyScheduleState<CipherSuite, IS_SERVER>,
     cipher: CipherSuite::Cipher,
     write_record_number: u64,
@@ -266,8 +301,6 @@ where
 impl<CipherSuite, const IS_SERVER: bool> KeySchedule<CipherSuite, IS_SERVER>
 where
     CipherSuite: DtlsCipherSuite,
-    <<CipherSuite as DtlsCipherSuite>::Cipher as AeadCore>::NonceSize: core::fmt::Debug,
-    <<CipherSuite as DtlsCipherSuite>::Cipher as KeySizeUser>::KeySize: core::fmt::Debug,
 {
     /// Check if the key schedule is uninitialized.
     pub fn is_uninitialized(&self) -> bool {
@@ -428,8 +461,10 @@ where
             ),
         }
 
-        l0g::trace!(
-            "Crate handshake secrets ecdhe {ecdhe_secret:02x?}, transcript {transcript:02x?}"
+        trace!(
+            "Crate handshake secrets ecdhe {:?}, transcript {:?}",
+            ecdhe_secret,
+            transcript
         );
 
         // Prepare the previous secret for use in the next stage.
@@ -688,7 +723,7 @@ where
         } = args;
 
         if payload_with_tag.len() < 16.max(self.tag_size()) {
-            l0g::debug!("Invalid record, too short");
+            debug!("Invalid record, too short");
             // Invalid record, 16 bytes minimum for record number max and tag size to make sure
             // there is a tag.
             return Err(aead::Error);
@@ -696,7 +731,7 @@ where
 
         // Check the epoch, early return if wrong.
         if ciphertext_header.epoch & 0b11 != self.epoch_number as u8 & 0b11 {
-            l0g::debug!("Wrong epoch");
+            debug!("Wrong epoch");
             return Err(aead::Error);
         }
 
@@ -717,15 +752,16 @@ where
             .await
             .is_err()
         {
-            l0g::debug!("Applying sequence number mask failed");
+            debug!("Applying sequence number mask failed");
         }
 
         let sequence_number = unified_hdr.sequence_number();
-        l0g::trace!("Got sequence number: {sequence_number:?}");
+        trace!("Got sequence number: {:?}", sequence_number);
         let estimated_read_record_number =
             find_closest_record_number(self.read_record_number, sequence_number);
-        l0g::trace!(
-            "Estimated read record number: {estimated_read_record_number:?} ({})",
+        trace!(
+            "Estimated read record number: {:?} ({})",
+            estimated_read_record_number,
             if IS_SERVER { "server" } else { "client" }
         );
 
@@ -744,7 +780,7 @@ where
             )
             .await?;
 
-        l0g::trace!("Decryption successful");
+        trace!("Decryption successful");
 
         // Decryption successful, store the read_record_number if it is larger.
         self.read_record_number = self.read_record_number.max(estimated_read_record_number);
@@ -760,13 +796,13 @@ where
     fn write_record_number(&self) -> u64 {
         let r = self.write_record_number;
 
-        l0g::trace!("using write record number: {}", r);
+        trace!("using write record number: {}", r);
         r
     }
 
     fn increment_write_record_number(&mut self) {
         self.write_record_number += 1;
-        l0g::trace!(
+        trace!(
             "incremented write record number to: {} ({})",
             self.write_record_number,
             if IS_SERVER { "server" } else { "client" }

@@ -9,7 +9,6 @@ edition = "2021"
 heapless = { version = "0.8.0", features = ["defmt-03"] }
 rand_core = { version = "0.6.4", default-features = false }
 rand = "0.8.5"
-defmt = "0.3.6"
 
 x25519-dalek = { version = "2.0.1", default-features = false, features = ["zeroize", "getrandom"] } # TODO: Replace with something that works on MCU and backend
 
@@ -19,11 +18,15 @@ sha2 = { version = "0.10", default-features = false }
 digest = { version = "0.10.7", default-features = false }
 typenum = { version = "1.17.0", default-features = false, features = ["no_std"] }
 hkdf = { version = "0.12.4", default-features = false }
-l0g = "1.0.0"
 zeroize = { version = "1.7.0", default-features = false, features = ["derive", "std"] }
 num_enum = { version = "0.7.2", default-features = false }
 aead = "0.5.2"
 chacha20 = "0.9.1"
+
+# l0g = "1.0.0"
+defmt-or-log = { version = "0.2.1", default-features = false }
+log = { version = "0.4", optional = true }
+defmt = { version = "0.3", optional = true }
 
 # p256-cortex-m4 = "0.1.0-alpha.6"
 # hkdf = { version = "0.12.4", default-features = false }
@@ -32,6 +35,8 @@ chacha20 = "0.9.1"
 
 [features]
 default = []
+defmt = ["dep:defmt", "defmt-or-log/defmt"]
+log = ["dep:log", "defmt-or-log/log"]
 
 # UNSAFE: This will print encryption keys, pre-shared keys and nonces in plaintext for debuging
 # purposes for built-in ciphers. NEVER have this feature enabled in production.

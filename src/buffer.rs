@@ -4,10 +4,12 @@ pub use parse_buffer::*;
 
 mod crypto_buffer {
     use aead::{Buffer, Error};
+    use defmt_or_log::derive_format_or_debug;
 
     /// Buffer for encrypting and decrypting records that implements `aead::Buffer`, so it works
     /// with existing AEAD traits.
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive_format_or_debug]
+    #[derive(PartialEq, Eq)]
     pub struct CryptoBuffer<'a> {
         data: &'a mut [u8],
         idx: usize,
@@ -53,11 +55,14 @@ mod crypto_buffer {
 }
 
 mod parse_buffer {
+    use defmt_or_log::derive_format_or_debug;
+
     use crate::integers::{U24, U48};
 
     /// Buffer for helping parsing of encrypted records until they are decrypted. After decryption
     /// the normal `ParseBuffer` takes over.
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive_format_or_debug]
+    #[derive(PartialEq, Eq)]
     pub struct ParseBufferMut<'a> {
         data: &'a mut [u8],
     }
@@ -95,7 +100,8 @@ mod parse_buffer {
     }
 
     /// Buffer for helping parsing of records.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive_format_or_debug]
+    #[derive(Clone, PartialEq, Eq)]
     pub struct ParseBuffer<'a> {
         data: &'a [u8],
     }
@@ -188,6 +194,7 @@ mod parse_buffer {
     mod test {
         use super::ParseBuffer;
         use crate::integers::{U24, U48};
+        use defmt_or_log::unwrap;
 
         #[test]
         fn pop() {
@@ -197,18 +204,20 @@ mod parse_buffer {
 
             let mut pb = ParseBuffer::new(data);
 
-            assert_eq!(pb.pop_u8().unwrap(), 0);
-            assert_eq!(pb.pop_u16_be().unwrap(), 0x0102);
-            assert_eq!(pb.pop_u24_be().unwrap(), U24::new(0x030405));
-            assert_eq!(pb.pop_u32_be().unwrap(), 0x06070809);
-            assert_eq!(pb.pop_u48_be().unwrap(), U48::new(0x0a0b0c0d0e0f));
-            assert_eq!(pb.pop_slice(3).unwrap(), &[16, 17, 18]);
+            assert_eq!(unwrap!(pb.pop_u8()), 0);
+            assert_eq!(unwrap!(pb.pop_u16_be()), 0x0102);
+            assert_eq!(unwrap!(pb.pop_u24_be()), U24::new(0x030405));
+            assert_eq!(unwrap!(pb.pop_u32_be()), 0x06070809);
+            assert_eq!(unwrap!(pb.pop_u48_be()), U48::new(0x0a0b0c0d0e0f));
+            assert_eq!(unwrap!(pb.pop_slice(3)), &[16, 17, 18]);
             assert_eq!(pb.pop_rest(), &[19, 20, 21]);
         }
     }
 }
 
 mod encoding_buffer {
+    use defmt_or_log::derive_format_or_debug;
+
     use crate::integers::{U24, U48};
     use core::{
         fmt,
@@ -392,7 +401,7 @@ mod encoding_buffer {
     }
 
     /// Handle to an allocated `u8` spot in a `Buffer`.
-    #[derive(Debug)]
+    #[derive_format_or_debug]
     #[must_use]
     pub struct AllocU8Handle {
         index: usize,
@@ -419,7 +428,7 @@ mod encoding_buffer {
     }
 
     /// Handle to an allocated `u16` spot in a `Buffer`.
-    #[derive(Debug)]
+    #[derive_format_or_debug]
     #[must_use]
     pub struct AllocU16Handle {
         index: usize,
@@ -446,7 +455,7 @@ mod encoding_buffer {
     }
 
     /// Handle to an allocated `u24` spot in a `Buffer`.
-    #[derive(Debug)]
+    #[derive_format_or_debug]
     #[must_use]
     pub struct AllocU24Handle {
         index: usize,
@@ -473,7 +482,7 @@ mod encoding_buffer {
     }
 
     /// Handle to an allocated `u48` spot in a `Buffer`.
-    #[derive(Debug)]
+    #[derive_format_or_debug]
     #[must_use]
     pub struct AllocU48Handle {
         index: usize,
@@ -500,7 +509,7 @@ mod encoding_buffer {
     }
 
     /// Handle to an allocated slice in a `Buffer`.
-    #[derive(Debug)]
+    #[derive_format_or_debug]
     #[must_use]
     pub struct AllocSliceHandle {
         index: usize,

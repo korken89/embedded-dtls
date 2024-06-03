@@ -1,5 +1,6 @@
 use aead::{AeadCore, AeadMutInPlace, KeyInit, KeySizeUser};
 use chacha20poly1305::{ChaCha20Poly1305, ChaChaPoly1305};
+use defmt_or_log::derive_format_or_debug;
 use digest::{
     core_api::BlockSizeUser, generic_array::GenericArray, Digest, FixedOutput, OutputSizeUser,
     Reset,
@@ -10,7 +11,8 @@ use crate::buffer::CryptoBuffer;
 
 /// Represents a TLS 1.3 cipher suite
 #[repr(u16)]
-#[derive(Copy, Clone, Debug, defmt::Format, num_enum::TryFromPrimitive)]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, num_enum::TryFromPrimitive)]
 pub enum CodePoint {
     // TlsAes128GcmSha256 = 0x1301,
     // TlsAes256GcmSha384 = 0x1302,
@@ -81,7 +83,7 @@ pub trait DtlsCipher: AeadCore {
 }
 
 /// Chacha cipher.
-#[derive(Debug)]
+#[derive_format_or_debug]
 pub struct DtlsEcdhePskWithChacha20Poly1305Sha256;
 
 impl DtlsCipherSuite for DtlsEcdhePskWithChacha20Poly1305Sha256 {
@@ -134,14 +136,14 @@ pub trait DtlsReKeyInPlace: KeySizeUser {
 impl DtlsReKeyInPlace for ChaCha20Poly1305Cipher {
     fn rekey_aead(&mut self, key: &aead::Key<Self>) {
         #[cfg(feature = "unsafe_debug_keys")]
-        l0g::debug!("New aead key: {key:02x?}");
+        defmt_or_log::debug!("New aead key: {:?}", key.as_slice());
         // The ChaCha20Poly1305 allows for creation from the key.
         self.aead = ChaCha20Poly1305::new(key);
     }
 
     fn rekey_mask(&mut self, key: &aead::Key<Self>) {
         #[cfg(feature = "unsafe_debug_keys")]
-        l0g::debug!("New mask key: {key:02x?}");
+        defmt_or_log::debug!("New mask key: {:?}", key.as_slice());
         // The ChaCha20 stream cipher does not allow for creation from the key, it also needs the
         // IV. The cipher is created on the fly in `apply_mask_for_record_number` instead where
         // the IV is available.
@@ -157,7 +159,7 @@ impl DtlsCipher for ChaCha20Poly1305Cipher {
         unified_hdr: &[u8],
     ) -> aead::Result<()> {
         #[cfg(feature = "unsafe_debug_keys")]
-        l0g::debug!("Encrypting with nonce: {nonce:02x?}");
+        defmt_or_log::debug!("Encrypting with nonce: {:?}", nonce.as_slice());
 
         self.aead
             .encrypt_in_place(nonce, unified_hdr, plaintext_with_tag)
@@ -170,7 +172,7 @@ impl DtlsCipher for ChaCha20Poly1305Cipher {
         unified_hdr: &[u8],
     ) -> aead::Result<()> {
         #[cfg(feature = "unsafe_debug_keys")]
-        l0g::debug!("Decrypting with nonce: {nonce:02x?}");
+        defmt_or_log::debug!("Decrypting with nonce: {:?}", nonce.as_slice());
 
         self.aead
             .decrypt_in_place(nonce, &unified_hdr, ciphertext_with_tag)
