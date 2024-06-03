@@ -128,7 +128,7 @@ pub mod server_config {
 // 2. The payload (Handshake, ChangeCipherSpec, Alert, ApplicationData)
 
 #[derive(Debug, Copy, Clone)]
-pub enum Error<D: Datagram> {
+pub enum Error<D: Endpoint> {
     /// The backing buffer ran out of space.
     InsufficientSpace,
     /// Failed to parse a message.
@@ -152,9 +152,9 @@ pub enum Error<D: Datagram> {
 // TODO: Make this not hard-implemented.
 impl<D> defmt::Format for Error<D>
 where
-    D: Datagram,
-    <D as Datagram>::SendError: defmt::Format,
-    <D as Datagram>::ReceiveError: defmt::Format,
+    D: Endpoint,
+    <D as Endpoint>::SendError: defmt::Format,
+    <D as Endpoint>::ReceiveError: defmt::Format,
 {
     fn format(&self, fmt: defmt::Formatter) {
         defmt::write!(fmt, "{}", self);
@@ -165,7 +165,9 @@ where
 ///
 /// This means on `std` that it cannot be implemented directly on a socket, but probably a
 /// sender/receiver pair which splits the incoming packets based on IP or similar.
-pub trait Datagram {
+///
+/// The debug implementation should indicate the identifier for this endpoint.
+pub trait Endpoint: core::fmt::Debug {
     /// Error type for sending.
     type SendError;
     /// Error type for receiving.
@@ -186,7 +188,7 @@ pub mod client {
         handshake::ServerHandshake,
         key_schedule::KeySchedule,
         record::{ClientRecord, EncodeOrParse, GenericCipher, ServerRecord},
-        Datagram, Error,
+        Endpoint, Error,
     };
     use chacha20poly1305::{AeadCore, KeySizeUser};
     use digest::Digest;
@@ -204,7 +206,7 @@ pub mod client {
 
     impl<Socket, CipherSuite> ClientConnection<Socket, CipherSuite>
     where
-        Socket: Datagram,
+        Socket: Endpoint,
         CipherSuite: DtlsCipherSuite + core::fmt::Debug,
     {
         /// Open a DTLS 1.3 client connection.
@@ -400,6 +402,8 @@ pub mod client {
                 }
             }
 
+            l0g::info!("New client connection created for {socket:?}");
+
             Ok(ClientConnection {
                 socket,
                 key_schedule,
@@ -423,7 +427,7 @@ pub mod server {
             NoCipher, RecordNumber, ServerRecord,
         },
         server_config::{Identity, Key, ServerConfig},
-        Datagram, Error,
+        Endpoint, Error,
     };
     use digest::Digest;
     use heapless::Vec as HVec;
@@ -445,7 +449,7 @@ pub mod server {
 
     impl<Socket> ServerConnection<Socket>
     where
-        Socket: Datagram,
+        Socket: Endpoint,
     {
         /// Open a DTLS 1.3 server connection.
         /// This returns an active connection after handshake is completed.
@@ -637,6 +641,7 @@ pub mod server {
             }
 
             // Handshake complete!
+            l0g::info!("New server connection created for {socket:?}");
 
             Ok(ServerConnection {
                 socket,
@@ -813,7 +818,7 @@ pub mod server {
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashMap, time::Duration};
+    use std::time::Duration;
 
     use super::*;
     use crate::{
@@ -830,14 +835,19 @@ mod test {
         Mutex,
     };
 
-    #[derive(Debug)]
     struct ChannelSocket {
         who: &'static str,
         rx: Mutex<Receiver<Vec<u8>>>,
         tx: Sender<Vec<u8>>,
     }
 
-    impl Datagram for ChannelSocket {
+    impl core::fmt::Debug for ChannelSocket {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Socket {{ who: {} }}", self.who)
+        }
+    }
+
+    impl Endpoint for ChannelSocket {
         type SendError = ();
         type ReceiveError = ();
 
