@@ -488,6 +488,7 @@ pub struct ServerHello<'a> {
     pub version: ProtocolVersion,
     pub legacy_session_id_echo: &'a [u8],
     pub cipher_suite_index: u16,
+    pub random: &'a [u8],
     pub extensions: NewServerExtensions<'a>,
 }
 
@@ -507,7 +508,7 @@ impl<'a> ServerHello<'a> {
         buf.extend_from_slice(&LEGACY_DTLS_VERSION)?;
 
         // Random.
-        buf.extend_from_slice(&rand::random::<Random>())?;
+        buf.extend_from_slice(&self.random)?;
 
         // Legacy Session ID echo.
         buf.push_u8(self.legacy_session_id_echo.len() as u8)?;
@@ -534,7 +535,7 @@ impl<'a> ServerHello<'a> {
 
     pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
         let version = buf.pop_u16_be()?.to_be_bytes();
-        let _random = buf.pop_slice(32)?;
+        let random = buf.pop_slice(32)?;
         let legacy_session_id_len = buf.pop_u8()?;
         let legacy_session_id_echo = buf.pop_slice(legacy_session_id_len as usize)?;
 
@@ -549,6 +550,7 @@ impl<'a> ServerHello<'a> {
             version,
             legacy_session_id_echo,
             cipher_suite_index,
+            random,
             extensions,
         })
     }

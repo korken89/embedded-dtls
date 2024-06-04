@@ -30,9 +30,9 @@ pub enum Encryption {
 #[allow(unused)]
 struct NoRandom {}
 
-impl rand::CryptoRng for NoRandom {}
+impl CryptoRng for NoRandom {}
 
-impl rand::RngCore for NoRandom {
+impl RngCore for NoRandom {
     fn next_u32(&mut self) -> u32 {
         unreachable!()
     }
@@ -45,7 +45,7 @@ impl rand::RngCore for NoRandom {
         unreachable!()
     }
 
-    fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), rand::Error> {
+    fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), rand_core::Error> {
         unreachable!()
     }
 }
@@ -304,7 +304,8 @@ impl<'a> ClientRecord<'a> {
             },
         };
 
-        debug!("Sending client hello: {:?}", client_hello);
+        debug!("Sending client hello");
+        trace!("{:?}", client_hello);
 
         ClientRecord::Handshake(
             ClientHandshake::ClientHello(client_hello),
@@ -327,7 +328,8 @@ impl<'a> ClientRecord<'a> {
             verify: transcript_hash,
         };
 
-        debug!("Sending client finished: {:?}", finished);
+        debug!("Sending client finished");
+        trace!("{:?}", finished);
 
         ClientRecord::Handshake(
             ClientHandshake::ClientFinished(finished),
@@ -351,7 +353,8 @@ impl<'a> ClientRecord<'a> {
             record_numbers: EncodeOrParse::Encode(record_numbers),
         };
 
-        debug!("Sending client ACK: {:?}", ack);
+        debug!("Sending client ACK");
+        trace!("{:?}", ack);
 
         ClientRecord::Ack(ack, Encryption::Enabled)
             .encode(buf, key_schedule)
@@ -582,20 +585,28 @@ pub enum ServerRecord<'a> {
 
 impl<'a> ServerRecord<'a> {
     /// Create a client hello handshake.
-    pub async fn encode_server_hello<'buf>(
+    pub async fn encode_server_hello<'buf, Rng>(
         legacy_session_id: &[u8],
         supported_version: DtlsVersions,
         public_key: PublicKey,
         selected_cipher_suite: u16,
         selected_psk_identity: u16,
+        rng: &mut Rng,
         key_schedule: &mut impl GenericCipher,
         transcript_hasher: &mut impl GenericHasher,
         buf: &'buf mut EncodingBuffer<'_>,
-    ) -> Result<(), ()> {
+    ) -> Result<(), ()>
+    where
+        Rng: RngCore + CryptoRng,
+    {
+        let mut random = Random::default();
+        rng.fill_bytes(&mut random);
+
         let server_hello = ServerHello {
             version: LEGACY_DTLS_VERSION,
             legacy_session_id_echo: &legacy_session_id,
             cipher_suite_index: selected_cipher_suite,
+            random: &random,
             extensions: NewServerExtensions {
                 selected_supported_version: Some(ServerSupportedVersion {
                     version: supported_version,
@@ -610,7 +621,8 @@ impl<'a> ServerRecord<'a> {
             },
         };
 
-        debug!("Sending server hello: {:?}", server_hello);
+        debug!("Sending server hello");
+        trace!("{:?}", server_hello);
 
         ServerRecord::Handshake(
             ServerHandshake::ServerHello(server_hello),
@@ -632,7 +644,8 @@ impl<'a> ServerRecord<'a> {
             Encryption::Enabled,
         );
 
-        debug!("Sending server finished: {:?}", finished);
+        debug!("Sending server finished");
+        trace!("{:?}", finished);
 
         finished
             .encode(buf, Some(transcript_hasher), key_schedule)
@@ -649,7 +662,8 @@ impl<'a> ServerRecord<'a> {
             record_numbers: EncodeOrParse::Encode(record_numbers),
         };
 
-        debug!("Sending server ACK: {:?}", ack);
+        debug!("Sending server ACK");
+        trace!("{:?}", ack);
 
         ServerRecord::Ack(ack, Encryption::Enabled)
             .encode::<NoHasher>(buf, None, key_schedule)

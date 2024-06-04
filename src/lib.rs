@@ -207,6 +207,8 @@ pub mod client {
         where
             Rng: RngCore + CryptoRng,
         {
+            info!("Starting handshake for client connection {:?}", socket);
+
             let mut key_schedule = KeySchedule::new_client(cipher);
             let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
 
@@ -364,7 +366,8 @@ pub mod client {
                     return Err(Error::InvalidServerFinished);
                 };
 
-                debug!("Got server ACK: {:?}", ack);
+                debug!("Got server ACK");
+                trace!("{:?}", ack);
                 let EncodeOrParse::Parse(record_numbers) = ack.record_numbers else {
                     panic!("ACK: Expected parse, got encode");
                 };
@@ -413,6 +416,7 @@ pub mod server {
     use defmt_or_log::{debug, error, info, trace};
     use digest::Digest;
     use heapless::Vec as HVec;
+    use rand_core::{CryptoRng, RngCore};
     use sha2::Sha256;
     use x25519_dalek::{EphemeralSecret, PublicKey};
 
@@ -437,12 +441,17 @@ pub mod server {
         /// This returns an active connection after handshake is completed.
         ///
         /// NOTE: This does not do timeout, it's up to the caller to give up.
-        pub async fn open_server(
+        pub async fn open_server<Rng>(
             socket: Socket,
             server_config: &ServerConfig<'_, '_>,
+            rng: &mut Rng,
             buf: &mut [u8],
-        ) -> Result<Self, Error<Socket>> {
+        ) -> Result<Self, Error<Socket>>
+        where
+            Rng: RngCore + CryptoRng,
+        {
             // TODO: If any part fails with error, make sure to send the correct ALERT.
+            info!("Starting handshake for server connection {:?}", socket);
 
             let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
             trace!("Got datagram!");
@@ -537,6 +546,7 @@ pub mod server {
                     our_public_key,
                     selected_cipher_suite as u16,
                     0,
+                    rng,
                     &mut key_schedule,
                     &mut transcript_hasher,
                     &mut enc_buf,
@@ -915,9 +925,10 @@ mod test {
             let server_config = ServerConfig { psk: &psk };
 
             let buf = &mut vec![0; 16 * 1024];
+            let rng = &mut rand::rngs::OsRng;
 
             let mut server_connection =
-                ServerConnection::open_server(server_socket, &server_config, buf)
+                ServerConnection::open_server(server_socket, &server_config, rng, buf)
                     .await
                     .unwrap();
 
