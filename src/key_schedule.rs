@@ -836,17 +836,17 @@ fn find_closest_record_number(
         CiphertextSequenceNumber::Long(l) => (MASK_UPPER16, MASK_MSB16, OFFSET16, l as u64),
     };
 
-    let lower = (last_successful_record_number as u16).wrapping_add(1);
+    let lower = last_successful_record_number as u16;
     // If MSB is set we need to check the current record number and the next overflow for the
     // match. If it is not set we need to check the current and the previous.
     let msb = lower & mask_msb != 0;
 
     let candidate_center = (last_successful_record_number & mask_upper) | seq;
-    let diff_center = last_successful_record_number.abs_diff(candidate_center + 1) as u16;
+    let diff_center = last_successful_record_number.abs_diff(candidate_center + 1);
 
     if msb {
         let candidate_next = ((last_successful_record_number + offset) & mask_upper) | seq;
-        let diff_next = last_successful_record_number.abs_diff(candidate_next + 1) as u16;
+        let diff_next = last_successful_record_number.abs_diff(candidate_next + 1);
 
         if diff_center < diff_next {
             candidate_center
@@ -859,7 +859,7 @@ fn find_closest_record_number(
         }
 
         let candidate_prev = ((last_successful_record_number - offset) & mask_upper) | seq;
-        let diff_prev = last_successful_record_number.abs_diff(candidate_prev + 1) as u16;
+        let diff_prev = last_successful_record_number.abs_diff(candidate_prev + 1);
 
         if diff_center < diff_prev {
             candidate_center
@@ -879,13 +879,13 @@ mod test {
     fn closest_record_number_linear_u8() {
         let mut last_record_number = 0;
 
-        for num in 0..10_000_000 {
+        for tx_record_number in 0..10_000_000 {
             let estimated = find_closest_record_number(
                 last_record_number,
-                CiphertextSequenceNumber::Short(num as u8),
+                CiphertextSequenceNumber::Short(tx_record_number as u8),
             );
 
-            assert_eq!(num, estimated);
+            assert_eq!(tx_record_number, estimated);
 
             last_record_number = estimated;
         }
@@ -895,13 +895,13 @@ mod test {
     fn closest_record_number_linear_u16() {
         let mut last_record_number = 0;
 
-        for num in 0..10_000_000 {
+        for tx_record_number in 0..10_000_000 {
             let estimated = find_closest_record_number(
                 last_record_number,
-                CiphertextSequenceNumber::Long(num as u16),
+                CiphertextSequenceNumber::Long(tx_record_number as u16),
             );
 
-            assert_eq!(num, estimated);
+            assert_eq!(tx_record_number, estimated);
 
             last_record_number = estimated;
         }
