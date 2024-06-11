@@ -4,9 +4,9 @@ use crate::{
     client_config::ClientConfig,
     handshake::{
         extensions::{
-            ClientExtensions, ClientSupportedVersions, DtlsVersions, KeyShareEntry, NamedGroup,
-            NewServerExtensions, OfferedPsks, PskKeyExchangeMode, PskKeyExchangeModes, SelectedPsk,
-            ServerSupportedVersion,
+            ClientExtensions, ClientSupportedVersions, DtlsVersions, HeartbeatExtension,
+            HeartbeatMode, KeyShareEntry, NamedGroup, OfferedPsks, PskKeyExchangeMode,
+            PskKeyExchangeModes, SelectedPsk, ServerExtensions, ServerSupportedVersion,
         },
         ClientHandshake, ClientHello, Finished, Random, ServerHandshake, ServerHello,
     },
@@ -369,6 +369,9 @@ impl<'a> ClientRecord<'a> {
                 supported_versions: Some(ClientSupportedVersions {
                     version: DtlsVersions::V1_3,
                 }),
+                heartbeat: Some(HeartbeatExtension {
+                    mode: HeartbeatMode::PeerAllowedToSend,
+                }),
                 pre_shared_key: Some(OfferedPsks {
                     identities: EncodeOrParse::Encode(identities),
                     hash_size: EncodeOrParse::Encode(
@@ -724,13 +727,16 @@ impl<'a> ServerRecord<'a> {
             legacy_session_id_echo: &legacy_session_id,
             cipher_suite_index: selected_cipher_suite,
             random: &random,
-            extensions: NewServerExtensions {
+            extensions: ServerExtensions {
                 selected_supported_version: Some(ServerSupportedVersion {
                     version: supported_version,
                 }),
                 key_share: Some(KeyShareEntry {
                     group: NamedGroup::X25519,
                     opaque: public_key.as_bytes(),
+                }),
+                heartbeat: Some(HeartbeatExtension {
+                    mode: HeartbeatMode::PeerAllowedToSend,
                 }),
                 pre_shared_key: Some(SelectedPsk {
                     selected_identity: selected_psk_identity,
@@ -1001,28 +1007,6 @@ pub type ProtocolVersion = [u8; 2];
 
 /// Value used for protocol version in DTLS 1.3.
 pub const LEGACY_DTLS_VERSION: ProtocolVersion = [254, 253];
-
-/// Helper to parse DTLS headers.
-#[derive_format_or_debug]
-pub enum DTlsHeader<'a> {
-    Plaintext(DTlsPlaintextHeader),
-    Ciphertext(DTlsCiphertextHeader<'a>),
-}
-
-impl<'a> DTlsHeader<'a> {
-    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
-        let mut pt_buf = buf.clone(); // We need 2 parse buffers.
-
-        if let Some(h) = DTlsCiphertextHeader::parse(buf) {
-            Some(DTlsHeader::Ciphertext(h))
-        } else if let Some(h) = DTlsPlaintextHeader::parse(&mut pt_buf) {
-            *buf = pt_buf;
-            Some(DTlsHeader::Plaintext(h))
-        } else {
-            None
-        }
-    }
-}
 
 /// DTLS 1.3 plaintext header.
 ///

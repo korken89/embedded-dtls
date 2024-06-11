@@ -127,6 +127,7 @@ pub trait DtlsReKeyInPlace: KeySizeUser {
     ///
     /// This is called the `*_traffic_secret*` in Section 7.1 RFC8446.
     fn rekey_aead(&mut self, key: &aead::Key<Self>);
+
     /// Re-key the record number mask cipher from fixed size key.
     ///
     /// This is called the `sn_key` in Section 4.2.3 RFC9147.
@@ -192,7 +193,7 @@ impl DtlsCipher for ChaCha20Poly1305Cipher {
 
         let iv = &ciphertext[4..];
         let mut cipher = <ChaCha20 as KeyIvInit>::new(&self.mask_key, iv.try_into().unwrap());
-        cipher.seek(block_counter);
+        cipher.seek(block_counter as u64 * 64); // Block size for Chacha is 64 bytes.
         cipher.apply_keystream(record_number);
 
         Ok(())

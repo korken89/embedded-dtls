@@ -60,6 +60,7 @@ pub struct ClientExtensions<'a> {
     pub psk_key_exchange_modes: Option<PskKeyExchangeModes>,
     pub key_share: Option<KeyShareEntry<'a>>,
     pub supported_versions: Option<ClientSupportedVersions>,
+    pub heartbeat: Option<HeartbeatExtension>,
     pub pre_shared_key: Option<OfferedPsks<'a>>,
 }
 
@@ -77,6 +78,10 @@ impl<'a> ClientExtensions<'a> {
         if let Some(key_share) = &self.key_share {
             buf.push_u8(ExtensionType::KeyShare as u8)?;
             encode_extension(buf, |buf| key_share.encode(buf))??;
+        }
+        if let Some(heartbeat) = &self.heartbeat {
+            buf.push_u8(ExtensionType::Heartbeat as u8)?;
+            encode_extension(buf, |buf| heartbeat.encode(buf))??;
         }
 
         if let Some(psk) = &self.pre_shared_key {
@@ -146,6 +151,21 @@ impl<'a> ClientExtensions<'a> {
 
                     ret.key_share = Some(v);
                 }
+                ExtensionType::Heartbeat => {
+                    let Some(v) =
+                        HeartbeatExtension::parse(&mut ParseBuffer::new(extension.extension_data))
+                    else {
+                        error!("Failed to parse HeartbeatExtension");
+                        return None;
+                    };
+
+                    if ret.heartbeat.is_some() {
+                        error!("Heartbeat extension already parsed!");
+                        return None;
+                    }
+
+                    ret.heartbeat = Some(v);
+                }
                 ExtensionType::PreSharedKey => {
                     let Some((psk, binders_start_pos)) =
                         OfferedPsks::parse(&mut ParseBuffer::new(extension.extension_data))
@@ -176,13 +196,14 @@ impl<'a> ClientExtensions<'a> {
 /// Helper to parse server extensions.
 #[derive_format_or_debug]
 #[derive(Default)]
-pub struct NewServerExtensions<'a> {
+pub struct ServerExtensions<'a> {
     pub selected_supported_version: Option<ServerSupportedVersion>,
     pub key_share: Option<KeyShareEntry<'a>>,
+    pub heartbeat: Option<HeartbeatExtension>,
     pub pre_shared_key: Option<SelectedPsk>,
 }
 
-impl<'a> NewServerExtensions<'a> {
+impl<'a> ServerExtensions<'a> {
     /// Encode server extensions.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
         if let Some(supported_version) = &self.selected_supported_version {
@@ -192,6 +213,10 @@ impl<'a> NewServerExtensions<'a> {
         if let Some(key_share) = &self.key_share {
             buf.push_u8(ExtensionType::KeyShare as u8)?;
             encode_extension(buf, |buf| key_share.encode(buf))??;
+        }
+        if let Some(heartbeat) = &self.heartbeat {
+            buf.push_u8(ExtensionType::Heartbeat as u8)?;
+            encode_extension(buf, |buf| heartbeat.encode(buf))??;
         }
 
         if let Some(psk) = &self.pre_shared_key {
@@ -203,7 +228,7 @@ impl<'a> NewServerExtensions<'a> {
     }
 
     pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
-        let mut ret = NewServerExtensions::default();
+        let mut ret = ServerExtensions::default();
 
         let extensions_length = buf.pop_u16_be()?;
         let mut extensions = ParseBuffer::new(buf.pop_slice(extensions_length as usize)?);
@@ -239,6 +264,21 @@ impl<'a> NewServerExtensions<'a> {
                     }
 
                     ret.selected_supported_version = Some(v);
+                }
+                ExtensionType::Heartbeat => {
+                    let Some(v) =
+                        HeartbeatExtension::parse(&mut ParseBuffer::new(extension.extension_data))
+                    else {
+                        error!("Failed to parse HeartbeatExtension");
+                        return None;
+                    };
+
+                    if ret.heartbeat.is_some() {
+                        error!("Heartbeat extension already parsed!");
+                        return None;
+                    }
+
+                    ret.heartbeat = Some(v);
                 }
                 ExtensionType::PreSharedKey => {
                     let Some(v) =
@@ -280,118 +320,6 @@ fn encode_extension<R, F: FnOnce(&mut EncodingBuffer) -> R>(
     extension_length_allocation.set(buf, content_length);
 
     Ok(r)
-}
-
-#[derive_format_or_debug]
-#[derive(Clone, PartialOrd, PartialEq)]
-pub enum ServerExtensions<'a> {
-    KeyShare(KeyShareEntry<'a>),
-    SelectedSupportedVersion(ServerSupportedVersion),
-    PreSharedKey(SelectedPsk),
-}
-
-impl<'a> ServerExtensions<'a> {
-    /// Encode a server extension.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
-        buf.push_u8(self.extension_type() as u8)?;
-
-        let extension_length_allocation = buf.alloc_u16()?;
-        let content_start = buf.len();
-
-        match self {
-            ServerExtensions::KeyShare(key_share) => key_share.encode(buf)?,
-            ServerExtensions::SelectedSupportedVersion(versions) => versions.encode(buf)?,
-            ServerExtensions::PreSharedKey(offered) => offered.encode(buf)?,
-        };
-
-        // Fill in the length of this extension.
-        let content_length = (buf.len() - content_start) as u16;
-        extension_length_allocation.set(buf, content_length);
-
-        Ok(())
-    }
-
-    fn extension_type(&self) -> ExtensionType {
-        match self {
-            ServerExtensions::KeyShare(_) => ExtensionType::KeyShare,
-            ServerExtensions::SelectedSupportedVersion(_) => ExtensionType::SupportedVersions,
-            ServerExtensions::PreSharedKey(_) => ExtensionType::PreSharedKey,
-        }
-    }
-}
-
-/// Helper to parse server extensions.
-#[derive_format_or_debug]
-#[derive(Default)]
-pub struct ParseServerExtensions<'a> {
-    pub selected_supported_version: Option<ServerSupportedVersion>,
-    pub key_share: Option<KeyShareEntry<'a>>,
-    pub pre_shared_key: Option<SelectedPsk>,
-}
-
-impl<'a> ParseServerExtensions<'a> {
-    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
-        let mut ret = ParseServerExtensions::default();
-
-        let extensions_length = buf.pop_u16_be()?;
-        let mut extensions = ParseBuffer::new(buf.pop_slice(extensions_length as usize)?);
-
-        while let Some(extension) = ParseExtension::parse(&mut extensions) {
-            match extension.extension_type {
-                ExtensionType::KeyShare => {
-                    let Some(v) =
-                        KeyShareEntry::parse(&mut ParseBuffer::new(extension.extension_data))
-                    else {
-                        error!("Failed to parse PskKeyExchange");
-                        return None;
-                    };
-
-                    if ret.key_share.is_some() {
-                        error!("Keyshare extension already parsed!");
-                        return None;
-                    }
-
-                    ret.key_share = Some(v);
-                }
-                ExtensionType::SupportedVersions => {
-                    let Some(v) = ServerSupportedVersion::parse(&mut ParseBuffer::new(
-                        extension.extension_data,
-                    )) else {
-                        error!("Failed to parse ServerSelectedVersion");
-                        return None;
-                    };
-
-                    if ret.selected_supported_version.is_some() {
-                        error!("Keyshare extension already parsed!");
-                        return None;
-                    }
-
-                    ret.selected_supported_version = Some(v);
-                }
-                ExtensionType::PreSharedKey => {
-                    let Some(v) =
-                        SelectedPsk::parse(&mut ParseBuffer::new(extension.extension_data))
-                    else {
-                        error!("Failed to parse SelectedPsk");
-                        return None;
-                    };
-
-                    if ret.pre_shared_key.is_some() {
-                        error!("Keyshare extension already parsed!");
-                        return None;
-                    }
-
-                    ret.pre_shared_key = Some(v);
-                }
-                _ => {
-                    error!("Got more extensions than what's supported!");
-                    return None;
-                }
-            }
-        }
-
-        Some(ret)
-    }
 }
 
 /// Pre-Shared Key Exchange Modes.
@@ -728,7 +656,33 @@ impl SelectedPsk {
     }
 }
 
+/// The heartbeat extension.
+///
+/// From Section 2, RFC6520.
+#[derive_format_or_debug]
+#[derive(Clone, PartialOrd, PartialEq)]
+pub struct HeartbeatExtension {
+    /// Supported heartbeat mode.
+    pub mode: HeartbeatMode,
+}
+
+impl HeartbeatExtension {
+    /// Encode a `heartbeat` extension.
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+        buf.push_u8(self.mode as u8)
+    }
+
+    /// Parse a supported heartbeat.
+    pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        Some(Self {
+            mode: HeartbeatMode::try_from(buf.pop_u8()?).ok()?,
+        })
+    }
+}
+
 /// Heartbeat mode.
+///
+/// From Section 2, RFC6520.
 #[repr(u8)]
 #[derive_format_or_debug]
 #[derive(Copy, Clone, PartialOrd, PartialEq, TryFromPrimitive)]
@@ -781,7 +735,7 @@ pub enum ExtensionType {
     SupportedGroups = 10,
     SignatureAlgorithms = 13,
     UseSrtp = 14,
-    Heatbeat = 15,
+    Heartbeat = 15,
     ApplicationLayerProtocolNegotiation = 16,
     SignedCertificateTimestamp = 18,
     ClientCertificateType = 19,

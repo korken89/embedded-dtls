@@ -55,49 +55,8 @@ mod crypto_buffer {
 }
 
 mod parse_buffer {
-    use defmt_or_log::derive_format_or_debug;
-
     use crate::integers::{U24, U48};
-
-    /// Buffer for helping parsing of encrypted records until they are decrypted. After decryption
-    /// the normal `ParseBuffer` takes over.
-    #[derive_format_or_debug]
-    #[derive(PartialEq, Eq)]
-    pub struct ParseBufferMut<'a> {
-        data: &'a mut [u8],
-    }
-
-    impl<'a> ParseBufferMut<'a> {
-        /// Create a new parse buffer.
-        pub fn new(data: &'a mut [u8]) -> Self {
-            Self { data }
-        }
-
-        /// Get the length of the data.
-        pub fn len(&self) -> usize {
-            self.data.len()
-        }
-
-        /// Check if the parse buffer is empty.
-        pub fn is_empty(&self) -> bool {
-            self.data.is_empty()
-        }
-
-        /// Pop the rest of the buffer.
-        pub fn pop_rest(&mut self) -> &mut [u8] {
-            core::mem::replace(&mut self.data, &mut [])
-        }
-
-        /// Create a `ParseBuffer` from the current position.
-        pub fn as_parse_buffer(&self) -> ParseBuffer {
-            ParseBuffer::new(self.data)
-        }
-
-        /// Get the first byte.
-        pub fn first(&self) -> Option<u8> {
-            self.data.first().copied()
-        }
-    }
+    use defmt_or_log::derive_format_or_debug;
 
     /// Buffer for helping parsing of records.
     #[derive_format_or_debug]

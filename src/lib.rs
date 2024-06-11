@@ -896,7 +896,7 @@ mod test {
             let client_config = ClientConfig {
                 psk: Psk {
                     identity: b"hello world",
-                    key: b"1234567890qwertyuiopasdfghjklzxc",
+                    key: b"11111234567890qwertyuiopasdfghjklzxc",
                 },
             };
 
@@ -919,7 +919,7 @@ mod test {
         let s = tokio::spawn(async move {
             let psk = [(
                 server_config::Identity::from(b"hello world"),
-                server_config::Key::from(b"1234567890qwertyuiopasdfghjklzxc"),
+                server_config::Key::from(b"11111234567890qwertyuiopasdfghjklzxc"),
             )];
 
             let server_config = ServerConfig { psk: &psk };
@@ -931,6 +931,8 @@ mod test {
                 ServerConnection::open_server(server_socket, &server_config, rng, buf)
                     .await
                     .unwrap();
+
+            // server_connection.send(b"hello").await;
 
             tokio::time::sleep(Duration::from_secs(1)).await;
         });

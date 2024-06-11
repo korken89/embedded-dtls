@@ -1,4 +1,4 @@
-use self::extensions::{ClientExtensions, DtlsVersions, NamedGroup, NewServerExtensions};
+use self::extensions::{ClientExtensions, DtlsVersions, NamedGroup, ServerExtensions};
 use crate::{
     buffer::{AllocSliceHandle, AllocU16Handle, AllocU24Handle, EncodingBuffer, ParseBuffer},
     handshake::extensions::PskKeyExchangeMode,
@@ -489,7 +489,7 @@ pub struct ServerHello<'a> {
     pub legacy_session_id_echo: &'a [u8],
     pub cipher_suite_index: u16,
     pub random: &'a [u8],
-    pub extensions: NewServerExtensions<'a>,
+    pub extensions: ServerExtensions<'a>,
 }
 
 impl<'a> ServerHello<'a> {
@@ -544,7 +544,7 @@ impl<'a> ServerHello<'a> {
         let _legacy_compression_method = buf.pop_u8()?;
 
         // Extensions
-        let extensions = NewServerExtensions::parse(buf)?;
+        let extensions = ServerExtensions::parse(buf)?;
 
         Some(Self {
             version,
