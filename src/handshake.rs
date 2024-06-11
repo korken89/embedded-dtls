@@ -20,6 +20,7 @@ pub type Random = [u8; 32];
 pub enum ClientHandshake<'a> {
     ClientHello(ClientHello<'a>),
     ClientFinished(Finished<'a>),
+    KeyUpdate(KeyUpdate),
 }
 
 impl<'a> ClientHandshake<'a> {
@@ -34,9 +35,13 @@ impl<'a> ClientHandshake<'a> {
         let content_start = buf.len();
 
         let binders = match self {
-            ClientHandshake::ClientHello(hello) => hello.encode(buf)?,
-            ClientHandshake::ClientFinished(finished) => {
+            Self::ClientHello(hello) => hello.encode(buf)?,
+            Self::ClientFinished(finished) => {
                 finished.encode(buf)?;
+                None
+            }
+            Self::KeyUpdate(key_update) => {
+                key_update.encode(buf)?;
                 None
             }
         };
@@ -88,15 +93,22 @@ impl<'a> ClientHandshake<'a> {
 
                 Some((Self::ClientFinished(client_finished), None))
             }
-            HandshakeType::KeyUpdate => todo!(),
+            HandshakeType::KeyUpdate => {
+                let key_update = KeyUpdate::parse(&mut ParseBuffer::new(handshake_payload))?;
+
+                trace!("Got client keyupdate: {:?}", key_update);
+
+                Some((Self::KeyUpdate(key_update), None))
+            }
             _ => None,
         }
     }
 
     fn handshake_type(&self) -> HandshakeType {
         match self {
-            ClientHandshake::ClientHello(_) => HandshakeType::ClientHello,
-            ClientHandshake::ClientFinished(_) => HandshakeType::Finished,
+            Self::ClientHello(_) => HandshakeType::ClientHello,
+            Self::ClientFinished(_) => HandshakeType::Finished,
+            Self::KeyUpdate(_) => HandshakeType::KeyUpdate,
         }
     }
 }
@@ -105,6 +117,7 @@ impl<'a> ClientHandshake<'a> {
 pub enum ServerHandshake<'a> {
     ServerHello(ServerHello<'a>),
     ServerFinished(Finished<'a>),
+    KeyUpdate(KeyUpdate),
 }
 
 impl<'a> ServerHandshake<'a> {
@@ -119,10 +132,11 @@ impl<'a> ServerHandshake<'a> {
         let content_start = buf.len();
 
         match self {
-            ServerHandshake::ServerHello(hello) => hello.encode(buf)?,
-            ServerHandshake::ServerFinished(finished) => {
+            Self::ServerHello(hello) => hello.encode(buf)?,
+            Self::ServerFinished(finished) => {
                 finished.encode(buf)?;
             }
+            Self::KeyUpdate(key_update) => key_update.encode(buf)?,
         };
 
         let content_length = (buf.len() - content_start) as u32;
@@ -163,15 +177,22 @@ impl<'a> ServerHandshake<'a> {
 
                 Some(Self::ServerFinished(server_finished))
             }
-            HandshakeType::KeyUpdate => todo!(),
+            HandshakeType::KeyUpdate => {
+                let key_update = KeyUpdate::parse(&mut ParseBuffer::new(handshake_payload))?;
+
+                trace!("Got client keyupdate: {:?}", key_update);
+
+                Some(Self::KeyUpdate(key_update))
+            }
             _ => None,
         }
     }
 
     fn handshake_type(&self) -> HandshakeType {
         match self {
-            ServerHandshake::ServerHello(_) => HandshakeType::ServerHello,
-            ServerHandshake::ServerFinished(_) => HandshakeType::Finished,
+            Self::ServerHello(_) => HandshakeType::ServerHello,
+            Self::ServerFinished(_) => HandshakeType::Finished,
+            Self::KeyUpdate(_) => HandshakeType::KeyUpdate,
         }
     }
 }
@@ -647,4 +668,40 @@ impl<'a> Finished<'a> {
             verify: buf.pop_rest(),
         }
     }
+}
+
+/// KeyUpdate payload in an Handshake.
+///
+/// Defined in Section 4.6.3, RFC8446.
+#[derive_format_or_debug]
+#[derive(Clone, PartialOrd, PartialEq)]
+pub struct KeyUpdate {
+    pub request_update: KeyUpdateRequest,
+}
+
+impl KeyUpdate {
+    /// Encode a KeyUpdate payload in an Handshake.
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+        buf.push_u8(self.request_update as u8)
+    }
+
+    /// Parse a KeyYpdate message.
+    pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        Some(Self {
+            request_update: KeyUpdateRequest::try_from(buf.pop_u8()?).ok()?,
+        })
+    }
+}
+
+/// KeyUpdateRequest payload.
+///
+/// Defined in Section 4.6.3, RFC8446.
+#[repr(u8)]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialOrd, PartialEq, TryFromPrimitive)]
+pub enum KeyUpdateRequest {
+    /// The receiver does not need to update its own sending keys.
+    UpdateNotRequested = 0,
+    /// The receiver should respond with its own `KeyUpdate`.
+    UpdateRequested = 1,
 }
