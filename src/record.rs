@@ -20,10 +20,13 @@ use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::PublicKey;
 
+/// Marker for encryption being enabled or disabled.
 #[derive_format_or_debug]
 #[derive(Copy, Clone, PartialOrd, PartialEq)]
 pub enum Encryption {
+    /// Encryption is enabled.
     Enabled,
+    /// Encryption is disabled.
     Disabled,
 }
 
@@ -60,7 +63,9 @@ pub enum EncodeOrParse<E, P> {
     Parse(P),
 }
 
-/// A unified header.
+/// A unified header for a DTLS cipher text.
+///
+/// Defined in Section 4, RFC9147.
 #[derive_format_or_debug]
 pub struct UnifiedHeader<'a> {
     data: &'a mut [u8],
@@ -101,6 +106,8 @@ impl<'a> Ack<'a> {
 }
 
 /// Record number.
+///
+/// Defined in Section 4, RFC9147.
 #[derive_format_or_debug]
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecordNumber {
@@ -251,14 +258,81 @@ impl RecordPayloadPositions {
     }
 }
 
+/// Alert level.
+#[repr(u8)]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialOrd, PartialEq, Eq, TryFromPrimitive)]
+pub enum AlertLevel {
+    Warning = 1,
+    Fatal = 2,
+}
+
+/// Alert description.
+#[repr(u8)]
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialOrd, PartialEq, Eq, TryFromPrimitive)]
+pub enum AlertDescription {
+    CloseNotify = 0,
+    UnexpectedMessage = 10,
+    BadRecordMac = 20,
+    RecordOverflow = 22,
+    HandshakeFailure = 40,
+    BadCertificate = 42,
+    UnsupportedCertificate = 43,
+    CertificateRevoked = 44,
+    CertificateExpired = 45,
+    CertificateUnknown = 46,
+    IllegalParameter = 47,
+    UnknownCa = 48,
+    AccessDenied = 49,
+    DecodeError = 50,
+    DecryptError = 51,
+    ProtocolVersion = 70,
+    InsufficientSecurity = 71,
+    InternalError = 80,
+    InappropriateFallback = 86,
+    UserCanceled = 90,
+    MissingExtension = 109,
+    UnsupportedExtension = 110,
+    UnrecognizedName = 112,
+    BadCertificateStatusResponse = 113,
+    UnknownPskIdentity = 115,
+    CertificateRequired = 116,
+    NoApplicationProtocol = 120,
+}
+
+/// An alert payload.
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub struct Alert {
+    pub level: AlertLevel,
+    pub description: AlertDescription,
+}
+
+impl Alert {
+    /// Encode an alert.
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+        buf.push_u8(self.level as u8)?;
+        buf.push_u8(self.description as u8)
+    }
+
+    /// Parse an alert.
+    pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
+        let level = buf.pop_u8()?.try_into().ok()?;
+        let description = buf.pop_u8()?.try_into().ok()?;
+
+        Some(Self { level, description })
+    }
+}
+
 /// Supported client records.
 #[derive_format_or_debug]
 pub enum ClientRecord<'a> {
     Handshake(ClientHandshake<'a>, Encryption),
-    Alert(/* Alert, */ (), Encryption),
+    Alert(Alert, Encryption),
     Ack(Ack<'a>, Encryption),
     Heartbeat(()),
-    ApplicationData(/* &'a [u8] */),
+    ApplicationData(&'a [u8]),
 }
 
 impl<'a> ClientRecord<'a> {
@@ -362,6 +436,46 @@ impl<'a> ClientRecord<'a> {
             .map(|_| ())
     }
 
+    /// Create a client's Alert message.
+    pub async fn encode_alert<CipherSuite: DtlsCipherSuite>(
+        buf: &mut EncodingBuffer<'_>,
+        key_schedule: &mut KeySchedule<CipherSuite, false>,
+        encrypted: Encryption,
+        level: AlertLevel,
+        description: AlertDescription,
+    ) -> Result<(), ()>
+    where
+        CipherSuite: DtlsCipherSuite,
+    {
+        let alert = Alert { level, description };
+
+        debug!("Sending client Alert");
+        trace!("{:?}", alert);
+
+        ClientRecord::Alert(alert, encrypted)
+            .encode(buf, key_schedule)
+            .await
+            .map(|_| ())
+    }
+
+    /// Create a client's Application Data message.
+    pub async fn encode_application_data<CipherSuite: DtlsCipherSuite>(
+        buf: &mut EncodingBuffer<'_>,
+        key_schedule: &mut KeySchedule<CipherSuite, false>,
+        user_content: &[u8],
+    ) -> Result<(), ()>
+    where
+        CipherSuite: DtlsCipherSuite,
+    {
+        debug!("Sending client application data");
+        trace!("content = {:?}", user_content);
+
+        ClientRecord::ApplicationData(user_content)
+            .encode(buf, key_schedule)
+            .await
+            .map(|_| ())
+    }
+
     /// Encode the record into a buffer. Returns (packet to send, content to hash).
     async fn encode<'buf>(
         &self,
@@ -387,10 +501,16 @@ impl<'a> ClientRecord<'a> {
         let binders = match self {
             // NOTE: Each record encoder needs to update the transcript hash at their end.
             ClientRecord::Handshake(handshake, _) => handshake.encode(buf)?,
-            ClientRecord::Alert(_, _) => todo!(),
+            ClientRecord::Alert(alert, _) => {
+                alert.encode(buf)?;
+                None
+            }
             ClientRecord::Heartbeat(_) => todo!(),
             ClientRecord::Ack(_, _) => todo!(),
-            ClientRecord::ApplicationData() => todo!(),
+            ClientRecord::ApplicationData(user_data) => {
+                buf.extend_from_slice(user_data)?;
+                None
+            }
         };
 
         let end = buf.current_pos_ptr();
@@ -441,13 +561,10 @@ impl<'a> ClientRecord<'a> {
                 let (handshake, binders_pos) = ClientHandshake::parse(buf)?;
                 (ClientRecord::Handshake(handshake, encryption), binders_pos)
             }
-            ContentType::Ack => {
-                let ack = Ack::parse(buf)?;
-                (ClientRecord::Ack(ack, encryption), None)
-            }
+            ContentType::Ack => (ClientRecord::Ack(Ack::parse(buf)?, encryption), None),
             ContentType::Heartbeat => todo!(),
-            ContentType::Alert => todo!(),
-            ContentType::ApplicationData => todo!(),
+            ContentType::Alert => (ClientRecord::Alert(Alert::parse(buf)?, encryption), None),
+            ContentType::ApplicationData => (ClientRecord::ApplicationData(buf.pop_rest()), None),
             ContentType::ChangeCipherSpec => todo!(),
         };
         let end = buf.current_pos_ptr();
@@ -477,7 +594,7 @@ impl<'a> ClientRecord<'a> {
             ClientRecord::Alert(_, _) => ContentType::Alert,
             ClientRecord::Ack(_, _) => ContentType::Ack,
             ClientRecord::Heartbeat(_) => ContentType::Heartbeat,
-            ClientRecord::ApplicationData() => ContentType::ApplicationData,
+            ClientRecord::ApplicationData(_) => ContentType::ApplicationData,
         }
     }
 }
@@ -577,10 +694,10 @@ pub struct CipherArguments<'a> {
 #[derive_format_or_debug]
 pub enum ServerRecord<'a> {
     Handshake(ServerHandshake<'a>, Encryption),
-    Alert(/* Alert, */ (), Encryption),
+    Alert(Alert, Encryption),
     Ack(Ack<'a>, Encryption),
     Heartbeat(()),
-    ApplicationData(/* &'a [u8] */),
+    ApplicationData(&'a [u8]),
 }
 
 impl<'a> ServerRecord<'a> {
@@ -671,8 +788,48 @@ impl<'a> ServerRecord<'a> {
             .map(|_| ())
     }
 
+    /// Create a server's Alert message.
+    pub async fn encode_alert<CipherSuite: DtlsCipherSuite>(
+        key_schedule: &mut impl GenericCipher,
+        buf: &mut EncodingBuffer<'_>,
+        encrypted: Encryption,
+        level: AlertLevel,
+        description: AlertDescription,
+    ) -> Result<(), ()>
+    where
+        CipherSuite: DtlsCipherSuite,
+    {
+        let alert = Alert { level, description };
+
+        debug!("Sending server Alert");
+        trace!("{:?}", alert);
+
+        ClientRecord::Alert(alert, encrypted)
+            .encode(buf, key_schedule)
+            .await
+            .map(|_| ())
+    }
+
+    /// Create a servers's Application Data message.
+    pub async fn encode_application_data<CipherSuite: DtlsCipherSuite>(
+        buf: &mut EncodingBuffer<'_>,
+        key_schedule: &mut KeySchedule<CipherSuite, false>,
+        user_content: &[u8],
+    ) -> Result<(), ()>
+    where
+        CipherSuite: DtlsCipherSuite,
+    {
+        debug!("Sending server application data");
+        trace!("content = {:?}", user_content);
+
+        ServerRecord::ApplicationData(user_content)
+            .encode::<NoHasher>(buf, None, key_schedule)
+            .await
+            .map(|_| ())
+    }
+
     /// Encode the record into a buffer. Returns (packet to send, content to hash).
-    pub async fn encode<'buf, Hasher: GenericHasher>(
+    async fn encode<'buf, Hasher: GenericHasher>(
         &self,
         buf: &'buf mut EncodingBuffer<'_>,
         transcript_hasher: Option<&mut Hasher>,
@@ -698,10 +855,10 @@ impl<'a> ServerRecord<'a> {
         match self {
             // NOTE: Each record encoder needs to update the transcript hash at their end.
             ServerRecord::Handshake(handshake, _) => handshake.encode(buf)?,
-            ServerRecord::Alert(_, _) => todo!(),
+            ServerRecord::Alert(alert, _) => alert.encode(buf)?,
             ServerRecord::Heartbeat(_) => todo!(),
             ServerRecord::Ack(ack, _) => ack.encode(buf)?,
-            ServerRecord::ApplicationData() => todo!(),
+            ServerRecord::ApplicationData(user_data) => buf.extend_from_slice(user_data)?,
         }
 
         let end = buf.current_pos_ptr();
@@ -736,7 +893,7 @@ impl<'a> ServerRecord<'a> {
             ServerRecord::Alert(_, _) => ContentType::Alert,
             ServerRecord::Ack(_, _) => ContentType::Ack,
             ServerRecord::Heartbeat(_) => ContentType::Heartbeat,
-            ServerRecord::ApplicationData() => ContentType::ApplicationData,
+            ServerRecord::ApplicationData(_) => ContentType::ApplicationData,
         }
     }
 
@@ -776,16 +933,12 @@ impl<'a> ServerRecord<'a> {
     ) -> Option<Self> {
         Some(match content_type {
             ContentType::Handshake => {
-                let handshake = ServerHandshake::parse(buf)?;
-                ServerRecord::Handshake(handshake, encryption)
+                ServerRecord::Handshake(ServerHandshake::parse(buf)?, encryption)
             }
-            ContentType::Ack => {
-                let ack = Ack::parse(buf)?;
-                ServerRecord::Ack(ack, encryption)
-            }
+            ContentType::Ack => ServerRecord::Ack(Ack::parse(buf)?, encryption),
             ContentType::Heartbeat => todo!(),
-            ContentType::Alert => todo!(),
-            ContentType::ApplicationData => todo!(),
+            ContentType::Alert => ServerRecord::Alert(Alert::parse(buf)?, encryption),
+            ContentType::ApplicationData => ServerRecord::ApplicationData(buf.pop_rest()),
             ContentType::ChangeCipherSpec => todo!(),
         })
     }
@@ -871,7 +1024,9 @@ impl<'a> DTlsHeader<'a> {
     }
 }
 
-/// DTls 1.3 plaintext header.
+/// DTLS 1.3 plaintext header.
+///
+/// Defined in Section 4, RFC9147.
 #[derive_format_or_debug]
 #[derive(PartialEq, Eq)]
 pub struct DTlsPlaintextHeader {
@@ -922,6 +1077,8 @@ impl DTlsPlaintextHeader {
 }
 
 /// DTlsCiphertext unified header.
+///
+/// Defined in Section 4, RFC9147.
 #[derive_format_or_debug]
 #[derive(Copy, Clone, PartialOrd, PartialEq)]
 pub struct DTlsCiphertextHeader<'a> {
