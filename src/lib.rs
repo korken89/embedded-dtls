@@ -168,7 +168,7 @@ pub mod client {
         client_config::ClientConfig,
         handshake::ServerHandshake,
         key_schedule::KeySchedule,
-        record::{ClientRecord, EncodeOrParse, GenericCipher, ServerRecord},
+        record::{ClientRecord, EncodeOrParse, GenericKeySchedule, ServerRecord},
         Endpoint, Error,
     };
     use defmt_or_log::{debug, error, info, trace, FormatOrDebug};
@@ -407,8 +407,8 @@ pub mod server {
         },
         key_schedule::KeySchedule,
         record::{
-            CipherArguments, ClientRecord, DTlsCiphertextHeader, GenericCipher, GenericHasher,
-            NoCipher, RecordNumber, ServerRecord,
+            CipherArguments, ClientRecord, DTlsCiphertextHeader, GenericKeySchedule,
+            GenericTranscript, NoKeySchedule, RecordNumber, ServerRecord,
         },
         server_config::{Identity, Key, ServerConfig},
         Endpoint, Error,
@@ -457,7 +457,7 @@ pub mod server {
             trace!("Got datagram!");
 
             let (client_hello, positions, buffer_that_was_parsed) = {
-                let record = ClientRecord::parse::<NoCipher>(&mut resp, None)
+                let record = ClientRecord::parse::<NoKeySchedule>(&mut resp, None)
                     .await
                     .ok_or(Error::InvalidClientHello)?;
 
@@ -727,7 +727,7 @@ pub mod server {
     }
 
     // All server ciphers must implement `GenericCipher`.
-    impl GenericCipher for ServerKeySchedule {
+    impl GenericKeySchedule for ServerKeySchedule {
         async fn encrypt_record(&mut self, args: CipherArguments<'_>) -> aead::Result<()> {
             match self {
                 ServerKeySchedule::Chacha20Poly1305Sha256(cipher) => {
@@ -787,7 +787,7 @@ pub mod server {
         Sha256(Sha256),
     }
 
-    impl GenericHasher for TranscriptHasher {
+    impl GenericTranscript for TranscriptHasher {
         fn update(&mut self, data: &[u8]) {
             self.update(data);
         }

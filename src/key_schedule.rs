@@ -18,7 +18,7 @@ use crate::{
     buffer::{CryptoBuffer, EncodingBuffer},
     cipher_suites::{DtlsCipher, DtlsCipherSuite, DtlsReKeyInPlace},
     handshake::extensions::Psk,
-    record::{CipherArguments, CiphertextSequenceNumber, DTlsCiphertextHeader, GenericCipher},
+    record::{CipherArguments, CiphertextSequenceNumber, DTlsCiphertextHeader, GenericKeySchedule},
 };
 use aead::Buffer;
 use chacha20poly1305::{AeadCore, KeySizeUser};
@@ -658,7 +658,7 @@ where
     hkdf.expand(&hkdf_label, okm).expect("Internal error");
 }
 
-impl<CipherSuite, const IS_SERVER: bool> GenericCipher for KeySchedule<CipherSuite, IS_SERVER>
+impl<CipherSuite, const IS_SERVER: bool> GenericKeySchedule for KeySchedule<CipherSuite, IS_SERVER>
 where
     CipherSuite: DtlsCipherSuite,
 {

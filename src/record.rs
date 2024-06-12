@@ -483,7 +483,7 @@ impl<'a> ClientRecord<'a> {
     async fn encode<'buf>(
         &self,
         buf: &'buf mut EncodingBuffer<'_>,
-        cipher: &mut impl GenericCipher,
+        cipher: &mut impl GenericKeySchedule,
     ) -> Result<RecordPayloadPositions, ()> {
         encode_record(
             buf,
@@ -534,7 +534,7 @@ impl<'a> ClientRecord<'a> {
         cipher: Option<&mut Cipher>,
     ) -> Option<((ClientRecord<'a>, RecordPayloadPositions), &'a [u8])>
     where
-        Cipher: GenericCipher,
+        Cipher: GenericKeySchedule,
     {
         let r = parse_record(buf, cipher, |content_type, encryption, buf| {
             // // Perform transcript hashing.
@@ -602,12 +602,12 @@ impl<'a> ClientRecord<'a> {
     }
 }
 
-pub(crate) trait GenericHasher {
+pub(crate) trait GenericTranscript {
     /// Add the input buffer to the hasher.
     fn update(&mut self, data: &[u8]);
 }
 
-impl<T> GenericHasher for T
+impl<T> GenericTranscript for T
 where
     T: Digest,
 {
@@ -616,14 +616,14 @@ where
     }
 }
 
-/// No hasher marker.
-pub struct NoHasher {}
+/// No transcript hashing marker.
+pub struct NoTranscript {}
 
-impl GenericHasher for NoHasher {
+impl GenericTranscript for NoTranscript {
     fn update(&mut self, _data: &[u8]) {}
 }
 
-pub(crate) trait GenericCipher {
+pub(crate) trait GenericKeySchedule {
     /// Encrypts a record.
     async fn encrypt_record(&mut self, args: CipherArguments) -> aead::Result<()>;
 
@@ -651,9 +651,9 @@ pub(crate) trait GenericCipher {
 }
 
 /// No cipher marker.
-pub struct NoCipher {}
+pub struct NoKeySchedule {}
 
-impl GenericCipher for NoCipher {
+impl GenericKeySchedule for NoKeySchedule {
     async fn encrypt_record(&mut self, _args: CipherArguments<'_>) -> aead::Result<()> {
         Err(aead::Error)
     }
@@ -712,8 +712,8 @@ impl<'a> ServerRecord<'a> {
         selected_cipher_suite: u16,
         selected_psk_identity: u16,
         rng: &mut Rng,
-        key_schedule: &mut impl GenericCipher,
-        transcript_hasher: &mut impl GenericHasher,
+        key_schedule: &mut impl GenericKeySchedule,
+        transcript_hasher: &mut impl GenericTranscript,
         buf: &'buf mut EncodingBuffer<'_>,
     ) -> Result<(), ()>
     where
@@ -758,8 +758,8 @@ impl<'a> ServerRecord<'a> {
     /// Create a server's finished message.
     pub async fn encode_finished(
         verify: &[u8],
-        key_schedule: &mut impl GenericCipher,
-        transcript_hasher: &mut impl GenericHasher,
+        key_schedule: &mut impl GenericKeySchedule,
+        transcript_hasher: &mut impl GenericTranscript,
         buf: &mut EncodingBuffer<'_>,
     ) -> Result<(), ()> {
         let finished = ServerRecord::Handshake(
@@ -778,7 +778,7 @@ impl<'a> ServerRecord<'a> {
     /// Create a server's ACK message.
     pub async fn encode_ack(
         record_numbers: &[RecordNumber],
-        key_schedule: &mut impl GenericCipher,
+        key_schedule: &mut impl GenericKeySchedule,
         buf: &mut EncodingBuffer<'_>,
     ) -> Result<(), ()> {
         let ack = Ack {
@@ -789,14 +789,14 @@ impl<'a> ServerRecord<'a> {
         trace!("{:?}", ack);
 
         ServerRecord::Ack(ack, Encryption::Enabled)
-            .encode::<NoHasher>(buf, None, key_schedule)
+            .encode::<NoTranscript>(buf, None, key_schedule)
             .await
             .map(|_| ())
     }
 
     /// Create a server's Alert message.
     pub async fn encode_alert<CipherSuite: DtlsCipherSuite>(
-        key_schedule: &mut impl GenericCipher,
+        key_schedule: &mut impl GenericKeySchedule,
         buf: &mut EncodingBuffer<'_>,
         encrypted: Encryption,
         level: AlertLevel,
@@ -829,17 +829,17 @@ impl<'a> ServerRecord<'a> {
         trace!("content = {:?}", user_content);
 
         ServerRecord::ApplicationData(user_content)
-            .encode::<NoHasher>(buf, None, key_schedule)
+            .encode::<NoTranscript>(buf, None, key_schedule)
             .await
             .map(|_| ())
     }
 
     /// Encode the record into a buffer. Returns (packet to send, content to hash).
-    async fn encode<'buf, Hasher: GenericHasher>(
+    async fn encode<'buf, Hasher: GenericTranscript>(
         &self,
         buf: &'buf mut EncodingBuffer<'_>,
         transcript_hasher: Option<&mut Hasher>,
-        cipher: &mut impl GenericCipher,
+        cipher: &mut impl GenericKeySchedule,
     ) -> Result<(), ()> {
         encode_record(
             buf,
@@ -853,7 +853,7 @@ impl<'a> ServerRecord<'a> {
 
     fn encode_content<'buf>(
         &self,
-        transcript_hasher: Option<&mut impl GenericHasher>,
+        transcript_hasher: Option<&mut impl GenericTranscript>,
         buf: &'buf mut EncodingBuffer,
     ) -> Result<(), ()> {
         let start = buf.current_pos_ptr();
@@ -910,7 +910,7 @@ impl<'a> ServerRecord<'a> {
     pub async fn parse<Hash>(
         buf: &mut &'a mut [u8],
         transcript_hasher: Option<&mut Hash>,
-        cipher: &mut impl GenericCipher,
+        cipher: &mut impl GenericKeySchedule,
     ) -> Option<ServerRecord<'a>>
     where
         Hash: Digest,
@@ -1290,7 +1290,7 @@ pub enum ContentType {
 /// Encode the record into a buffer. Returns (packet to send, content to hash).
 pub async fn encode_record<'buf, Ret>(
     buf: &'buf mut EncodingBuffer<'_>,
-    cipher: &mut impl GenericCipher,
+    cipher: &mut impl GenericKeySchedule,
     is_encrypted: bool,
     content_type: ContentType,
     encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<Ret, ()>,
@@ -1326,7 +1326,7 @@ pub async fn encode_record<'buf, Ret>(
 /// Parses a record and returns the parsed content and the payload buffer that was used for parsing.
 pub async fn parse_record<'a, Content>(
     buf: &mut &'a mut [u8],
-    cipher: Option<&mut impl GenericCipher>,
+    cipher: Option<&mut impl GenericKeySchedule>,
     parse_content: impl FnOnce(ContentType, Encryption, &mut ParseBuffer<'a>) -> Option<Content>,
 ) -> Option<(Content, &'a [u8])>
 where
@@ -1463,7 +1463,7 @@ fn encode_plaintext<'buf, Ret>(
 /// Encode a ciphertext.
 async fn encode_ciphertext<'buf, Ret>(
     buf: &'buf mut EncodingBuffer<'_>,
-    cipher: &mut impl GenericCipher,
+    cipher: &mut impl GenericKeySchedule,
     content_type: ContentType,
     epoch: u8,
     sequence_number: CiphertextSequenceNumber,

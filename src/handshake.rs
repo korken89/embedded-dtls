@@ -82,25 +82,35 @@ impl<'a> ClientHandshake<'a> {
                 let mut buf = ParseBuffer::new(handshake_payload);
                 let (client_hello, binders_pos) = ClientHello::parse(&mut buf)?;
 
-                trace!("Got client hello: {:?}", client_hello);
+                debug!("Got client hello");
+                trace!("{:?}", client_hello);
 
                 Some((Self::ClientHello(client_hello), binders_pos))
             }
             HandshakeType::Finished => {
                 let client_finished = Finished::parse(&mut ParseBuffer::new(handshake_payload));
 
-                trace!("Got client finished: {:?}", client_finished);
+                debug!("Got client finished");
+                trace!("{:?}", client_finished);
 
                 Some((Self::ClientFinished(client_finished), None))
             }
             HandshakeType::KeyUpdate => {
                 let key_update = KeyUpdate::parse(&mut ParseBuffer::new(handshake_payload))?;
 
-                trace!("Got client keyupdate: {:?}", key_update);
+                debug!("Got client keyupdate");
+                trace!("{:?}", key_update);
 
                 Some((Self::KeyUpdate(key_update), None))
             }
-            _ => None,
+            _ => {
+                debug!(
+                    "Got unimplemented handshake: {:?}",
+                    handshake_header.msg_type
+                );
+
+                None
+            }
         }
     }
 
@@ -166,25 +176,35 @@ impl<'a> ServerHandshake<'a> {
             HandshakeType::ServerHello => {
                 let server_hello = ServerHello::parse(&mut ParseBuffer::new(handshake_payload))?;
 
-                trace!("Got server hello: {:?}", server_hello);
+                debug!("Got server hello");
+                trace!("{:?}", server_hello);
 
                 Some(Self::ServerHello(server_hello))
             }
             HandshakeType::Finished => {
                 let server_finished = Finished::parse(&mut ParseBuffer::new(handshake_payload));
 
-                trace!("Got server finished: {:?}", server_finished);
+                debug!("Got server finished");
+                trace!("{:?}", server_finished);
 
                 Some(Self::ServerFinished(server_finished))
             }
             HandshakeType::KeyUpdate => {
                 let key_update = KeyUpdate::parse(&mut ParseBuffer::new(handshake_payload))?;
 
-                trace!("Got client keyupdate: {:?}", key_update);
+                debug!("Got server keyupdate");
+                trace!("{:?}", key_update);
 
                 Some(Self::KeyUpdate(key_update))
             }
-            _ => None,
+            _ => {
+                debug!(
+                    "Got unimplemented handshake: {:?}",
+                    handshake_header.msg_type
+                );
+
+                None
+            }
         }
     }
 
@@ -504,6 +524,7 @@ impl<'a> ClientHello<'a> {
     }
 }
 
+/// Server Hello handshake payload.
 #[derive_format_or_debug]
 pub struct ServerHello<'a> {
     pub version: ProtocolVersion,
@@ -685,7 +706,7 @@ impl KeyUpdate {
         buf.push_u8(self.request_update as u8)
     }
 
-    /// Parse a KeyYpdate message.
+    /// Parse a KeyUpdate message.
     pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
         Some(Self {
             request_update: KeyUpdateRequest::try_from(buf.pop_u8()?).ok()?,
