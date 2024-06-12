@@ -130,18 +130,6 @@ pub enum Error<D: Endpoint> {
     Recv(D::ReceiveError),
 }
 
-// TODO: Make this not hard-implemented.
-// impl<D> defmt::Format for Error<D>
-// where
-//     D: Endpoint,
-//     <D as Endpoint>::SendError: defmt::Format,
-//     <D as Endpoint>::ReceiveError: defmt::Format,
-// {
-//     fn format(&self, fmt: defmt::Formatter) {
-//         defmt::write!(fmt, "{}", self);
-//     }
-// }
-
 /// Datagram trait, send and receives datagrams from/to a single endpoint.
 ///
 /// This means on `std` that it cannot be implemented directly on a socket, but probably a
@@ -184,7 +172,7 @@ pub mod client {
     {
         /// Sender/receiver of data.
         socket: Socket,
-        /// TODO: Keys for client->server and server->client. Also called "key schedule".
+        /// Cipher and keys for client->server and server->client communication.
         key_schedule: KeySchedule<CipherSuite, false>,
     }
 
