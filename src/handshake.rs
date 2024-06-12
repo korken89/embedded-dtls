@@ -4,8 +4,8 @@ use crate::{
     handshake::extensions::PskKeyExchangeMode,
     integers::U24,
     record::{EncodeOrParse, ProtocolVersion, LEGACY_DTLS_VERSION},
+    server::config::{Identity, ServerConfig},
     server::ServerKeySchedule,
-    server_config::{Identity, ServerConfig},
 };
 use defmt_or_log::{debug, derive_format_or_debug, error, trace};
 use num_enum::TryFromPrimitive;

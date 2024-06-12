@@ -1,7 +1,7 @@
 use crate::{
     buffer::{AllocU16Handle, EncodingBuffer, ParseBuffer},
     cipher_suites::DtlsCipherSuite,
-    client_config::ClientConfig,
+    client::config::ClientConfig,
     handshake::{
         extensions::{
             ClientExtensions, ClientSupportedVersions, DtlsVersions, HeartbeatExtension,
