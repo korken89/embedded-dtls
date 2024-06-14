@@ -10,7 +10,7 @@
 //! Heavily inspired by [`embedded-tls`].
 //! [`embedded-tls`]: https://github.com/drogue-iot/embedded-tls
 
-#![cfg_attr(not(test), no_std)]
+// #![cfg_attr(not(test), no_std)]
 #![allow(async_fn_in_trait)]
 
 use defmt_or_log::{derive_format_or_debug, FormatOrDebug};
@@ -18,17 +18,14 @@ use defmt_or_log::{derive_format_or_debug, FormatOrDebug};
 pub(crate) mod buffer;
 pub(crate) mod cipher_suites;
 pub mod client;
+pub mod connection;
 pub(crate) mod handshake;
 pub(crate) mod integers;
 pub(crate) mod key_schedule;
 pub(crate) mod record;
 pub mod server;
 
-// The TLS cake
-//
-// 1. Record layer (fragmentation and such)
-// 2. The payload (Handshake, ChangeCipherSpec, Alert, ApplicationData)
-
+/// Error definitions.
 #[derive_format_or_debug]
 #[derive(Copy, Clone)]
 pub enum Error<D: Endpoint> {
@@ -70,6 +67,28 @@ pub trait Endpoint: FormatOrDebug {
     async fn recv<'a>(&self, buf: &'a mut [u8]) -> Result<&'a mut [u8], Self::ReceiveError>;
 }
 
+/// Producer side of an application data queue.
+pub trait ApplicationDataProducer {
+    /// Error type.
+    type Error;
+
+    /// Push a full payload to the application data queue.
+    ///
+    /// If this returns an error it is interpreted as the queue being closed.
+    async fn push(&mut self, data: impl AsRef<[u8]>) -> Result<(), Self::Error>;
+}
+
+/// Consumer side of an application data queue.
+pub trait ApplicationDataConsumer {
+    /// Error type.
+    type Error;
+
+    /// Pop a full payload to the application data queue.
+    ///
+    /// If this returns an error it is interpreted as the queue being closed.
+    async fn pop(&mut self) -> Result<impl AsRef<[u8]>, Self::Error>;
+}
+
 #[cfg(test)]
 mod test {
     use std::time::Duration;
@@ -78,10 +97,10 @@ mod test {
     use crate::{
         cipher_suites::{ChaCha20Poly1305Cipher, DtlsEcdhePskWithChacha20Poly1305Sha256},
         client::config::ClientConfig,
-        client::ClientConnection,
+        client::open_client,
         handshake::extensions::Psk,
         server::config::ServerConfig,
-        server::ServerConnection,
+        server::open_server,
     };
     use defmt_or_log::trace;
     use rand::{rngs::StdRng, SeedableRng};
@@ -89,6 +108,33 @@ mod test {
         mpsc::{channel, Receiver, Sender},
         Mutex,
     };
+
+    /// Create a framed queue with specific maximum depth in number of packets.
+    pub fn framed_queue(depth: usize) -> (AppSender, AppReceiver) {
+        let (s, r) = channel(depth);
+
+        (AppSender(s), AppReceiver(r))
+    }
+
+    pub struct AppSender(Sender<Vec<u8>>);
+
+    impl crate::ApplicationDataProducer for AppSender {
+        type Error = ();
+
+        async fn push(&mut self, data: impl AsRef<[u8]>) -> Result<(), Self::Error> {
+            self.0.send(data.as_ref().into()).await.map_err(|_| ())
+        }
+    }
+
+    pub struct AppReceiver(Receiver<Vec<u8>>);
+
+    impl crate::ApplicationDataConsumer for AppReceiver {
+        type Error = ();
+
+        async fn pop(&mut self) -> Result<impl AsRef<[u8]>, Self::Error> {
+            self.0.recv().await.ok_or(())
+        }
+    }
 
     struct ChannelSocket {
         who: &'static str,
@@ -164,7 +210,7 @@ mod test {
 
             let cipher = ChaCha20Poly1305Cipher::default();
             let mut client_connection =
-                ClientConnection::<_, DtlsEcdhePskWithChacha20Poly1305Sha256>::open_client(
+                open_client::<_, _, DtlsEcdhePskWithChacha20Poly1305Sha256>(
                     &mut rng,
                     client_buf,
                     client_socket,
@@ -189,10 +235,9 @@ mod test {
             let buf = &mut vec![0; 16 * 1024];
             let rng = &mut rand::rngs::OsRng;
 
-            let mut server_connection =
-                ServerConnection::open_server(server_socket, &server_config, rng, buf)
-                    .await
-                    .unwrap();
+            let mut server_connection = open_server(server_socket, &server_config, rng, buf)
+                .await
+                .unwrap();
 
             // server_connection.send(b"hello").await;
 

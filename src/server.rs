@@ -1,6 +1,7 @@
 use crate::{
     buffer::EncodingBuffer,
     cipher_suites::{ChaCha20Poly1305Cipher, DtlsEcdhePskWithChacha20Poly1305Sha256},
+    connection::Connection,
     handshake::{
         extensions::{DtlsVersions, Psk},
         ClientHandshake,
@@ -26,215 +27,201 @@ pub mod config;
 /// constant.
 const MAX_HASH_SIZE: usize = 32;
 
-// TODO: How to select between server and client? Typestate, flag or two separate structs?
-/// A DTLS 1.3 connection.
-pub struct ServerConnection<Socket> {
-    /// Sender/receiver of data.
+/// Open a DTLS 1.3 server connection.
+/// This returns an active connection after handshake is completed.
+///
+/// NOTE: This does not do timeout, it's up to the caller to give up.
+pub async fn open_server<Rng, Socket>(
     socket: Socket,
-    /// Keys for client->server and server->client. Also called "key schedule".
-    key_schedule: ServerKeySchedule,
-}
-
-impl<Socket> ServerConnection<Socket>
+    server_config: &ServerConfig<'_, '_>,
+    rng: &mut Rng,
+    buf: &mut [u8],
+) -> Result<Connection<Socket, ServerKeySchedule>, Error<Socket>>
 where
+    Rng: RngCore + CryptoRng,
     Socket: Endpoint,
 {
-    /// Open a DTLS 1.3 server connection.
-    /// This returns an active connection after handshake is completed.
-    ///
-    /// NOTE: This does not do timeout, it's up to the caller to give up.
-    pub async fn open_server<Rng>(
-        socket: Socket,
-        server_config: &ServerConfig<'_, '_>,
-        rng: &mut Rng,
-        buf: &mut [u8],
-    ) -> Result<Self, Error<Socket>>
-    where
-        Rng: RngCore + CryptoRng,
+    // TODO: If any part fails with error, make sure to send the correct ALERT.
+    info!("Starting handshake for server connection {:?}", socket);
+
+    let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+    trace!("Got datagram!");
+
+    let (client_hello, positions, buffer_that_was_parsed) = {
+        let record = ClientRecord::parse::<NoKeySchedule>(&mut resp, None)
+            .await
+            .ok_or(Error::InvalidClientHello)?;
+
+        if let ((ClientRecord::Handshake(ClientHandshake::ClientHello(hello), _), pos), buf) =
+            record
+        {
+            (hello, pos, buf)
+        } else {
+            return Err(Error::InvalidClientHello);
+        }
+    };
+
+    // Find the first supported cipher suite.
+    let (mut key_schedule, selected_cipher_suite) = {
+        let mut r = None;
+        for (index, cipher_suite) in client_hello
+            .cipher_suites
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes(chunk.try_into().unwrap()))
+            .enumerate()
+        {
+            // Check so we can support this cipher suite.
+            if let Some(key_schedule) = ServerKeySchedule::try_from_cipher_suite(cipher_suite) {
+                r = Some((key_schedule, index));
+            }
+        }
+
+        // TODO: This should generate an alert.
+        r.ok_or(Error::InvalidClientHello)?
+    };
+
+    // At this point we know the selected cipher suite, and hence also the hash function.
+    // Now we can generate transcript hashes for binders and the message in total.
+    let mut transcript_hasher = key_schedule.new_transcript_hasher();
     {
-        // TODO: If any part fails with error, make sure to send the correct ALERT.
-        info!("Starting handshake for server connection {:?}", socket);
-
-        let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
-        trace!("Got datagram!");
-
-        let (client_hello, positions, buffer_that_was_parsed) = {
-            let record = ClientRecord::parse::<NoKeySchedule>(&mut resp, None)
-                .await
+        let binders_transcript_hash = {
+            let (up_to_binders, binders_and_rest) = positions
+                .pre_post_binders(buffer_that_was_parsed)
                 .ok_or(Error::InvalidClientHello)?;
 
-            if let ((ClientRecord::Handshake(ClientHandshake::ClientHello(hello), _), pos), buf) =
-                record
-            {
-                (hello, pos, buf)
-            } else {
-                return Err(Error::InvalidClientHello);
-            }
+            transcript_hasher.update(up_to_binders);
+            let binders_transcript_hash = transcript_hasher.clone().finalize();
+            transcript_hasher.update(binders_and_rest);
+            binders_transcript_hash
         };
 
-        // Find the first supported cipher suite.
-        let (mut key_schedule, selected_cipher_suite) = {
-            let mut r = None;
-            for (index, cipher_suite) in client_hello
-                .cipher_suites
-                .chunks_exact(2)
-                .map(|chunk| u16::from_be_bytes(chunk.try_into().unwrap()))
-                .enumerate()
-            {
-                // Check so we can support this cipher suite.
-                if let Some(key_schedule) = ServerKeySchedule::try_from_cipher_suite(cipher_suite) {
-                    r = Some((key_schedule, index));
-                }
-            }
+        trace!(
+            "Server transcript after client hello: {:?}",
+            transcript_hasher.clone().finalize()
+        );
 
-            // TODO: This should generate an alert.
-            r.ok_or(Error::InvalidClientHello)?
-        };
-
-        // At this point we know the selected cipher suite, and hence also the hash function.
-        // Now we can generate transcript hashes for binders and the message in total.
-        let mut transcript_hasher = key_schedule.new_transcript_hasher();
-        {
-            let binders_transcript_hash = {
-                let (up_to_binders, binders_and_rest) = positions
-                    .pre_post_binders(buffer_that_was_parsed)
-                    .ok_or(Error::InvalidClientHello)?;
-
-                transcript_hasher.update(up_to_binders);
-                let binders_transcript_hash = transcript_hasher.clone().finalize();
-                transcript_hasher.update(binders_and_rest);
-                binders_transcript_hash
-            };
-
-            trace!(
-                "Server transcript after client hello: {:?}",
-                transcript_hasher.clone().finalize()
-            );
-
-            let their_public_key = client_hello
-                .validate_and_initialize_keyschedule(
-                    &mut key_schedule,
-                    server_config,
-                    &binders_transcript_hash,
-                )
-                .map_err(|_| Error::InvalidClientHello)?;
-
-            // Perform ECDHE -> Handshake Secret with Key Schedule
-            // TODO: For now we assume X25519.
-            let secret = EphemeralSecret::random();
-            let our_public_key = PublicKey::from(&secret);
-            let shared_secret = secret.diffie_hellman(&their_public_key);
-
-            // Send server hello.
-            let legacy_session_id: HVec<u8, 32> = HVec::from_slice(client_hello.legacy_session_id)
-                .map_err(|_| Error::InsufficientSpace)?;
-
-            // TODO: Can we move this up somehow?
-            if !resp.is_empty() {
-                error!("More data after client hello");
-                return Err(Error::InvalidClientHello);
-            }
-
-            // TODO: We hardcode the selected PSK as the first one for now.
-            let mut enc_buf = EncodingBuffer::new(buf);
-            ServerRecord::encode_server_hello(
-                &legacy_session_id,
-                DtlsVersions::V1_3,
-                our_public_key,
-                selected_cipher_suite as u16,
-                0,
-                rng,
+        let their_public_key = client_hello
+            .validate_and_initialize_keyschedule(
                 &mut key_schedule,
-                &mut transcript_hasher,
-                &mut enc_buf,
+                server_config,
+                &binders_transcript_hash,
             )
-            .await
+            .map_err(|_| Error::InvalidClientHello)?;
+
+        // Perform ECDHE -> Handshake Secret with Key Schedule
+        // TODO: For now we assume X25519.
+        let secret = EphemeralSecret::random();
+        let our_public_key = PublicKey::from(&secret);
+        let shared_secret = secret.diffie_hellman(&their_public_key);
+
+        // Send server hello.
+        let legacy_session_id: HVec<u8, 32> = HVec::from_slice(client_hello.legacy_session_id)
             .map_err(|_| Error::InsufficientSpace)?;
 
-            trace!(
-                "Server transcript after server hello: {:?}",
-                transcript_hasher.clone().finalize()
-            );
-
-            key_schedule.initialize_handshake_secret(
-                shared_secret.as_bytes(),
-                &transcript_hasher.clone().finalize(),
-            );
-
-            // Add the Finished message to this datagram.
-            let verify =
-                key_schedule.create_verify_data(&transcript_hasher.clone().finalize(), true);
-            ServerRecord::encode_finished(
-                &verify,
-                &mut key_schedule,
-                &mut transcript_hasher,
-                &mut enc_buf,
-            )
-            .await
-            .map_err(|_| Error::InsufficientSpace)?;
-
-            socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
+        // TODO: Can we move this up somehow?
+        if !resp.is_empty() {
+            error!("More data after client hello");
+            return Err(Error::InvalidClientHello);
         }
 
-        // Finished from client
-        {
-            let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+        // TODO: We hardcode the selected PSK as the first one for now.
+        let mut enc_buf = EncodingBuffer::new(buf);
+        ServerRecord::encode_server_hello(
+            &legacy_session_id,
+            DtlsVersions::V1_3,
+            our_public_key,
+            selected_cipher_suite as u16,
+            0,
+            rng,
+            &mut key_schedule,
+            &mut transcript_hasher,
+            &mut enc_buf,
+        )
+        .await
+        .map_err(|_| Error::InsufficientSpace)?;
 
-            // Check if we got more datagrams, we're expecting a finished.
-            let expected_verify =
-                key_schedule.create_verify_data(&transcript_hasher.clone().finalize(), false);
+        trace!(
+            "Server transcript after server hello: {:?}",
+            transcript_hasher.clone().finalize()
+        );
 
-            let finished = {
-                if let ((ClientRecord::Handshake(ClientHandshake::ClientFinished(fin), _), _), _) =
-                    ClientRecord::parse(&mut resp, Some(&mut key_schedule))
-                        .await
-                        .ok_or(Error::InvalidClientFinished)?
-                {
-                    fin
-                } else {
-                    return Err(Error::InvalidClientFinished);
-                }
-            };
+        key_schedule.initialize_handshake_secret(
+            shared_secret.as_bytes(),
+            &transcript_hasher.clone().finalize(),
+        );
 
-            if expected_verify != finished.verify {
-                error!("Client finished does not match transcript");
-                return Err(Error::InvalidServerFinished);
-            }
+        // Add the Finished message to this datagram.
+        let verify = key_schedule.create_verify_data(&transcript_hasher.clone().finalize(), true);
+        ServerRecord::encode_finished(
+            &verify,
+            &mut key_schedule,
+            &mut transcript_hasher,
+            &mut enc_buf,
+        )
+        .await
+        .map_err(|_| Error::InsufficientSpace)?;
 
-            debug!("Client finished MATCHES expected transcript");
-        }
-
-        // Update key schedule to Master Secret.
-        key_schedule.initialize_master_secret(&transcript_hasher.clone().finalize());
-
-        // Send ACK.
-        {
-            let mut enc_buf = EncodingBuffer::new(buf);
-            let sequence_number = key_schedule.read_record_number();
-            let epoch = key_schedule.epoch_number();
-
-            ServerRecord::encode_ack(
-                &[RecordNumber {
-                    epoch,
-                    sequence_number,
-                }],
-                &mut key_schedule,
-                &mut enc_buf,
-            )
-            .await
-            .map_err(|_| Error::InsufficientSpace)?;
-
-            socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
-        }
-
-        // Handshake complete!
-        info!("New server connection created for {:?}", socket);
-
-        Ok(ServerConnection {
-            socket,
-            key_schedule,
-        })
+        socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
     }
+
+    // Finished from client
+    {
+        let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+
+        // Check if we got more datagrams, we're expecting a finished.
+        let expected_verify =
+            key_schedule.create_verify_data(&transcript_hasher.clone().finalize(), false);
+
+        let finished = {
+            if let ((ClientRecord::Handshake(ClientHandshake::ClientFinished(fin), _), _), _) =
+                ClientRecord::parse(&mut resp, Some(&mut key_schedule))
+                    .await
+                    .ok_or(Error::InvalidClientFinished)?
+            {
+                fin
+            } else {
+                return Err(Error::InvalidClientFinished);
+            }
+        };
+
+        if expected_verify != finished.verify {
+            error!("Client finished does not match transcript");
+            return Err(Error::InvalidServerFinished);
+        }
+
+        debug!("Client finished MATCHES expected transcript");
+    }
+
+    // Update key schedule to Master Secret.
+    key_schedule.initialize_master_secret(&transcript_hasher.clone().finalize());
+
+    // Send ACK.
+    {
+        let mut enc_buf = EncodingBuffer::new(buf);
+        let sequence_number = key_schedule.read_record_number();
+        let epoch = key_schedule.epoch_number();
+
+        ServerRecord::encode_ack(
+            &[RecordNumber {
+                epoch,
+                sequence_number,
+            }],
+            &mut key_schedule,
+            &mut enc_buf,
+        )
+        .await
+        .map_err(|_| Error::InsufficientSpace)?;
+
+        socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
+    }
+
+    // Handshake complete!
+    info!("New server connection created for {:?}", socket);
+
+    Ok(Connection {
+        socket,
+        key_schedule,
+    })
 }
 
 pub enum ServerKeySchedule {
