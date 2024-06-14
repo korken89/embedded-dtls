@@ -17,13 +17,14 @@ pub mod extensions;
 pub type Random = [u8; 32];
 
 #[derive_format_or_debug]
-pub enum ClientHandshake<'a> {
+pub enum Handshake<'a> {
     ClientHello(ClientHello<'a>),
-    ClientFinished(Finished<'a>),
+    ServerHello(ServerHello<'a>),
+    Finished(Finished<'a>),
     KeyUpdate(KeyUpdate),
 }
 
-impl<'a> ClientHandshake<'a> {
+impl<'a> Handshake<'a> {
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<Option<usize>, ()> {
         // Encode client handshake.
         let header = HandshakeHeader::encode(self.handshake_type(), buf)?;
@@ -36,7 +37,11 @@ impl<'a> ClientHandshake<'a> {
 
         let binders = match self {
             Self::ClientHello(hello) => hello.encode(buf)?,
-            Self::ClientFinished(finished) => {
+            Self::ServerHello(hello) => {
+                hello.encode(buf)?;
+                None
+            }
+            Self::Finished(finished) => {
                 finished.encode(buf)?;
                 None
             }
@@ -87,13 +92,21 @@ impl<'a> ClientHandshake<'a> {
 
                 Some((Self::ClientHello(client_hello), binders_pos))
             }
+            HandshakeType::ServerHello => {
+                let server_hello = ServerHello::parse(&mut ParseBuffer::new(handshake_payload))?;
+
+                debug!("Got server hello");
+                trace!("{:?}", server_hello);
+
+                Some((Self::ServerHello(server_hello), None))
+            }
             HandshakeType::Finished => {
                 let client_finished = Finished::parse(&mut ParseBuffer::new(handshake_payload));
 
                 debug!("Got client finished");
                 trace!("{:?}", client_finished);
 
-                Some((Self::ClientFinished(client_finished), None))
+                Some((Self::Finished(client_finished), None))
             }
             HandshakeType::KeyUpdate => {
                 let key_update = KeyUpdate::parse(&mut ParseBuffer::new(handshake_payload))?;
@@ -117,101 +130,8 @@ impl<'a> ClientHandshake<'a> {
     fn handshake_type(&self) -> HandshakeType {
         match self {
             Self::ClientHello(_) => HandshakeType::ClientHello,
-            Self::ClientFinished(_) => HandshakeType::Finished,
-            Self::KeyUpdate(_) => HandshakeType::KeyUpdate,
-        }
-    }
-}
-
-#[derive_format_or_debug]
-pub enum ServerHandshake<'a> {
-    ServerHello(ServerHello<'a>),
-    ServerFinished(Finished<'a>),
-    KeyUpdate(KeyUpdate),
-}
-
-impl<'a> ServerHandshake<'a> {
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
-        // Encode client handshake.
-        let header = HandshakeHeader::encode(self.handshake_type(), buf)?;
-
-        // TODO: How to support fragmentation so we can ship this over e.g. IEEE802.15.4 radio that
-        // only has payload of 60-100 bytes?
-        // For now just assume everything goes into one `Handshake`.
-
-        let content_start = buf.len();
-
-        match self {
-            Self::ServerHello(hello) => hello.encode(buf)?,
-            Self::ServerFinished(finished) => {
-                finished.encode(buf)?;
-            }
-            Self::KeyUpdate(key_update) => key_update.encode(buf)?,
-        };
-
-        let content_length = (buf.len() - content_start) as u32;
-
-        header.length.set(buf, content_length.into());
-        header.message_seq.set(buf, 1); // TODO: This should probably be something else than 1
-        header.fragment_offset.set(buf, 0.into());
-        header.fragment_length.set(buf, content_length.into());
-
-        Ok(())
-    }
-
-    /// Parse a handshake message.
-    pub fn parse(buf: &mut ParseBuffer<'a>) -> Option<Self> {
-        let handshake_header = HandshakeHeader::parse(buf)?;
-
-        if handshake_header.length != handshake_header.fragment_length {
-            error!("We don't support fragmented handshakes yet.");
-            return None;
-        }
-
-        let handshake_payload = buf.pop_slice(handshake_header.fragment_length.get() as usize)?;
-
-        trace!("Got handshake: {:?}", handshake_header);
-
-        match handshake_header.msg_type {
-            HandshakeType::ServerHello => {
-                let server_hello = ServerHello::parse(&mut ParseBuffer::new(handshake_payload))?;
-
-                debug!("Got server hello");
-                trace!("{:?}", server_hello);
-
-                Some(Self::ServerHello(server_hello))
-            }
-            HandshakeType::Finished => {
-                let server_finished = Finished::parse(&mut ParseBuffer::new(handshake_payload));
-
-                debug!("Got server finished");
-                trace!("{:?}", server_finished);
-
-                Some(Self::ServerFinished(server_finished))
-            }
-            HandshakeType::KeyUpdate => {
-                let key_update = KeyUpdate::parse(&mut ParseBuffer::new(handshake_payload))?;
-
-                debug!("Got server keyupdate");
-                trace!("{:?}", key_update);
-
-                Some(Self::KeyUpdate(key_update))
-            }
-            _ => {
-                debug!(
-                    "Got unimplemented handshake: {:?}",
-                    handshake_header.msg_type
-                );
-
-                None
-            }
-        }
-    }
-
-    fn handshake_type(&self) -> HandshakeType {
-        match self {
             Self::ServerHello(_) => HandshakeType::ServerHello,
-            Self::ServerFinished(_) => HandshakeType::Finished,
+            Self::Finished(_) => HandshakeType::Finished,
             Self::KeyUpdate(_) => HandshakeType::KeyUpdate,
         }
     }

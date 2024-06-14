@@ -109,6 +109,32 @@ mod test {
         Mutex,
     };
 
+    #[allow(unused)]
+    struct FakeRandom {
+        fill: u8,
+    }
+
+    impl rand::RngCore for FakeRandom {
+        fn next_u32(&mut self) -> u32 {
+            0xcafebabe
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            0xdeadbeefdeadbeef
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            dest.fill(self.fill);
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+            dest.fill(self.fill);
+            Ok(())
+        }
+    }
+
+    impl rand::CryptoRng for FakeRandom {}
+
     /// Create a framed queue with specific maximum depth in number of packets.
     pub fn framed_queue(depth: usize) -> (AppSender, AppReceiver) {
         let (s, r) = channel(depth);
@@ -200,6 +226,7 @@ mod test {
         // Client
         let c = tokio::spawn(async move {
             let client_buf = &mut [0; 1024];
+            // let mut rng = FakeRandom { fill: 0xaa };
             let mut rng: StdRng = SeedableRng::from_entropy();
             let client_config = ClientConfig {
                 psk: Psk {
@@ -234,6 +261,7 @@ mod test {
 
             let buf = &mut vec![0; 16 * 1024];
             let rng = &mut rand::rngs::OsRng;
+            // let rng = &mut FakeRandom { fill: 0xbb };
 
             let mut server_connection = open_server(server_socket, &server_config, rng, buf)
                 .await

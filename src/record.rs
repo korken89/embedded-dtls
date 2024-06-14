@@ -8,14 +8,13 @@ use crate::{
             HeartbeatMode, KeyShareEntry, NamedGroup, OfferedPsks, PskKeyExchangeMode,
             PskKeyExchangeModes, SelectedPsk, ServerExtensions, ServerSupportedVersion,
         },
-        ClientHandshake, ClientHello, Finished, Random, ServerHandshake, ServerHello,
+        ClientHello, Finished, Handshake, Random, ServerHello,
     },
     integers::U48,
-    key_schedule::KeySchedule,
 };
 use core::ops::Range;
 use defmt_or_log::{debug, derive_format_or_debug, error, trace};
-use digest::{Digest, OutputSizeUser};
+use digest::OutputSizeUser;
 use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::PublicKey;
@@ -215,6 +214,7 @@ impl<'a> UnifiedHeader<'a> {
 
 /// Holds positions of key positions in the payload data. Used for transcript hashing.
 #[derive_format_or_debug]
+#[derive(Clone, Copy, Default)]
 pub struct RecordPayloadPositions {
     pub start: usize,
     pub binders: Option<usize>,
@@ -325,305 +325,8 @@ impl Alert {
     }
 }
 
-/// Supported client records.
-#[derive_format_or_debug]
-pub enum ClientRecord<'a> {
-    Handshake(ClientHandshake<'a>, Encryption),
-    Alert(Alert, Encryption),
-    Ack(Ack<'a>, Encryption),
-    Heartbeat(()),
-    ApplicationData(&'a [u8]),
-}
-
-impl<'a> ClientRecord<'a> {
-    /// Create a client hello handshake.
-    pub async fn encode_client_hello<CipherSuite, Rng>(
-        buf: &mut EncodingBuffer<'_>,
-        config: &'a ClientConfig<'a>,
-        public_key: &PublicKey,
-        rng: &mut Rng,
-        key_schedule: &mut KeySchedule<CipherSuite, false>,
-    ) -> Result<RecordPayloadPositions, ()>
-    where
-        Rng: RngCore + CryptoRng,
-        CipherSuite: DtlsCipherSuite,
-    {
-        let identities = &[config.psk.clone()];
-
-        let mut random = Random::default();
-        rng.fill_bytes(&mut random);
-
-        let client_hello = ClientHello {
-            version: LEGACY_DTLS_VERSION,
-            legacy_session_id: &[],
-            cipher_suites: &(<CipherSuite as DtlsCipherSuite>::CODE_POINT as u16).to_be_bytes(),
-            random: &random,
-            extensions: ClientExtensions {
-                psk_key_exchange_modes: Some(PskKeyExchangeModes {
-                    ke_modes: PskKeyExchangeMode::PskDheKe,
-                }),
-                key_share: Some(KeyShareEntry {
-                    group: NamedGroup::X25519,
-                    opaque: public_key.as_bytes(),
-                }),
-                supported_versions: Some(ClientSupportedVersions {
-                    version: DtlsVersions::V1_3,
-                }),
-                heartbeat: Some(HeartbeatExtension {
-                    mode: HeartbeatMode::PeerAllowedToSend,
-                }),
-                pre_shared_key: Some(OfferedPsks {
-                    identities: EncodeOrParse::Encode(identities),
-                    hash_size: EncodeOrParse::Encode(
-                        <<CipherSuite as DtlsCipherSuite>::Hash as OutputSizeUser>::output_size(),
-                    ),
-                }),
-            },
-        };
-
-        debug!("Sending client hello");
-        trace!("{:?}", client_hello);
-
-        ClientRecord::Handshake(
-            ClientHandshake::ClientHello(client_hello),
-            Encryption::Disabled,
-        )
-        .encode(buf, key_schedule)
-        .await
-    }
-
-    /// Create a client's finished message.
-    pub async fn encode_finished<CipherSuite>(
-        buf: &mut EncodingBuffer<'_>,
-        key_schedule: &mut KeySchedule<CipherSuite, false>,
-        transcript_hash: &'a [u8],
-    ) -> Result<(), ()>
-    where
-        CipherSuite: DtlsCipherSuite,
-    {
-        let finished = Finished {
-            verify: transcript_hash,
-        };
-
-        debug!("Sending client finished");
-        trace!("{:?}", finished);
-
-        ClientRecord::Handshake(
-            ClientHandshake::ClientFinished(finished),
-            Encryption::Enabled,
-        )
-        .encode(buf, key_schedule)
-        .await
-        .map(|_| ())
-    }
-
-    /// Create a client's ACK message.
-    pub async fn encode_ack<CipherSuite: DtlsCipherSuite>(
-        buf: &mut EncodingBuffer<'_>,
-        key_schedule: &mut KeySchedule<CipherSuite, false>,
-        record_numbers: &'a [RecordNumber],
-    ) -> Result<(), ()>
-    where
-        CipherSuite: DtlsCipherSuite,
-    {
-        let ack = Ack {
-            record_numbers: EncodeOrParse::Encode(record_numbers),
-        };
-
-        debug!("Sending client ACK");
-        trace!("{:?}", ack);
-
-        ClientRecord::Ack(ack, Encryption::Enabled)
-            .encode(buf, key_schedule)
-            .await
-            .map(|_| ())
-    }
-
-    /// Create a client's Alert message.
-    pub async fn encode_alert<CipherSuite: DtlsCipherSuite>(
-        buf: &mut EncodingBuffer<'_>,
-        key_schedule: &mut KeySchedule<CipherSuite, false>,
-        encrypted: Encryption,
-        level: AlertLevel,
-        description: AlertDescription,
-    ) -> Result<(), ()>
-    where
-        CipherSuite: DtlsCipherSuite,
-    {
-        let alert = Alert { level, description };
-
-        debug!("Sending client Alert");
-        trace!("{:?}", alert);
-
-        ClientRecord::Alert(alert, encrypted)
-            .encode(buf, key_schedule)
-            .await
-            .map(|_| ())
-    }
-
-    /// Create a client's Application Data message.
-    pub async fn encode_application_data<CipherSuite: DtlsCipherSuite>(
-        buf: &mut EncodingBuffer<'_>,
-        key_schedule: &mut KeySchedule<CipherSuite, false>,
-        user_content: &[u8],
-    ) -> Result<(), ()>
-    where
-        CipherSuite: DtlsCipherSuite,
-    {
-        debug!("Sending client application data");
-        trace!("content = {:?}", user_content);
-
-        ClientRecord::ApplicationData(user_content)
-            .encode(buf, key_schedule)
-            .await
-            .map(|_| ())
-    }
-
-    /// Encode the record into a buffer. Returns (packet to send, content to hash).
-    async fn encode<'buf>(
-        &self,
-        buf: &'buf mut EncodingBuffer<'_>,
-        cipher: &mut impl GenericKeySchedule,
-    ) -> Result<RecordPayloadPositions, ()> {
-        encode_record(
-            buf,
-            cipher,
-            self.is_encrypted(),
-            self.content_type(),
-            |buf| self.encode_content(buf),
-        )
-        .await
-    }
-
-    fn encode_content<'buf>(
-        &self,
-        buf: &'buf mut EncodingBuffer<'_>,
-    ) -> Result<RecordPayloadPositions, ()> {
-        let start = buf.current_pos_ptr();
-
-        let binders = match self {
-            // NOTE: Each record encoder needs to update the transcript hash at their end.
-            ClientRecord::Handshake(handshake, _) => handshake.encode(buf)?,
-            ClientRecord::Alert(alert, _) => {
-                alert.encode(buf)?;
-                None
-            }
-            ClientRecord::Heartbeat(_) => todo!(),
-            ClientRecord::Ack(_, _) => todo!(),
-            ClientRecord::ApplicationData(user_data) => {
-                buf.extend_from_slice(user_data)?;
-                None
-            }
-        };
-
-        let end = buf.current_pos_ptr();
-
-        Ok(RecordPayloadPositions {
-            start,
-            binders,
-            end,
-        })
-    }
-
-    /// Parse a `ServerRecord`. The incoming `buf` will be reduced to not include what's been
-    /// parsed after finishing, allowing for parse to be called multiple times.
-    ///
-    /// If a transcript hasher is supplied, then the hashing will be performed over the plaintext.
-    pub async fn parse<Cipher>(
-        buf: &mut &'a mut [u8],
-        cipher: Option<&mut Cipher>,
-    ) -> Option<((ClientRecord<'a>, RecordPayloadPositions), &'a [u8])>
-    where
-        Cipher: GenericKeySchedule,
-    {
-        let r = parse_record(buf, cipher, |content_type, encryption, buf| {
-            // // Perform transcript hashing.
-            // if let Some(hasher) = transcript_hasher {
-            //     hasher.update(buf.as_ref())
-            // }
-
-            Self::parse_content(content_type, encryption, buf)
-        })
-        .await;
-
-        if let Some(out) = &r {
-            trace!("Parsed {:?}", out);
-        }
-
-        r
-    }
-
-    fn parse_content(
-        content_type: ContentType,
-        encryption: Encryption,
-        buf: &mut ParseBuffer<'a>,
-    ) -> Option<(Self, RecordPayloadPositions)> {
-        let start = buf.current_pos_ptr();
-        let (ret, binders) = match content_type {
-            ContentType::Handshake => {
-                let (handshake, binders_pos) = ClientHandshake::parse(buf)?;
-                (ClientRecord::Handshake(handshake, encryption), binders_pos)
-            }
-            ContentType::Ack => (ClientRecord::Ack(Ack::parse(buf)?, encryption), None),
-            ContentType::Heartbeat => todo!(),
-            ContentType::Alert => (ClientRecord::Alert(Alert::parse(buf)?, encryption), None),
-            ContentType::ApplicationData => (ClientRecord::ApplicationData(buf.pop_rest()), None),
-            ContentType::ChangeCipherSpec => todo!(),
-        };
-        let end = buf.current_pos_ptr();
-
-        Some((
-            ret,
-            RecordPayloadPositions {
-                start,
-                binders,
-                end,
-            },
-        ))
-    }
-
-    fn is_encrypted(&self) -> bool {
-        match self {
-            ClientRecord::Handshake(_, Encryption::Disabled) => false,
-            ClientRecord::Alert(_, Encryption::Disabled) => false,
-            ClientRecord::Ack(_, Encryption::Disabled) => false,
-            _ => true,
-        }
-    }
-
-    fn content_type(&self) -> ContentType {
-        match self {
-            ClientRecord::Handshake(_, _) => ContentType::Handshake,
-            ClientRecord::Alert(_, _) => ContentType::Alert,
-            ClientRecord::Ack(_, _) => ContentType::Ack,
-            ClientRecord::Heartbeat(_) => ContentType::Heartbeat,
-            ClientRecord::ApplicationData(_) => ContentType::ApplicationData,
-        }
-    }
-}
-
-pub(crate) trait GenericTranscript {
-    /// Add the input buffer to the hasher.
-    fn update(&mut self, data: &[u8]);
-}
-
-impl<T> GenericTranscript for T
-where
-    T: Digest,
-{
-    fn update(&mut self, data: &[u8]) {
-        Digest::update(self, data)
-    }
-}
-
-/// No transcript hashing marker.
-pub struct NoTranscript {}
-
-impl GenericTranscript for NoTranscript {
-    fn update(&mut self, _data: &[u8]) {}
-}
-
-pub(crate) trait GenericKeySchedule {
+/// Internal trait for Key Schedules.
+pub trait GenericKeySchedule {
     /// Encrypts a record.
     async fn encrypt_record(&mut self, args: CipherArguments) -> aead::Result<()>;
 
@@ -695,16 +398,69 @@ pub struct CipherArguments<'a> {
 
 /// Supported client records.
 #[derive_format_or_debug]
-pub enum ServerRecord<'a> {
-    Handshake(ServerHandshake<'a>, Encryption),
+pub enum Record<'a> {
+    Handshake(Handshake<'a>, Encryption),
     Alert(Alert, Encryption),
     Ack(Ack<'a>, Encryption),
     Heartbeat(()),
     ApplicationData(&'a [u8]),
 }
 
-impl<'a> ServerRecord<'a> {
-    /// Create a client hello handshake.
+impl<'a> Record<'a> {
+    pub async fn encode_client_hello<CipherSuite, Rng>(
+        hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
+        buf: &mut EncodingBuffer<'_>,
+        config: &'a ClientConfig<'a>,
+        public_key: &PublicKey,
+        rng: &mut Rng,
+        key_schedule: &mut impl GenericKeySchedule,
+    ) -> Result<(), ()>
+    where
+        Rng: RngCore + CryptoRng,
+        CipherSuite: DtlsCipherSuite,
+    {
+        let identities = &[config.psk.clone()];
+
+        let mut random = Random::default();
+        rng.fill_bytes(&mut random);
+
+        let client_hello = ClientHello {
+            version: LEGACY_DTLS_VERSION,
+            legacy_session_id: &[],
+            cipher_suites: &(<CipherSuite as DtlsCipherSuite>::CODE_POINT as u16).to_be_bytes(),
+            random: &random,
+            extensions: ClientExtensions {
+                psk_key_exchange_modes: Some(PskKeyExchangeModes {
+                    ke_modes: PskKeyExchangeMode::PskDheKe,
+                }),
+                key_share: Some(KeyShareEntry {
+                    group: NamedGroup::X25519,
+                    opaque: public_key.as_bytes(),
+                }),
+                supported_versions: Some(ClientSupportedVersions {
+                    version: DtlsVersions::V1_3,
+                }),
+                heartbeat: Some(HeartbeatExtension {
+                    mode: HeartbeatMode::PeerAllowedToSend,
+                }),
+                pre_shared_key: Some(OfferedPsks {
+                    identities: EncodeOrParse::Encode(identities),
+                    hash_size: EncodeOrParse::Encode(
+                        <<CipherSuite as DtlsCipherSuite>::Hash as OutputSizeUser>::output_size(),
+                    ),
+                }),
+            },
+        };
+
+        debug!("Sending client hello");
+        trace!("{:?}", client_hello);
+
+        Record::Handshake(Handshake::ClientHello(client_hello), Encryption::Disabled)
+            .encode(hasher, buf, key_schedule)
+            .await
+    }
+
+    /// Create a server hello handshake.
     pub async fn encode_server_hello<'buf, Rng>(
         legacy_session_id: &[u8],
         supported_version: DtlsVersions,
@@ -713,7 +469,7 @@ impl<'a> ServerRecord<'a> {
         selected_psk_identity: u16,
         rng: &mut Rng,
         key_schedule: &mut impl GenericKeySchedule,
-        transcript_hasher: &mut impl GenericTranscript,
+        hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &'buf mut EncodingBuffer<'_>,
     ) -> Result<(), ()>
     where
@@ -747,49 +503,45 @@ impl<'a> ServerRecord<'a> {
         debug!("Sending server hello");
         trace!("{:?}", server_hello);
 
-        ServerRecord::Handshake(
-            ServerHandshake::ServerHello(server_hello),
-            Encryption::Disabled,
-        )
-        .encode(buf, Some(transcript_hasher), key_schedule)
-        .await
+        Record::Handshake(Handshake::ServerHello(server_hello), Encryption::Disabled)
+            .encode(hasher, buf, key_schedule)
+            .await
     }
 
     /// Create a server's finished message.
     pub async fn encode_finished(
         verify: &[u8],
         key_schedule: &mut impl GenericKeySchedule,
-        transcript_hasher: &mut impl GenericTranscript,
+        hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &mut EncodingBuffer<'_>,
     ) -> Result<(), ()> {
-        let finished = ServerRecord::Handshake(
-            ServerHandshake::ServerFinished(Finished { verify }),
+        let finished = Record::Handshake(
+            Handshake::Finished(Finished { verify }),
             Encryption::Enabled,
         );
 
-        debug!("Sending server finished");
+        debug!("Sending finished");
         trace!("{:?}", finished);
 
-        finished
-            .encode(buf, Some(transcript_hasher), key_schedule)
-            .await
+        finished.encode(hasher, buf, key_schedule).await
     }
 
     /// Create a server's ACK message.
     pub async fn encode_ack(
         record_numbers: &[RecordNumber],
         key_schedule: &mut impl GenericKeySchedule,
+        hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &mut EncodingBuffer<'_>,
     ) -> Result<(), ()> {
         let ack = Ack {
             record_numbers: EncodeOrParse::Encode(record_numbers),
         };
 
-        debug!("Sending server ACK");
+        debug!("Sending ACK");
         trace!("{:?}", ack);
 
-        ServerRecord::Ack(ack, Encryption::Enabled)
-            .encode::<NoTranscript>(buf, None, key_schedule)
+        Record::Ack(ack, Encryption::Enabled)
+            .encode(hasher, buf, key_schedule)
             .await
             .map(|_| ())
     }
@@ -797,6 +549,7 @@ impl<'a> ServerRecord<'a> {
     /// Create a server's Alert message.
     pub async fn encode_alert<CipherSuite: DtlsCipherSuite>(
         key_schedule: &mut impl GenericKeySchedule,
+        hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &mut EncodingBuffer<'_>,
         encrypted: Encryption,
         level: AlertLevel,
@@ -807,38 +560,36 @@ impl<'a> ServerRecord<'a> {
     {
         let alert = Alert { level, description };
 
-        debug!("Sending server Alert");
+        debug!("Sending Alert");
         trace!("{:?}", alert);
 
-        ClientRecord::Alert(alert, encrypted)
-            .encode(buf, key_schedule)
+        Record::Alert(alert, encrypted)
+            .encode(hasher, buf, key_schedule)
             .await
             .map(|_| ())
     }
 
     /// Create a servers's Application Data message.
-    pub async fn encode_application_data<CipherSuite: DtlsCipherSuite>(
+    pub async fn encode_application_data(
+        hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &mut EncodingBuffer<'_>,
-        key_schedule: &mut KeySchedule<CipherSuite, false>,
+        key_schedule: &mut impl GenericKeySchedule,
         user_content: &[u8],
-    ) -> Result<(), ()>
-    where
-        CipherSuite: DtlsCipherSuite,
-    {
+    ) -> Result<(), ()> {
         debug!("Sending server application data");
         trace!("content = {:?}", user_content);
 
-        ServerRecord::ApplicationData(user_content)
-            .encode::<NoTranscript>(buf, None, key_schedule)
+        Record::ApplicationData(user_content)
+            .encode(hasher, buf, key_schedule)
             .await
             .map(|_| ())
     }
 
     /// Encode the record into a buffer. Returns (packet to send, content to hash).
-    async fn encode<'buf, Hasher: GenericTranscript>(
+    async fn encode<'buf>(
         &self,
+        hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &'buf mut EncodingBuffer<'_>,
-        transcript_hasher: Option<&mut Hasher>,
         cipher: &mut impl GenericKeySchedule,
     ) -> Result<(), ()> {
         encode_record(
@@ -846,82 +597,80 @@ impl<'a> ServerRecord<'a> {
             cipher,
             self.is_encrypted(),
             self.content_type(),
-            |buf| self.encode_content(transcript_hasher, buf),
+            |buf| self.encode_content(hasher, buf),
         )
         .await
     }
 
     fn encode_content<'buf>(
         &self,
-        transcript_hasher: Option<&mut impl GenericTranscript>,
-        buf: &'buf mut EncodingBuffer,
+        hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
+        buf: &'buf mut EncodingBuffer<'_>,
     ) -> Result<(), ()> {
         let start = buf.current_pos_ptr();
 
-        match self {
+        let binders = match self {
             // NOTE: Each record encoder needs to update the transcript hash at their end.
-            ServerRecord::Handshake(handshake, _) => handshake.encode(buf)?,
-            ServerRecord::Alert(alert, _) => alert.encode(buf)?,
-            ServerRecord::Heartbeat(_) => todo!(),
-            ServerRecord::Ack(ack, _) => ack.encode(buf)?,
-            ServerRecord::ApplicationData(user_data) => buf.extend_from_slice(user_data)?,
-        }
+            Record::Handshake(handshake, _) => handshake.encode(buf)?,
+            Record::Alert(alert, _) => {
+                alert.encode(buf)?;
+                None
+            }
+            Record::Heartbeat(_) => todo!(),
+            Record::Ack(ack, _) => ack.encode(buf).map(|_| None)?,
+            Record::ApplicationData(user_data) => {
+                buf.extend_from_slice(user_data)?;
+                None
+            }
+        };
 
         let end = buf.current_pos_ptr();
 
-        if let Some(hasher) = transcript_hasher {
-            hasher.update(
-                RecordPayloadPositions {
-                    start,
-                    binders: None,
-                    end,
-                }
-                .as_slice(&buf)
-                .ok_or(())?,
-            );
-        }
+        hasher((
+            RecordPayloadPositions {
+                start,
+                binders,
+                end,
+            },
+            &buf,
+        ));
 
         Ok(())
     }
 
     fn is_encrypted(&self) -> bool {
         match self {
-            ServerRecord::Handshake(_, Encryption::Disabled)
-            | ServerRecord::Alert(_, Encryption::Disabled)
-            | ServerRecord::Ack(_, Encryption::Disabled) => false,
+            Record::Handshake(_, Encryption::Disabled)
+            | Record::Alert(_, Encryption::Disabled)
+            | Record::Ack(_, Encryption::Disabled) => false,
             _ => true,
         }
     }
 
     fn content_type(&self) -> ContentType {
         match self {
-            ServerRecord::Handshake(_, _) => ContentType::Handshake,
-            ServerRecord::Alert(_, _) => ContentType::Alert,
-            ServerRecord::Ack(_, _) => ContentType::Ack,
-            ServerRecord::Heartbeat(_) => ContentType::Heartbeat,
-            ServerRecord::ApplicationData(_) => ContentType::ApplicationData,
+            Record::Handshake(_, _) => ContentType::Handshake,
+            Record::Alert(_, _) => ContentType::Alert,
+            Record::Ack(_, _) => ContentType::Ack,
+            Record::Heartbeat(_) => ContentType::Heartbeat,
+            Record::ApplicationData(_) => ContentType::ApplicationData,
         }
     }
 
-    /// Parse a `ServerRecord`. The incoming `buf` will be reduced to not include what's been
+    /// Parse a `Record`. The incoming `buf` will be reduced to not include what's been
     /// parsed after finishing, allowing for parse to be called multiple times.
     ///
     /// If a transcript hasher is supplied, then the hashing will be performed over the plaintext.
-    pub async fn parse<Hash>(
+    pub async fn parse<KeySchedule>(
+        hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &mut &'a mut [u8],
-        transcript_hasher: Option<&mut Hash>,
-        cipher: &mut impl GenericKeySchedule,
-    ) -> Option<ServerRecord<'a>>
+        cipher: Option<&mut KeySchedule>,
+    ) -> Option<(Record<'a>, &'a [u8])>
     where
-        Hash: Digest,
+        KeySchedule: GenericKeySchedule,
     {
-        let r = parse_record(buf, Some(cipher), |content_type, encryption, buf| {
-            // Perform transcript hashing.
-            if let Some(hasher) = transcript_hasher {
-                hasher.update(buf.as_ref())
-            }
-
-            Self::parse_content(content_type, encryption, buf)
+        let r = parse_record(buf, cipher, |content_type, encryption, buf| {
+            Self::parse_content(content_type, encryption, hasher, buf)
         })
         .await;
 
@@ -929,24 +678,43 @@ impl<'a> ServerRecord<'a> {
             trace!("Parsed {:?}", out);
         }
 
-        r.map(|s| s.0)
+        r
     }
 
     fn parse_content(
         content_type: ContentType,
         encryption: Encryption,
+        hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &mut ParseBuffer<'a>,
     ) -> Option<Self> {
-        Some(match content_type {
+        let buffer_that_was_parsed = buf.clone();
+
+        let start = buf.current_pos_ptr();
+
+        let (r, binders) = match content_type {
             ContentType::Handshake => {
-                ServerRecord::Handshake(ServerHandshake::parse(buf)?, encryption)
+                let (hs, binders) = Handshake::parse(buf)?;
+                (Record::Handshake(hs, encryption), binders)
             }
-            ContentType::Ack => ServerRecord::Ack(Ack::parse(buf)?, encryption),
+            ContentType::Ack => (Record::Ack(Ack::parse(buf)?, encryption), None),
             ContentType::Heartbeat => todo!(),
-            ContentType::Alert => ServerRecord::Alert(Alert::parse(buf)?, encryption),
-            ContentType::ApplicationData => ServerRecord::ApplicationData(buf.pop_rest()),
+            ContentType::Alert => (Record::Alert(Alert::parse(buf)?, encryption), None),
+            ContentType::ApplicationData => (Record::ApplicationData(buf.pop_rest()), None),
             ContentType::ChangeCipherSpec => todo!(),
-        })
+        };
+
+        let end = buf.current_pos_ptr();
+
+        hasher((
+            RecordPayloadPositions {
+                start,
+                binders,
+                end,
+            },
+            buffer_that_was_parsed.as_ref(),
+        ));
+
+        Some(r)
     }
 }
 

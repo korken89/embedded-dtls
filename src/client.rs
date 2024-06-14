@@ -3,12 +3,12 @@ use crate::{
     cipher_suites::DtlsCipherSuite,
     client::config::ClientConfig,
     connection::Connection,
-    handshake::ServerHandshake,
+    handshake::Handshake,
     key_schedule::KeySchedule,
-    record::{ClientRecord, EncodeOrParse, GenericKeySchedule, ServerRecord},
+    record::{EncodeOrParse, GenericKeySchedule, Record},
     Endpoint, Error,
 };
-use defmt_or_log::{debug, error, info, trace, FormatOrDebug};
+use defmt_or_log::{debug, error, info, trace};
 use digest::Digest;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::{EphemeralSecret, PublicKey};
@@ -46,7 +46,15 @@ where
     // Send ClientHello.
     {
         let mut ser_buf = EncodingBuffer::new(buf);
-        let positions = ClientRecord::encode_client_hello::<CipherSuite, _>(
+
+        // We read out the positions instead of doing hashing inline due to the fact that
+        // the binders need to be inserted and hashed as well. The hasher API does not allow
+        // for writing within the closure.
+        let mut positions = Default::default();
+        Record::encode_client_hello::<CipherSuite, _>(
+            |(p, _buf)| {
+                positions = p;
+            },
             &mut ser_buf,
             config,
             &our_public_key,
@@ -89,16 +97,23 @@ where
         // let mut parse_buffer = ParseBufferMut::new(resp);
 
         let shared_secret = {
-            let server_hello =
-                if let ServerRecord::Handshake(ServerHandshake::ServerHello(hello), _) =
-                    ServerRecord::parse(&mut resp, Some(&mut transcript_hasher), &mut key_schedule)
-                        .await
-                        .ok_or(Error::InvalidServerHello)?
-                {
-                    hello
-                } else {
-                    return Err(Error::InvalidServerHello);
-                };
+            let server_hello = if let (Record::Handshake(Handshake::ServerHello(hello), _), _) =
+                Record::parse(
+                    |(p, buf)| {
+                        if let Some(buf) = p.as_slice(&buf) {
+                            transcript_hasher.update(buf);
+                        }
+                    },
+                    &mut resp,
+                    Some(&mut key_schedule),
+                )
+                .await
+                .ok_or(Error::InvalidServerHello)?
+            {
+                hello
+            } else {
+                return Err(Error::InvalidServerHello);
+            };
 
             trace!(
                 "Client transcript after server hello: {:?}",
@@ -129,14 +144,17 @@ where
                 resp
             };
 
-            if let ServerRecord::Handshake(ServerHandshake::ServerFinished(fin), _) =
-                ServerRecord::parse::<CipherSuite::Hash>(
-                    &mut buf,
-                    Some(&mut transcript_hasher),
-                    &mut key_schedule,
-                )
-                .await
-                .ok_or(Error::InvalidServerFinished)?
+            if let (Record::Handshake(Handshake::Finished(fin), _), _) = Record::parse(
+                |(p, buf)| {
+                    if let Some(buf) = p.as_slice(&buf) {
+                        transcript_hasher.update(buf);
+                    }
+                },
+                &mut buf,
+                Some(&mut key_schedule),
+            )
+            .await
+            .ok_or(Error::InvalidServerFinished)?
             {
                 fin
             } else {
@@ -159,7 +177,7 @@ where
         let verify = key_schedule.create_verify_data(&transcript_hasher.clone().finalize(), false);
 
         // Add the Finished message to this datagram.
-        ClientRecord::encode_finished(ser_buf, &mut key_schedule, &verify)
+        Record::encode_finished(&verify, &mut key_schedule, |_| {}, ser_buf)
             .await
             .map_err(|_| Error::InsufficientSpace)?;
 
@@ -173,8 +191,8 @@ where
     {
         let mut ack = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
 
-        let ack = if let ServerRecord::Ack(ack, _) =
-            ServerRecord::parse::<CipherSuite::Hash>(&mut ack, None, &mut key_schedule)
+        let ack = if let (Record::Ack(ack, _), _) =
+            Record::parse(|_| {}, &mut ack, Some(&mut key_schedule))
                 .await
                 .ok_or(Error::InvalidServerFinished)?
         {

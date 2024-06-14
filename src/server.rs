@@ -4,12 +4,12 @@ use crate::{
     connection::Connection,
     handshake::{
         extensions::{DtlsVersions, Psk},
-        ClientHandshake,
+        Handshake,
     },
     key_schedule::KeySchedule,
     record::{
-        CipherArguments, ClientRecord, DTlsCiphertextHeader, GenericKeySchedule, GenericTranscript,
-        NoKeySchedule, RecordNumber, ServerRecord,
+        CipherArguments, DTlsCiphertextHeader, GenericKeySchedule, NoKeySchedule, Record,
+        RecordNumber,
     },
     server::config::{Identity, Key, ServerConfig},
     Endpoint, Error,
@@ -48,14 +48,23 @@ where
     trace!("Got datagram!");
 
     let (client_hello, positions, buffer_that_was_parsed) = {
-        let record = ClientRecord::parse::<NoKeySchedule>(&mut resp, None)
-            .await
-            .ok_or(Error::InvalidClientHello)?;
+        // We read out the positions instead of doing hashing inline due to the fact that
+        // the binders can't be calculated before the cipher suite is known.
+        let mut positions = Default::default();
+        let record = Record::parse::<NoKeySchedule>(
+            |(p, _buf)| {
+                positions = p;
+            },
+            &mut resp,
+            None,
+        )
+        .await
+        .ok_or(Error::InvalidClientHello)?;
 
-        if let ((ClientRecord::Handshake(ClientHandshake::ClientHello(hello), _), pos), buf) =
+        if let (Record::Handshake(Handshake::ClientHello(hello), _), buffer_that_was_parsed) =
             record
         {
-            (hello, pos, buf)
+            (hello, positions, buffer_that_was_parsed)
         } else {
             return Err(Error::InvalidClientHello);
         }
@@ -126,7 +135,7 @@ where
 
         // TODO: We hardcode the selected PSK as the first one for now.
         let mut enc_buf = EncodingBuffer::new(buf);
-        ServerRecord::encode_server_hello(
+        Record::encode_server_hello(
             &legacy_session_id,
             DtlsVersions::V1_3,
             our_public_key,
@@ -134,7 +143,11 @@ where
             0,
             rng,
             &mut key_schedule,
-            &mut transcript_hasher,
+            |(p, buf)| {
+                if let Some(buf) = p.as_slice(&buf) {
+                    transcript_hasher.update(buf);
+                }
+            },
             &mut enc_buf,
         )
         .await
@@ -152,10 +165,14 @@ where
 
         // Add the Finished message to this datagram.
         let verify = key_schedule.create_verify_data(&transcript_hasher.clone().finalize(), true);
-        ServerRecord::encode_finished(
+        Record::encode_finished(
             &verify,
             &mut key_schedule,
-            &mut transcript_hasher,
+            |(p, buf)| {
+                if let Some(buf) = p.as_slice(&buf) {
+                    transcript_hasher.update(buf);
+                }
+            },
             &mut enc_buf,
         )
         .await
@@ -173,8 +190,8 @@ where
             key_schedule.create_verify_data(&transcript_hasher.clone().finalize(), false);
 
         let finished = {
-            if let ((ClientRecord::Handshake(ClientHandshake::ClientFinished(fin), _), _), _) =
-                ClientRecord::parse(&mut resp, Some(&mut key_schedule))
+            if let (Record::Handshake(Handshake::Finished(fin), _), _) =
+                Record::parse(|_| {}, &mut resp, Some(&mut key_schedule))
                     .await
                     .ok_or(Error::InvalidClientFinished)?
             {
@@ -201,12 +218,13 @@ where
         let sequence_number = key_schedule.read_record_number();
         let epoch = key_schedule.epoch_number();
 
-        ServerRecord::encode_ack(
+        Record::encode_ack(
             &[RecordNumber {
                 epoch,
                 sequence_number,
             }],
             &mut key_schedule,
+            |_| {},
             &mut enc_buf,
         )
         .await
@@ -364,12 +382,6 @@ impl GenericKeySchedule for ServerKeySchedule {
 #[derive(Clone, Debug)]
 pub enum TranscriptHasher {
     Sha256(Sha256),
-}
-
-impl GenericTranscript for TranscriptHasher {
-    fn update(&mut self, data: &[u8]) {
-        self.update(data);
-    }
 }
 
 impl TranscriptHasher {
