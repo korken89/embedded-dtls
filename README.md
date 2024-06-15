@@ -1,4 +1,4 @@
-# `embedded-dtls`
+# `embedded-dtls` ⚠️ WIP ⚠️
 
 > `embedded-dtls` implements a `#![no_std]` server and client for DTLS 1.3, with support for hardware acceleration by cryptographic coprocessors on the client.
 
