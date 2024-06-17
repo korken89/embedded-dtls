@@ -1,5 +1,5 @@
 use core::pin::pin;
-use defmt_or_log::{debug, derive_format_or_debug, error};
+use defmt_or_log::{debug, derive_format_or_debug, error, trace};
 use embassy_futures::select::{select, Either};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
 use embedded_hal_async::delay::DelayNs;
@@ -187,26 +187,37 @@ where
             match Record::parse(|_| {}, &mut data, Some(*key_schedule.lock().await)).await {
                 Some((r, _)) => match r {
                     Record::Handshake(_, _) => {
+                        debug!("Parsed a handshake");
+                        trace!("{:?}", r);
                         // TODO: Perform key update (if it is key update)
 
                         todo!();
                     }
                     Record::Alert(_, _) => {
+                        debug!("Parsed an alert");
+                        trace!("{:?}", r);
                         // TODO: Handle alert, maybe close connection
 
                         todo!();
                     }
                     Record::Ack(_, _) => {
+                        debug!("Parsed an ack");
+                        trace!("{:?}", r);
                         // TODO: Check if it's ACK for the key update
 
                         todo!();
                     }
                     Record::Heartbeat(_) => {
+                        debug!("Parsed a heartbeat");
+                        trace!("{:?}", r);
                         // TODO: Send response (if we support it)
 
                         todo!();
                     }
                     Record::ApplicationData(data) => {
+                        debug!("Parsed application data");
+                        trace!("{:?}", data);
+
                         rx_sender
                             .send(data)
                             .await
@@ -215,10 +226,6 @@ where
                 },
                 None => {
                     debug!("Parsing of record failed");
-                    // trace!("{:?}");
-                    // TODO: log
-
-                    todo!();
                 }
             }
         }
