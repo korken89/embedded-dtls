@@ -110,6 +110,11 @@ where
     'outer: loop {
         let buf = &mut EncodingBuffer::new(tx_buffer);
 
+        // Section B.2, RFC9147 gives the maximum to 2^23.5 ~ 11.86M encodings.
+        if key_schedule.lock().await.write_record_number() > 11_500_000 {
+            // TODO: Perform key update.
+        }
+
         {
             let payload = tx_receiver
                 .peek()
