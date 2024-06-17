@@ -241,6 +241,11 @@ mod encoding_buffer {
             self.buf.len()
         }
 
+        /// Get the space left in the buffer.
+        pub fn space_left(&self) -> usize {
+            self.capacity() - self.len()
+        }
+
         /// Current index of the buffer.
         pub fn index(&self) -> usize {
             self.idx

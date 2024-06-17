@@ -68,25 +68,30 @@ pub trait Endpoint: FormatOrDebug {
 }
 
 /// Producer side of an application data queue.
-pub trait ApplicationDataProducer {
+pub trait ApplicationDataSender {
     /// Error type.
-    type Error;
+    type Error: FormatOrDebug;
 
-    /// Push a full payload to the application data queue.
+    /// Send a full payload to the application data queue.
     ///
     /// If this returns an error it is interpreted as the queue being closed.
-    async fn push(&mut self, data: impl AsRef<[u8]>) -> Result<(), Self::Error>;
+    async fn send(&mut self, data: impl AsRef<[u8]>) -> Result<(), Self::Error>;
 }
 
 /// Consumer side of an application data queue.
-pub trait ApplicationDataConsumer {
+pub trait ApplicationDataReceiver {
     /// Error type.
-    type Error;
+    type Error: FormatOrDebug;
 
-    /// Pop a full payload to the application data queue.
+    /// Peek a full payload from the application data queue.
     ///
     /// If this returns an error it is interpreted as the queue being closed.
-    async fn pop(&mut self) -> Result<impl AsRef<[u8]>, Self::Error>;
+    async fn peek(&mut self) -> Result<impl AsRef<[u8]>, Self::Error>;
+
+    /// Pop the latest payload from the application data queue.
+    ///
+    /// If this returns an error it is interpreted as the queue being closed.
+    fn pop(&mut self) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]
@@ -139,26 +144,43 @@ mod test {
     pub fn framed_queue(depth: usize) -> (AppSender, AppReceiver) {
         let (s, r) = channel(depth);
 
-        (AppSender(s), AppReceiver(r))
+        (
+            AppSender(s),
+            AppReceiver {
+                recv: r,
+                store: None,
+            },
+        )
     }
 
     pub struct AppSender(Sender<Vec<u8>>);
 
-    impl crate::ApplicationDataProducer for AppSender {
+    impl crate::ApplicationDataSender for AppSender {
         type Error = ();
 
-        async fn push(&mut self, data: impl AsRef<[u8]>) -> Result<(), Self::Error> {
+        async fn send(&mut self, data: impl AsRef<[u8]>) -> Result<(), Self::Error> {
             self.0.send(data.as_ref().into()).await.map_err(|_| ())
         }
     }
 
-    pub struct AppReceiver(Receiver<Vec<u8>>);
+    pub struct AppReceiver {
+        recv: Receiver<Vec<u8>>,
+        store: Option<Vec<u8>>,
+    }
 
-    impl crate::ApplicationDataConsumer for AppReceiver {
+    impl crate::ApplicationDataReceiver for AppReceiver {
         type Error = ();
 
-        async fn pop(&mut self) -> Result<impl AsRef<[u8]>, Self::Error> {
-            self.0.recv().await.ok_or(())
+        async fn peek(&mut self) -> Result<impl AsRef<[u8]>, Self::Error> {
+            if self.store.is_none() {
+                self.store = Some(self.recv.recv().await.ok_or(())?);
+            }
+            self.store.as_ref().ok_or(())
+        }
+
+        fn pop(&mut self) -> Result<(), Self::Error> {
+            self.store = None;
+            Ok(())
         }
     }
 

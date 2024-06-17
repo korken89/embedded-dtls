@@ -19,6 +19,9 @@ use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::PublicKey;
 
+/// The number of bytes that header (4), encoding (1), and encryption (16) will at a minimum use.
+pub(crate) const MINIMUM_CIPHERTEXT_OVERHEAD: usize = 4 + 1 + 16;
+
 /// Marker for encryption being enabled or disabled.
 #[derive_format_or_debug]
 #[derive(Copy, Clone, PartialOrd, PartialEq)]
@@ -508,7 +511,7 @@ impl<'a> Record<'a> {
             .await
     }
 
-    /// Create a server's finished message.
+    /// Create a finished message.
     pub async fn encode_finished(
         verify: &[u8],
         key_schedule: &mut impl GenericKeySchedule,
@@ -526,7 +529,7 @@ impl<'a> Record<'a> {
         finished.encode(hasher, buf, key_schedule).await
     }
 
-    /// Create a server's ACK message.
+    /// Create a ACK message.
     pub async fn encode_ack(
         record_numbers: &[RecordNumber],
         key_schedule: &mut impl GenericKeySchedule,
@@ -546,7 +549,7 @@ impl<'a> Record<'a> {
             .map(|_| ())
     }
 
-    /// Create a server's Alert message.
+    /// Create a Alert message.
     pub async fn encode_alert<CipherSuite: DtlsCipherSuite>(
         key_schedule: &mut impl GenericKeySchedule,
         hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
@@ -569,18 +572,17 @@ impl<'a> Record<'a> {
             .map(|_| ())
     }
 
-    /// Create a servers's Application Data message.
+    /// Create a Application Data message.
     pub async fn encode_application_data(
-        hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &mut EncodingBuffer<'_>,
         key_schedule: &mut impl GenericKeySchedule,
         user_content: &[u8],
     ) -> Result<(), ()> {
-        debug!("Sending server application data");
+        debug!("Sending application data");
         trace!("content = {:?}", user_content);
 
         Record::ApplicationData(user_content)
-            .encode(hasher, buf, key_schedule)
+            .encode(|_| {}, buf, key_schedule)
             .await
             .map(|_| ())
     }
