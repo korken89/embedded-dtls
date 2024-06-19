@@ -1,9 +1,10 @@
+use core::convert::Infallible;
+use core::ops::DerefMut;
 use core::pin::pin;
 use defmt_or_log::{debug, derive_format_or_debug, error, trace};
 use embassy_futures::select::{select, Either};
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
 use embedded_hal_async::delay::DelayNs;
-use std::convert::Infallible;
+use select_sharing::SelectSharing;
 
 use crate::{
     buffer::EncodingBuffer,
@@ -48,7 +49,7 @@ where
     ///
     /// The `{rx, tx}_buffer` should ideally be the size of the MTU, but may be less as well.
     pub async fn run<Receiver, Sender>(
-        mut self,
+        self,
         rx_buffer: &mut [u8],
         tx_buffer: &mut [u8],
         rx_sender: &mut Sender,
@@ -60,16 +61,19 @@ where
         Receiver: ApplicationDataReceiver,
     {
         // Make sure we can share the key schedule between each path in the select below.
-        let key_schedule = Mutex::<NoopRawMutex, _>::new(&mut self.key_schedule);
+        // TODO: Can we use something different from a mutex here? A `NoopMutex` did not work
+        // as it poisons the entire future to become `!Send` even though it's only used here in
+        // local scope...
+        let key_schedule = &SelectSharing::new(self.key_schedule);
         let socket = &self.socket;
 
         match select(
-            rx_worker::<Socket, Sender, Receiver>(socket, rx_sender, rx_buffer, &key_schedule),
+            rx_worker::<Socket, Sender, Receiver>(socket, rx_sender, rx_buffer, key_schedule),
             tx_worker::<Socket, Sender, Receiver>(
                 socket,
                 tx_receiver,
                 tx_buffer,
-                &key_schedule,
+                key_schedule,
                 delay,
             ),
         )
@@ -99,7 +103,7 @@ async fn tx_worker<Socket, Sender, Receiver>(
     socket: &Socket,
     tx_receiver: &mut Receiver,
     tx_buffer: &mut [u8],
-    key_schedule: &Mutex<NoopRawMutex, &mut impl GenericKeySchedule>,
+    key_schedule: &SelectSharing<impl GenericKeySchedule>,
     delay: &mut impl DelayNs,
 ) -> Result<Infallible, ErrorHelper<Socket, Sender, Receiver>>
 where
@@ -116,15 +120,19 @@ where
         }
 
         {
+            debug!("TX waiting for data");
             let payload = tx_receiver
                 .peek()
                 .await
-                .map_err(|e| ConnectionError::ReceiveError(e))?;
+                .map_err(ConnectionError::ReceiveError)?;
 
             // Encode payload, this is on a fresh buffer and should not fail.
-            if let Err(e) =
-                Record::encode_application_data(buf, *key_schedule.lock().await, payload.as_ref())
-                    .await
+            if let Err(e) = Record::encode_application_data(
+                buf,
+                key_schedule.lock().await.deref_mut(),
+                payload.as_ref(),
+            )
+            .await
             {
                 error!("Encoding of application data failed with error = {:?}", e);
                 continue 'outer;
@@ -137,14 +145,12 @@ where
 
         // Continue filling the buffer until timeout, or full.
         'stuffer: loop {
-            tx_receiver
-                .pop()
-                .map_err(|e| ConnectionError::ReceiveError(e))?;
+            tx_receiver.pop().map_err(ConnectionError::ReceiveError)?;
 
             // We only want to cancel the peek with timeout, not encoding of data.
             let payload = match select(&mut timeout, tx_receiver.peek()).await {
                 Either::First(_) => break 'stuffer,
-                Either::Second(p) => p.map_err(|e| ConnectionError::ReceiveError(e))?,
+                Either::Second(p) => p.map_err(ConnectionError::ReceiveError)?,
             };
 
             // No need to waste time encoding the payload if we know it won't fit.
@@ -154,9 +160,13 @@ where
             }
 
             // Encode payload.
-            if Record::encode_application_data(buf, *key_schedule.lock().await, payload.as_ref())
-                .await
-                .is_err()
+            if Record::encode_application_data(
+                buf,
+                key_schedule.lock().await.deref_mut(),
+                payload.as_ref(),
+            )
+            .await
+            .is_err()
             {
                 debug!("TX buffer full, without predicting");
                 break 'stuffer;
@@ -165,7 +175,7 @@ where
 
         // Send the finished buffer.
         socket
-            .send(&buf)
+            .send(buf)
             .await
             .map_err(|e| ConnectionError::DtlsError(Error::Send(e)))?;
     }
@@ -175,7 +185,7 @@ async fn rx_worker<Socket, Sender, Receiver>(
     socket: &Socket,
     rx_sender: &mut Sender,
     rx_buffer: &mut [u8],
-    key_schedule: &Mutex<NoopRawMutex, &mut impl GenericKeySchedule>,
+    key_schedule: &SelectSharing<impl GenericKeySchedule>,
 ) -> Result<Infallible, ErrorHelper<Socket, Sender, Receiver>>
 where
     Socket: Endpoint,
@@ -183,13 +193,20 @@ where
     Receiver: ApplicationDataReceiver,
 {
     loop {
+        debug!("RX waiting for data");
         let mut data = socket
             .recv(rx_buffer)
             .await
             .map_err(|e| ConnectionError::DtlsError(Error::Recv(e)))?;
 
         while !data.is_empty() {
-            match Record::parse(|_| {}, &mut data, Some(*key_schedule.lock().await)).await {
+            match Record::parse(
+                |_| {},
+                &mut data,
+                Some(key_schedule.lock().await.deref_mut()),
+            )
+            .await
+            {
                 Some((r, _)) => match r {
                     Record::Handshake(_, _) => {
                         debug!("Parsed a handshake");
@@ -226,7 +243,7 @@ where
                         rx_sender
                             .send(data)
                             .await
-                            .map_err(|e| ConnectionError::SendError(e))?;
+                            .map_err(ConnectionError::SendError)?;
                     }
                 },
                 None => {
@@ -235,4 +252,93 @@ where
             }
         }
     }
+}
+
+mod select_sharing {
+    use core::{
+        cell::UnsafeCell,
+        future::poll_fn,
+        ops::{Deref, DerefMut},
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Poll, Waker},
+    };
+
+    /// Simple helper to share a T between the `select` arms in `Connection::run`.
+    /// If this is locked, then the `do_poll` will be set, causing the waker to be run on unlock.
+    pub struct SelectSharing<T> {
+        inner: UnsafeCell<T>,
+        locked: AtomicBool,
+        do_poll: AtomicBool,
+    }
+
+    unsafe impl<T> Send for SelectSharing<T> {}
+    unsafe impl<T> Sync for SelectSharing<T> {}
+
+    impl<T> SelectSharing<T> {
+        /// Create a new `SelectSharing` wrapper.
+        pub const fn new(val: T) -> Self {
+            Self {
+                inner: UnsafeCell::new(val),
+                locked: AtomicBool::new(false),
+                do_poll: AtomicBool::new(false),
+            }
+        }
+
+        /// Lock the shared resource and gain access to it.
+        pub async fn lock(&self) -> SelectSharingGuard<T> {
+            poll_fn(|cx| {
+                if self
+                    .locked
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    Poll::Ready(SelectSharingGuard {
+                        parent: self,
+                        to_wake: cx.waker().clone(),
+                    })
+                } else {
+                    self.do_poll.store(true, Ordering::Relaxed);
+
+                    Poll::Pending
+                }
+            })
+            .await
+        }
+    }
+
+    /// This type signifies exclusive access to the object protected by `SelectSharing`.
+    pub struct SelectSharingGuard<'a, T> {
+        parent: &'a SelectSharing<T>,
+        to_wake: Waker,
+    }
+
+    impl<'a, T> Deref for SelectSharingGuard<'a, T> {
+        type Target = T;
+
+        fn deref(&self) -> &Self::Target {
+            // SAFETY: This is protected via the `locked` atomic flag.
+            unsafe { &*self.parent.inner.get() }
+        }
+    }
+
+    impl<'a, T> DerefMut for SelectSharingGuard<'a, T> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            // SAFETY: This is protected via the `locked` atomic flag.
+            unsafe { &mut *self.parent.inner.get() }
+        }
+    }
+
+    impl<'a, T> Drop for SelectSharingGuard<'a, T> {
+        fn drop(&mut self) {
+            self.parent.locked.store(false, Ordering::Release);
+
+            if self.parent.do_poll.load(Ordering::Relaxed) {
+                self.parent.do_poll.store(false, Ordering::Relaxed);
+                self.to_wake.wake_by_ref();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod test {}
 }

@@ -101,7 +101,7 @@ mod parse_buffer {
 
         /// Pop a byte.
         pub fn pop_u8(&mut self) -> Option<u8> {
-            let r = *self.data.get(0)?;
+            let r = *self.data.first()?;
             self.data = &self.data[1..];
             Some(r)
         }

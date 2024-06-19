@@ -332,7 +332,7 @@ pub struct PskKeyExchangeModes {
 impl PskKeyExchangeModes {
     /// Encode a `psk_key_exchange_modes` extension.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
-        buf.push_u8(1 as u8)?;
+        buf.push_u8(1)?;
         buf.push_u8(self.ke_modes as u8)?;
 
         Ok(())

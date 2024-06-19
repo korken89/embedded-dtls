@@ -100,7 +100,7 @@ where
             let server_hello = if let (Record::Handshake(Handshake::ServerHello(hello), _), _) =
                 Record::parse(
                     |(p, buf)| {
-                        if let Some(buf) = p.as_slice(&buf) {
+                        if let Some(buf) = p.as_slice(buf) {
                             transcript_hasher.update(buf);
                         }
                     },
@@ -146,7 +146,7 @@ where
 
             if let (Record::Handshake(Handshake::Finished(fin), _), _) = Record::parse(
                 |(p, buf)| {
-                    if let Some(buf) = p.as_slice(&buf) {
+                    if let Some(buf) = p.as_slice(buf) {
                         transcript_hasher.update(buf);
                     }
                 },
@@ -181,7 +181,7 @@ where
             .await
             .map_err(|_| Error::InsufficientSpace)?;
 
-        socket.send(&ser_buf).await.map_err(|e| Error::Send(e))?;
+        socket.send(ser_buf).await.map_err(|e| Error::Send(e))?;
     }
 
     // Update key schedule to Master Secret.

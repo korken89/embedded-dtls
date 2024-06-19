@@ -176,7 +176,7 @@ impl DtlsCipher for ChaCha20Poly1305Cipher {
         defmt_or_log::debug!("Decrypting with nonce: {:?}", nonce.as_slice());
 
         self.aead
-            .decrypt_in_place(nonce, &unified_hdr, ciphertext_with_tag)
+            .decrypt_in_place(nonce, unified_hdr, ciphertext_with_tag)
     }
 
     async fn apply_mask_for_record_number(
@@ -192,7 +192,7 @@ impl DtlsCipher for ChaCha20Poly1305Cipher {
         let block_counter = u32::from_le_bytes(ciphertext[..4].try_into().unwrap());
 
         let iv = &ciphertext[4..];
-        let mut cipher = <ChaCha20 as KeyIvInit>::new(&self.mask_key, iv.try_into().unwrap());
+        let mut cipher = <ChaCha20 as KeyIvInit>::new(&self.mask_key, iv.into());
         cipher.seek(block_counter as u64 * 64); // Block size for Chacha is 64 bytes.
         cipher.apply_keystream(record_number);
 

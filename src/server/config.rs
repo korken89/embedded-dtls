@@ -50,7 +50,7 @@ where
 
 impl<'a> Key<'a> {
     pub(crate) fn as_slice(&self) -> &[u8] {
-        &self.0
+        self.0
     }
 }
 

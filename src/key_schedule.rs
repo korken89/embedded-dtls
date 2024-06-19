@@ -304,10 +304,7 @@ where
 {
     /// Check if the key schedule is uninitialized.
     pub fn is_uninitialized(&self) -> bool {
-        match &self.keyschedule_state {
-            KeyScheduleState::Uninitialized => true,
-            _ => false,
-        }
+        matches!(&self.keyschedule_state, KeyScheduleState::Uninitialized)
     }
 
     /// Derive a secret for the current state in the key schedule.
@@ -581,7 +578,7 @@ where
     fn create_traffic_keying_material<KeySize: ArrayLength<u8>, IvSize: ArrayLength<u8>>(
         secret: &HashArray<<CipherSuite as DtlsCipherSuite>::Hash>,
     ) -> TrafficKeyingMaterial<KeySize, IvSize> {
-        let hkdf = SimpleHkdf::from_prk(&secret).unwrap();
+        let hkdf = SimpleHkdf::from_prk(secret).unwrap();
 
         let mut write_key = GenericArray::default();
         hkdf_make_expanded_label::<<CipherSuite as DtlsCipherSuite>::Hash>(

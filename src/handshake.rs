@@ -249,7 +249,7 @@ impl<'a> ClientHello<'a> {
         if self.random.len() != 32 {
             return Err(());
         }
-        buf.extend_from_slice(&self.random)?;
+        buf.extend_from_slice(self.random)?;
 
         // Legacy Session ID.
         buf.push_u8(0)?;
@@ -470,11 +470,11 @@ impl<'a> ServerHello<'a> {
         buf.extend_from_slice(&LEGACY_DTLS_VERSION)?;
 
         // Random.
-        buf.extend_from_slice(&self.random)?;
+        buf.extend_from_slice(self.random)?;
 
         // Legacy Session ID echo.
         buf.push_u8(self.legacy_session_id_echo.len() as u8)?;
-        buf.extend_from_slice(&self.legacy_session_id_echo)?;
+        buf.extend_from_slice(self.legacy_session_id_echo)?;
 
         // Selected cipher suite.
         buf.push_u16_be(self.cipher_suite_index)?;
@@ -600,7 +600,7 @@ pub struct Finished<'a> {
 impl<'a> Finished<'a> {
     /// Encode a Finished payload in an Handshake.
     pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
-        buf.extend_from_slice(&self.verify)
+        buf.extend_from_slice(self.verify)
     }
 
     /// Parse a finished message.

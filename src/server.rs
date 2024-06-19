@@ -144,7 +144,7 @@ where
             rng,
             &mut key_schedule,
             |(p, buf)| {
-                if let Some(buf) = p.as_slice(&buf) {
+                if let Some(buf) = p.as_slice(buf) {
                     transcript_hasher.update(buf);
                 }
             },
@@ -169,7 +169,7 @@ where
             &verify,
             &mut key_schedule,
             |(p, buf)| {
-                if let Some(buf) = p.as_slice(&buf) {
+                if let Some(buf) = p.as_slice(buf) {
                     transcript_hasher.update(buf);
                 }
             },

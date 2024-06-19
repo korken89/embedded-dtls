@@ -180,7 +180,7 @@ impl<'a> RecordNumberIter<'a> {
         let record_numbers = buf.pop_slice(record_numbers_size as usize)?;
 
         Some(Self {
-            record_numbers: ParseBuffer::new(&record_numbers),
+            record_numbers: ParseBuffer::new(record_numbers),
         })
     }
 }
@@ -483,7 +483,7 @@ impl<'a> Record<'a> {
 
         let server_hello = ServerHello {
             version: LEGACY_DTLS_VERSION,
-            legacy_session_id_echo: &legacy_session_id,
+            legacy_session_id_echo: legacy_session_id,
             cipher_suite_index: selected_cipher_suite,
             random: &random,
             extensions: ServerExtensions {
@@ -550,17 +550,14 @@ impl<'a> Record<'a> {
     }
 
     /// Create a Alert message.
-    pub async fn encode_alert<CipherSuite: DtlsCipherSuite>(
+    pub async fn encode_alert(
         key_schedule: &mut impl GenericKeySchedule,
         hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &mut EncodingBuffer<'_>,
         encrypted: Encryption,
         level: AlertLevel,
         description: AlertDescription,
-    ) -> Result<(), ()>
-    where
-        CipherSuite: DtlsCipherSuite,
-    {
+    ) -> Result<(), ()> {
         let alert = Alert { level, description };
 
         debug!("Sending Alert");
@@ -604,10 +601,10 @@ impl<'a> Record<'a> {
         .await
     }
 
-    fn encode_content<'buf>(
+    fn encode_content(
         &self,
         hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
-        buf: &'buf mut EncodingBuffer<'_>,
+        buf: &mut EncodingBuffer<'_>,
     ) -> Result<(), ()> {
         let start = buf.current_pos_ptr();
 
@@ -634,19 +631,19 @@ impl<'a> Record<'a> {
                 binders,
                 end,
             },
-            &buf,
+            buf,
         ));
 
         Ok(())
     }
 
     fn is_encrypted(&self) -> bool {
-        match self {
+        !matches!(
+            self,
             Record::Handshake(_, Encryption::Disabled)
-            | Record::Alert(_, Encryption::Disabled)
-            | Record::Ack(_, Encryption::Disabled) => false,
-            _ => true,
-        }
+                | Record::Alert(_, Encryption::Disabled)
+                | Record::Ack(_, Encryption::Disabled)
+        )
     }
 
     fn content_type(&self) -> ContentType {
@@ -1130,8 +1127,8 @@ where
             };
 
             // Split the buffer into what should be parsed.
-            let b = core::mem::replace(buf, &mut []);
-            let (to_parse, next_datagram) = b.split_at_mut(header_length + payload_length as usize);
+            let b = core::mem::take(buf);
+            let (to_parse, next_datagram) = b.split_at_mut(header_length + payload_length);
             let _ = core::mem::replace(buf, next_datagram);
 
             // Split into header and payload.
@@ -1179,7 +1176,7 @@ where
             }
 
             // Split the buffer into what should be parsed.
-            let b = core::mem::replace(buf, &mut []);
+            let b = core::mem::take(buf);
             let (to_parse, next_datagram) = b.split_at_mut(header_length + header.length as usize);
             let _ = core::mem::replace(buf, next_datagram);
 
@@ -1197,8 +1194,8 @@ where
 }
 
 /// Encode a plaintext.
-fn encode_plaintext<'buf, Ret>(
-    buf: &'buf mut EncodingBuffer,
+fn encode_plaintext<Ret>(
+    buf: &mut EncodingBuffer,
     content_type: ContentType,
     epoch: u16,
     sequence_number: U48,
@@ -1287,7 +1284,7 @@ async fn encode_ciphertext<'buf, Ret>(
 
     // ------ Encrypt payload
     {
-        let plaintext_position = content_start..innerplaintext_end as usize;
+        let plaintext_position = content_start..innerplaintext_end;
 
         // Split the buffer into the 2 slices.
         let (unified_hdr, payload_with_tag) =

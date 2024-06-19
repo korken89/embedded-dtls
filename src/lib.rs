@@ -108,6 +108,7 @@ mod test {
         server::open_server,
     };
     use defmt_or_log::trace;
+    use embedded_hal_async::delay::DelayNs;
     use rand::{rngs::StdRng, SeedableRng};
     use tokio::sync::{
         mpsc::{channel, Receiver, Sender},
@@ -184,6 +185,14 @@ mod test {
         }
     }
 
+    struct Delay {}
+
+    impl DelayNs for Delay {
+        async fn delay_ns(&mut self, ns: u32) {
+            tokio::time::sleep(Duration::from_nanos(ns as _)).await;
+        }
+    }
+
     struct ChannelSocket {
         who: &'static str,
         rx: Mutex<Receiver<Vec<u8>>>,
@@ -239,6 +248,90 @@ mod test {
         )
     }
 
+    async fn client(client_socket: ChannelSocket) {
+        let client_buf = &mut [0; 1024];
+        // let mut rng = FakeRandom { fill: 0xaa };
+        let mut rng: StdRng = SeedableRng::from_entropy();
+        let client_config = ClientConfig {
+            psk: Psk {
+                identity: b"hello world",
+                key: b"11111234567890qwertyuiopasdfghjklzxc",
+            },
+        };
+
+        let cipher = ChaCha20Poly1305Cipher::default();
+        let mut client_connection = open_client::<_, _, DtlsEcdhePskWithChacha20Poly1305Sha256>(
+            &mut rng,
+            client_buf,
+            client_socket,
+            cipher,
+            &client_config,
+        )
+        .await
+        .unwrap();
+
+        let (mut tx_sender, mut tx_receiver) = framed_queue(10);
+        let (mut rx_sender, mut rx_receiver) = framed_queue(10);
+
+        let rx_buf = &mut vec![0; 1536];
+        let tx_buf = &mut vec![0; 1536];
+
+        if let Err(e) = client_connection
+            .run(
+                rx_buf,
+                tx_buf,
+                &mut rx_sender,
+                &mut tx_receiver,
+                &mut Delay {},
+            )
+            .await
+        {
+            // ..
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    async fn server(server_socket: ChannelSocket) {
+        let psk = [(
+            server::config::Identity::from(b"hello world"),
+            server::config::Key::from(b"11111234567890qwertyuiopasdfghjklzxc"),
+        )];
+
+        let server_config = ServerConfig { psk: &psk };
+
+        let buf = &mut vec![0; 16 * 1024];
+        let rng = &mut rand::rngs::OsRng;
+        // let rng = &mut FakeRandom { fill: 0xbb };
+
+        let mut server_connection = open_server(server_socket, &server_config, rng, buf)
+            .await
+            .unwrap();
+
+        let (mut tx_sender, mut tx_receiver) = framed_queue(10);
+        let (mut rx_sender, mut rx_receiver) = framed_queue(10);
+
+        let rx_buf = &mut vec![0; 1536];
+        let tx_buf = &mut vec![0; 1536];
+
+        if let Err(e) = server_connection
+            .run(
+                rx_buf,
+                tx_buf,
+                &mut rx_sender,
+                &mut tx_receiver,
+                &mut Delay {},
+            )
+            .await
+        {
+            // ..
+        }
+
+        // server_connection.send(b"hello").await;
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
     #[tokio::test]
     async fn open_connection() {
         simple_logger::SimpleLogger::new().env().init().unwrap();
@@ -246,53 +339,10 @@ mod test {
         let (server_socket, client_socket) = make_server_client_channel();
 
         // Client
-        let c = tokio::spawn(async move {
-            let client_buf = &mut [0; 1024];
-            // let mut rng = FakeRandom { fill: 0xaa };
-            let mut rng: StdRng = SeedableRng::from_entropy();
-            let client_config = ClientConfig {
-                psk: Psk {
-                    identity: b"hello world",
-                    key: b"11111234567890qwertyuiopasdfghjklzxc",
-                },
-            };
-
-            let cipher = ChaCha20Poly1305Cipher::default();
-            let mut client_connection =
-                open_client::<_, _, DtlsEcdhePskWithChacha20Poly1305Sha256>(
-                    &mut rng,
-                    client_buf,
-                    client_socket,
-                    cipher,
-                    &client_config,
-                )
-                .await
-                .unwrap();
-
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        });
+        let c = tokio::task::spawn(client(client_socket));
 
         // Server
-        let s = tokio::spawn(async move {
-            let psk = [(
-                server::config::Identity::from(b"hello world"),
-                server::config::Key::from(b"11111234567890qwertyuiopasdfghjklzxc"),
-            )];
-
-            let server_config = ServerConfig { psk: &psk };
-
-            let buf = &mut vec![0; 16 * 1024];
-            let rng = &mut rand::rngs::OsRng;
-            // let rng = &mut FakeRandom { fill: 0xbb };
-
-            let mut server_connection = open_server(server_socket, &server_config, rng, buf)
-                .await
-                .unwrap();
-
-            // server_connection.send(b"hello").await;
-
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        });
+        let s = tokio::task::spawn(server(server_socket));
 
         c.await.unwrap();
         s.await.unwrap();
