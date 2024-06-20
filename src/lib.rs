@@ -107,7 +107,7 @@ mod test {
         server::config::ServerConfig,
         server::open_server,
     };
-    use defmt_or_log::trace;
+    use defmt_or_log::{error, info, trace};
     use embedded_hal_async::delay::DelayNs;
     use rand::{rngs::StdRng, SeedableRng};
     use tokio::sync::{
@@ -260,7 +260,7 @@ mod test {
         };
 
         let cipher = ChaCha20Poly1305Cipher::default();
-        let mut client_connection = open_client::<_, _, DtlsEcdhePskWithChacha20Poly1305Sha256>(
+        let client_connection = open_client::<_, _, DtlsEcdhePskWithChacha20Poly1305Sha256>(
             &mut rng,
             client_buf,
             client_socket,
@@ -273,23 +273,46 @@ mod test {
         let (mut tx_sender, mut tx_receiver) = framed_queue(10);
         let (mut rx_sender, mut rx_receiver) = framed_queue(10);
 
-        let rx_buf = &mut vec![0; 1536];
-        let tx_buf = &mut vec![0; 1536];
+        tokio::spawn(async move {
+            let rx_buf = &mut vec![0; 1536];
+            let tx_buf = &mut vec![0; 1536];
 
-        if let Err(e) = client_connection
-            .run(
-                rx_buf,
-                tx_buf,
-                &mut rx_sender,
-                &mut tx_receiver,
-                &mut Delay {},
-            )
-            .await
-        {
-            // ..
+            if let Err(e) = client_connection
+                .run(
+                    rx_buf,
+                    tx_buf,
+                    &mut rx_sender,
+                    &mut tx_receiver,
+                    &mut Delay {},
+                )
+                .await
+            {
+                error!("Client connection closed with {:?}", e);
+            }
+        });
+
+        // Receive
+        for i in 0..10 {
+            {
+                let data = rx_receiver.peek().await.unwrap();
+                info!("Client got data: {:?}", data.as_ref());
+                assert!(data.as_ref().iter().all(|b| *b == i));
+            }
+            rx_receiver.pop().unwrap();
         }
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Send
+        for i in 10..15 {
+            tx_sender.send(&vec![i; 80]).await.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        for i in 15..20 {
+            tx_sender.send(&vec![i; 80]).await.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     async fn server(server_socket: ChannelSocket) {
@@ -304,32 +327,53 @@ mod test {
         let rng = &mut rand::rngs::OsRng;
         // let rng = &mut FakeRandom { fill: 0xbb };
 
-        let mut server_connection = open_server(server_socket, &server_config, rng, buf)
+        let server_connection = open_server(server_socket, &server_config, rng, buf)
             .await
             .unwrap();
 
         let (mut tx_sender, mut tx_receiver) = framed_queue(10);
         let (mut rx_sender, mut rx_receiver) = framed_queue(10);
 
-        let rx_buf = &mut vec![0; 1536];
-        let tx_buf = &mut vec![0; 1536];
+        tokio::spawn(async move {
+            let rx_buf = &mut vec![0; 1536];
+            let tx_buf = &mut vec![0; 1536];
 
-        if let Err(e) = server_connection
-            .run(
-                rx_buf,
-                tx_buf,
-                &mut rx_sender,
-                &mut tx_receiver,
-                &mut Delay {},
-            )
-            .await
-        {
-            // ..
+            if let Err(e) = server_connection
+                .run(
+                    rx_buf,
+                    tx_buf,
+                    &mut rx_sender,
+                    &mut tx_receiver,
+                    &mut Delay {},
+                )
+                .await
+            {
+                error!("Server connection closed with {:?}", e);
+            }
+        });
+
+        // Send
+        for i in 0..5 {
+            tx_sender.send(&vec![i; 80]).await.unwrap();
         }
 
-        // server_connection.send(b"hello").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        for i in 5..10 {
+            tx_sender.send(&vec![i; 80]).await.unwrap();
+        }
+
+        // Receive
+        for i in 10..20 {
+            {
+                let data = rx_receiver.peek().await.unwrap();
+                info!("Server got data: {:?}", data.as_ref());
+                assert!(data.as_ref().iter().all(|b| *b == i));
+            }
+            rx_receiver.pop().unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     #[tokio::test]
