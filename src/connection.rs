@@ -1,16 +1,25 @@
-use core::convert::Infallible;
-use core::ops::DerefMut;
-use core::pin::pin;
-use defmt_or_log::{debug, derive_format_or_debug, error, trace};
-use embassy_futures::select::{select, Either};
-use embedded_hal_async::delay::DelayNs;
-use select_sharing::SelectSharing;
-
 use crate::{
     buffer::EncodingBuffer,
     record::{GenericKeySchedule, Record, MINIMUM_CIPHERTEXT_OVERHEAD},
     ApplicationDataReceiver, ApplicationDataSender, Endpoint, Error,
 };
+use core::{convert::Infallible, ops::DerefMut, pin::pin};
+use defmt_or_log::{debug, derive_format_or_debug, error, trace};
+use embassy_futures::select::{select, Either};
+use embedded_hal_async::delay::DelayNs;
+use select_sharing::SelectSharing;
+
+// Tasks:
+//
+// 1. App data handling
+//
+// 2. Alert handling
+//
+// 3. Heartbeat handling (read/write)
+//
+// 4. Key updates
+//
+// 5. Close connection
 
 /// Error definitions.
 #[derive_format_or_debug]
@@ -85,17 +94,13 @@ where
     }
 }
 
-// Tasks:
+// Section B.2, RFC9147 gives the maximum to 2^23.5 ~ 11.86M encodings.
+#[cfg(not(feature = "testing_key_updates"))]
+const MAX_PACKETS_BEFORE_KEY_UPDATE: u64 = 11_500_000;
 
-// 1. App data handling
-
-// 2. Alert handling
-
-// 3. Heartbeat handling (read/write)
-
-// 4. Key updates
-
-// 5. Close connection
+// For testing KeyUpdate.
+#[cfg(feature = "testing_key_updates")]
+const MAX_PACKETS_BEFORE_KEY_UPDATE: u64 = 100;
 
 // TODO: How to indicate that TX should do something special for handling internal work?
 //       such as heartbeat request/response or send ACK ASAP?
@@ -114,9 +119,9 @@ where
     'outer: loop {
         let buf = &mut EncodingBuffer::new(tx_buffer);
 
-        // Section B.2, RFC9147 gives the maximum to 2^23.5 ~ 11.86M encodings.
-        if key_schedule.lock().await.write_record_number() > 11_500_000 {
+        if key_schedule.lock().await.write_record_number() > MAX_PACKETS_BEFORE_KEY_UPDATE {
             // TODO: Perform key update.
+            todo!()
         }
 
         {
@@ -265,6 +270,8 @@ mod select_sharing {
 
     /// Simple helper to share a T between the `select` arms in `Connection::run`.
     /// If this is locked, then the `do_poll` will be set, causing the waker to be run on unlock.
+    ///
+    /// Must only be used in a select statement where no external tasks are spawned.
     pub struct SelectSharing<T> {
         inner: UnsafeCell<T>,
         locked: AtomicBool,
@@ -287,6 +294,7 @@ mod select_sharing {
         /// Lock the shared resource and gain access to it.
         pub async fn lock(&self) -> SelectSharingGuard<T> {
             poll_fn(|cx| {
+                // Try lock.
                 if self
                     .locked
                     .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -297,6 +305,7 @@ mod select_sharing {
                         to_wake: cx.waker().clone(),
                     })
                 } else {
+                    // If locked, poll the select when done.
                     self.do_poll.store(true, Ordering::Relaxed);
 
                     Poll::Pending
@@ -330,8 +339,10 @@ mod select_sharing {
 
     impl<'a, T> Drop for SelectSharingGuard<'a, T> {
         fn drop(&mut self) {
+            // Unlock.
             self.parent.locked.store(false, Ordering::Release);
 
+            // Poll if requested.
             if self.parent.do_poll.load(Ordering::Relaxed) {
                 self.parent.do_poll.store(false, Ordering::Relaxed);
                 self.to_wake.wake_by_ref();

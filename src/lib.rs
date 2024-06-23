@@ -107,7 +107,7 @@ mod test {
         server::config::ServerConfig,
         server::open_server,
     };
-    use defmt_or_log::{error, info, trace};
+    use defmt_or_log::{error, trace, warn};
     use embedded_hal_async::delay::DelayNs;
     use rand::{rngs::StdRng, SeedableRng};
     use tokio::sync::{
@@ -295,10 +295,14 @@ mod test {
         for i in 0..10 {
             {
                 let data = rx_receiver.peek().await.unwrap();
-                info!("Client got data: {:?}", data.as_ref());
-                assert!(data.as_ref().iter().all(|b| *b == i));
+                // info!("Client got data: {:?}", data.as_ref());
+                assert!(data.as_ref().iter().all(|b| *b == i as u8));
             }
             rx_receiver.pop().unwrap();
+
+            if i % 1_000_000 == 0 {
+                warn!("receive at {}", i);
+            }
         }
 
         // Send
@@ -360,14 +364,17 @@ mod test {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         for i in 5..10 {
-            tx_sender.send(&vec![i; 80]).await.unwrap();
+            tx_sender.send(&vec![i as u8; 80]).await.unwrap();
+            if i % 1_000_000 == 0 {
+                warn!("send at {}", i);
+            }
         }
 
         // Receive
         for i in 10..20 {
             {
                 let data = rx_receiver.peek().await.unwrap();
-                info!("Server got data: {:?}", data.as_ref());
+                // info!("Server got data: {:?}", data.as_ref());
                 assert!(data.as_ref().iter().all(|b| *b == i));
             }
             rx_receiver.pop().unwrap();

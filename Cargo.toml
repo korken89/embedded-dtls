@@ -42,6 +42,9 @@ log = ["dep:log", "defmt-or-log/log", "embassy-sync/log"]
 # purposes for built-in ciphers. NEVER have this feature enabled in production.
 unsafe_debug_keys = []
 
+# TESTING: Features to help testing the library.
+testing_key_updates = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 l0g = { version = "1.0.0", features = ["log"] }
