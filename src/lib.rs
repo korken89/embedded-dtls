@@ -10,7 +10,7 @@
 //! Heavily inspired by [`embedded-tls`].
 //! [`embedded-tls`]: https://github.com/drogue-iot/embedded-tls
 
-// #![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_std)]
 #![allow(async_fn_in_trait)]
 
 use defmt_or_log::{derive_format_or_debug, FormatOrDebug};

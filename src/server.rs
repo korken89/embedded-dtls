@@ -119,7 +119,7 @@ where
 
         // Perform ECDHE -> Handshake Secret with Key Schedule
         // TODO: For now we assume X25519.
-        let secret = EphemeralSecret::random();
+        let secret = EphemeralSecret::random_from_rng(&mut *rng);
         let our_public_key = PublicKey::from(&secret);
         let shared_secret = secret.diffie_hellman(&their_public_key);
 
