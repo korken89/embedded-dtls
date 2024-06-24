@@ -10,7 +10,7 @@
 //! Heavily inspired by [`embedded-tls`].
 //! [`embedded-tls`]: https://github.com/drogue-iot/embedded-tls
 
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "tokio-queue")), no_std)]
 #![allow(async_fn_in_trait)]
 
 use defmt_or_log::{derive_format_or_debug, FormatOrDebug};
@@ -22,6 +22,7 @@ pub mod connection;
 pub(crate) mod handshake;
 pub(crate) mod integers;
 pub(crate) mod key_schedule;
+pub mod queue_helpers;
 pub(crate) mod record;
 pub mod server;
 
@@ -109,6 +110,7 @@ mod test {
     };
     use defmt_or_log::{error, trace, warn};
     use embedded_hal_async::delay::DelayNs;
+    use queue_helpers::framed_queue;
     use rand::{rngs::StdRng, SeedableRng};
     use tokio::sync::{
         mpsc::{channel, Receiver, Sender},
@@ -140,50 +142,6 @@ mod test {
     }
 
     impl rand::CryptoRng for FakeRandom {}
-
-    /// Create a framed queue with specific maximum depth in number of packets.
-    pub fn framed_queue(depth: usize) -> (AppSender, AppReceiver) {
-        let (s, r) = channel(depth);
-
-        (
-            AppSender(s),
-            AppReceiver {
-                recv: r,
-                store: None,
-            },
-        )
-    }
-
-    pub struct AppSender(Sender<Vec<u8>>);
-
-    impl crate::ApplicationDataSender for AppSender {
-        type Error = ();
-
-        async fn send(&mut self, data: impl AsRef<[u8]>) -> Result<(), Self::Error> {
-            self.0.send(data.as_ref().into()).await.map_err(|_| ())
-        }
-    }
-
-    pub struct AppReceiver {
-        recv: Receiver<Vec<u8>>,
-        store: Option<Vec<u8>>,
-    }
-
-    impl crate::ApplicationDataReceiver for AppReceiver {
-        type Error = ();
-
-        async fn peek(&mut self) -> Result<impl AsRef<[u8]>, Self::Error> {
-            if self.store.is_none() {
-                self.store = Some(self.recv.recv().await.ok_or(())?);
-            }
-            self.store.as_ref().ok_or(())
-        }
-
-        fn pop(&mut self) -> Result<(), Self::Error> {
-            self.store = None;
-            Ok(())
-        }
-    }
 
     struct Delay {}
 

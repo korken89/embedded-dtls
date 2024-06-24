@@ -2,4 +2,4 @@
 name = "rust"
 
 [language-server.rust-analyzer.config]
-rust-analyzer.cargo.features = ["log"]
+rust-analyzer.cargo.features = ["log", "tokio-queue", "bb-queue"]
