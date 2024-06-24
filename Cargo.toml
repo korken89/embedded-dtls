@@ -11,12 +11,12 @@ edition = "2021"
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["heapless"] }
 chacha20 = "0.9.1"
 sha2 = { version = "0.10", default-features = false }
-x25519-dalek = { version = "2.0.1", default-features = false, features = ["zeroize", "getrandom"] } # TODO: Replace with something that works on MCU and backend
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["zeroize"] } # TODO: Replace with something that works on MCU and backend
 
-# Traits 
+# Traits
 rand_core = { version = "0.6.4", default-features = false }
 digest = { version = "0.10.7", default-features = false }
-zeroize = { version = "1.7.0", default-features = false, features = ["derive", "std"] }
+zeroize = { version = "1.7.0", default-features = false, features = ["derive"] }
 num_enum = { version = "0.7.2", default-features = false }
 aead = "0.5.2"
 embedded-hal-async = "1.0.0"
