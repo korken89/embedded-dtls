@@ -4,7 +4,7 @@ use crate::{
     connection::Connection,
     handshake::{
         extensions::{DtlsVersions, Psk},
-        Handshake,
+        ClientHelloError, Handshake,
     },
     key_schedule::KeySchedule,
     record::{
@@ -59,14 +59,14 @@ where
             None,
         )
         .await
-        .ok_or(Error::InvalidClientHello)?;
+        .ok_or(Error::InvalidClientHello(ClientHelloError::UnableToParse))?;
 
         if let (Record::Handshake(Handshake::ClientHello(hello), _), buffer_that_was_parsed) =
             record
         {
             (hello, positions, buffer_that_was_parsed)
         } else {
-            return Err(Error::InvalidClientHello);
+            return Err(Error::InvalidClientHello(ClientHelloError::NotAClientHello));
         }
     };
 
@@ -86,7 +86,9 @@ where
         }
 
         // TODO: This should generate an alert.
-        r.ok_or(Error::InvalidClientHello)?
+        r.ok_or(Error::InvalidClientHello(
+            ClientHelloError::NoMatchingCipherSuite,
+        ))?
     };
 
     // At this point we know the selected cipher suite, and hence also the hash function.
@@ -96,7 +98,7 @@ where
         let binders_transcript_hash = {
             let (up_to_binders, binders_and_rest) = positions
                 .pre_post_binders(buffer_that_was_parsed)
-                .ok_or(Error::InvalidClientHello)?;
+                .expect("UNREACHABLE");
 
             transcript_hasher.update(up_to_binders);
             let binders_transcript_hash = transcript_hasher.clone().finalize();
@@ -115,7 +117,7 @@ where
                 server_config,
                 &binders_transcript_hash,
             )
-            .map_err(|_| Error::InvalidClientHello)?;
+            .map_err(|e| Error::InvalidClientHello(e))?;
 
         // Perform ECDHE -> Handshake Secret with Key Schedule
         // TODO: For now we assume X25519.
@@ -130,7 +132,7 @@ where
         // TODO: Can we move this up somehow?
         if !resp.is_empty() {
             error!("More data after client hello");
-            return Err(Error::InvalidClientHello);
+            return Err(Error::MorePayloadAfterClientHello);
         }
 
         // TODO: We hardcode the selected PSK as the first one for now.

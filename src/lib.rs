@@ -14,6 +14,7 @@
 #![allow(async_fn_in_trait)]
 
 use defmt_or_log::{derive_format_or_debug, FormatOrDebug};
+use handshake::{ClientHelloError, ServerHelloError};
 
 pub(crate) mod buffer;
 pub(crate) mod cipher_suites;
@@ -35,11 +36,13 @@ pub enum Error<D: Endpoint> {
     /// Failed to parse a message.
     Parse,
     /// The client hello was invalid.
-    InvalidClientHello,
+    InvalidClientHello(ClientHelloError),
+    /// There was more data in the client hello datagram.
+    MorePayloadAfterClientHello,
     /// The client finished was invalid.
     InvalidClientFinished,
     /// The server hello was invalid.
-    InvalidServerHello,
+    InvalidServerHello(ServerHelloError),
     /// The server finished was invalid.
     InvalidServerFinished,
     /// The server ACK was invalid.

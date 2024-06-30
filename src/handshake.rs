@@ -221,6 +221,23 @@ impl HandshakeHeader {
     }
 }
 
+/// Different errors in a client hello.
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum ClientHelloError {
+    WrongLegacyVersion,
+    WrongVersion,
+    MissingExpectedExtensions,
+    UnsupportedKeyShare,
+    UnsupportedPskKeyExchangeMode,
+    NoPreSharedKey,
+    UnknownPskIdentity,
+    PskBinderMismatch,
+    UnableToParse,
+    NotAClientHello,
+    NoMatchingCipherSuite,
+}
+
 /// ClientHello payload in a Handshake.
 #[derive_format_or_debug]
 pub struct ClientHello<'a> {
@@ -340,7 +357,7 @@ impl<'a> ClientHello<'a> {
         key_schedule: &mut ServerKeySchedule,
         server_config: &ServerConfig,
         binders_hash: &[u8],
-    ) -> Result<PublicKey, ()> {
+    ) -> Result<PublicKey, ClientHelloError> {
         debug_assert!(key_schedule.is_uninitialized());
 
         if self.version != LEGACY_DTLS_VERSION {
@@ -348,7 +365,7 @@ impl<'a> ClientHello<'a> {
                 "ClientHello version is not legacy DTLS version: {:?}",
                 self.version
             );
-            return Err(());
+            return Err(ClientHelloError::WrongLegacyVersion);
         }
 
         trace!("DTLS legacy version OK");
@@ -373,7 +390,7 @@ impl<'a> ClientHello<'a> {
                 "ClientHello: Not all expected extensions are provided {:?}",
                 self
             );
-            return Err(());
+            return Err(ClientHelloError::MissingExpectedExtensions);
         };
 
         trace!("All required extensions are present");
@@ -381,7 +398,7 @@ impl<'a> ClientHello<'a> {
         if supported_versions.version != DtlsVersions::V1_3 {
             // We only support DTLS 1.3.
             error!("Not DTLS 1.3");
-            return Err(());
+            return Err(ClientHelloError::WrongVersion);
         }
         trace!("DTLS version OK: {:?}", supported_versions.version);
 
@@ -391,7 +408,7 @@ impl<'a> ClientHello<'a> {
                     key_share.group,
                     key_share.opaque.len()
                 );
-            return Err(());
+            return Err(ClientHelloError::UnsupportedKeyShare);
         }
         trace!("Keyshare is OK: {:?}", key_share.group);
 
@@ -400,7 +417,7 @@ impl<'a> ClientHello<'a> {
                 "ClientHello: The PskKeyExchangeMode is unsupported: {:?}",
                 key_share.group
             );
-            return Err(());
+            return Err(ClientHelloError::UnsupportedPskKeyExchangeMode);
         }
         trace!(
             "Psk key exchange mode is OK: {:?}",
@@ -410,13 +427,15 @@ impl<'a> ClientHello<'a> {
         // Find the PSK.
         {
             let EncodeOrParse::Parse(psk_iter) = &pre_shared_key.identities else {
-                error!("ClientHello: Expected parse, got encoded PSK");
-                return Err(());
+                panic!("ClientHello: Expected parse, got encoded PSK");
             };
 
             // TODO: We only support a single PSK for now.
 
-            let pre_shared_key = psk_iter.clone().next().ok_or(())?;
+            let pre_shared_key = psk_iter
+                .clone()
+                .next()
+                .ok_or(ClientHelloError::NoPreSharedKey)?;
 
             let psk_identity = Identity::from(&pre_shared_key.identity);
             let Some(psk) = server_config
@@ -425,7 +444,7 @@ impl<'a> ClientHello<'a> {
                 .find(|&psk| psk_identity.eq(&psk.0))
             else {
                 error!("ClientHello: Psk unknown identity: {:?}", psk_identity);
-                return Err(());
+                return Err(ClientHelloError::UnknownPskIdentity);
             };
             trace!("Psk identity '{:?}' is AVAILABLE", psk_identity);
 
@@ -437,7 +456,7 @@ impl<'a> ClientHello<'a> {
 
             if binder != pre_shared_key.binder {
                 error!("ClientHello: Psk binder mismatch");
-                return Err(());
+                return Err(ClientHelloError::PskBinderMismatch);
             }
             trace!("Psk binders MATCH");
         }
@@ -449,6 +468,21 @@ impl<'a> ClientHello<'a> {
 
         Ok(their_public_key)
     }
+}
+
+/// Different errors in a server hello.
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum ServerHelloError {
+    WrongLegacyVersion,
+    WrongVersion,
+    MissingExpectedExtensions,
+    LegacySessionIdNotEmpty,
+    CipherSuiteOutOfBounds,
+    UnsupportedKeyShare,
+    SelectedPskOutOfBounds,
+    NotAServerHello,
+    UnableToParse,
 }
 
 /// Server Hello handshake payload.
@@ -525,18 +559,18 @@ impl<'a> ServerHello<'a> {
     }
 
     /// Validate the server hello.
-    pub fn validate(&self) -> Result<PublicKey, ()> {
+    pub fn validate(&self) -> Result<PublicKey, ServerHelloError> {
         if self.version != LEGACY_DTLS_VERSION {
             error!(
                 "ServerHello version is not legacy DTLS version: {:?}",
                 self.version
             );
-            return Err(());
+            return Err(ServerHelloError::WrongLegacyVersion);
         }
 
         if !self.legacy_session_id_echo.is_empty() {
             error!("ServerHello legacy session id echo is not empty");
-            return Err(());
+            return Err(ServerHelloError::LegacySessionIdNotEmpty);
         }
 
         // TODO: We only support one today, maybe more in the future.
@@ -545,7 +579,7 @@ impl<'a> ServerHello<'a> {
                 "ServerHello cipher suite mismatch, got {:x}",
                 self.cipher_suite_index
             );
-            return Err(());
+            return Err(ServerHelloError::CipherSuiteOutOfBounds);
         }
 
         // Are all the expexted extensions there? By this we enforce that the PSK key exchange
@@ -561,13 +595,13 @@ impl<'a> ServerHello<'a> {
                 "ServerHello: Not all expected extensions are provided {:?}",
                 self
             );
-            return Err(());
+            return Err(ServerHelloError::MissingExpectedExtensions);
         };
 
         if selected_supported_version.version != DtlsVersions::V1_3 {
             // We only support DTLS 1.3.
             error!("Not DTLS 1.3");
-            return Err(());
+            return Err(ServerHelloError::WrongVersion);
         }
         trace!("DTLS version OK: {:?}", selected_supported_version);
 
@@ -577,14 +611,14 @@ impl<'a> ServerHello<'a> {
                     key_share.group,
                     key_share.opaque.len()
                 );
-            return Err(());
+            return Err(ServerHelloError::UnsupportedKeyShare);
         }
         trace!("Keyshare is OK: {:?}", key_share.group);
 
         // TODO: We currently use the assumption that there is one PSK by looking for idx 0.
         if selected_psk.selected_identity != 0 {
             error!("ServerHello: Unknown selected Psk: {:?}", selected_psk);
-            return Err(());
+            return Err(ServerHelloError::SelectedPskOutOfBounds);
         };
         trace!("Selected Psk identity OK");
 

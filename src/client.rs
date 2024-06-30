@@ -3,7 +3,7 @@ use crate::{
     cipher_suites::DtlsCipherSuite,
     client::config::ClientConfig,
     connection::Connection,
-    handshake::Handshake,
+    handshake::{Handshake, ServerHelloError},
     key_schedule::KeySchedule,
     record::{EncodeOrParse, GenericKeySchedule, Record},
     Endpoint, Error,
@@ -108,11 +108,11 @@ where
                     Some(&mut key_schedule),
                 )
                 .await
-                .ok_or(Error::InvalidServerHello)?
+                .ok_or(Error::InvalidServerHello(ServerHelloError::UnableToParse))?
             {
                 hello
             } else {
-                return Err(Error::InvalidServerHello);
+                return Err(Error::InvalidServerHello(ServerHelloError::NotAServerHello));
             };
 
             trace!(
@@ -123,7 +123,7 @@ where
             // Update key schedule to Handshake Secret using public keys.
             let their_public_key = server_hello
                 .validate()
-                .map_err(|_| Error::InvalidServerHello)?;
+                .map_err(|e| Error::InvalidServerHello(e))?;
 
             secret_key.diffie_hellman(&their_public_key)
         };
