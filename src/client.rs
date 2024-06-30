@@ -23,7 +23,7 @@ pub async fn open_client<Rng, Socket, CipherSuite>(
     rng: &mut Rng,
     buf: &mut [u8],
     socket: Socket,
-    cipher: <CipherSuite as DtlsCipherSuite>::Cipher, // TODO: Should this be &mut ?
+    cipher: <CipherSuite as DtlsCipherSuite>::Cipher,
     config: &ClientConfig<'_>,
 ) -> Result<Connection<Socket, KeySchedule<CipherSuite, false>>, Error<Socket>>
 where

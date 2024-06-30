@@ -1,11 +1,15 @@
 use self::extensions::{ClientExtensions, DtlsVersions, NamedGroup, ServerExtensions};
 use crate::{
-    buffer::{AllocSliceHandle, AllocU16Handle, AllocU24Handle, EncodingBuffer, ParseBuffer},
+    buffer::{
+        AllocSliceHandle, AllocU16Handle, AllocU24Handle, EncodingBuffer, OutOfMemory, ParseBuffer,
+    },
     handshake::extensions::PskKeyExchangeMode,
     integers::U24,
     record::{EncodeOrParse, ProtocolVersion, LEGACY_DTLS_VERSION},
-    server::config::{Identity, ServerConfig},
-    server::ServerKeySchedule,
+    server::{
+        config::{Identity, ServerConfig},
+        ServerKeySchedule,
+    },
 };
 use defmt_or_log::{debug, derive_format_or_debug, error, trace};
 use num_enum::TryFromPrimitive;
@@ -25,7 +29,7 @@ pub enum Handshake<'a> {
 }
 
 impl<'a> Handshake<'a> {
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<Option<usize>, ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<Option<usize>, OutOfMemory> {
         // Encode client handshake.
         let header = HandshakeHeader::encode(self.handshake_type(), buf)?;
 
@@ -189,7 +193,7 @@ impl HandshakeHeader {
     pub fn encode(
         msg_type: HandshakeType,
         buf: &mut EncodingBuffer,
-    ) -> Result<HandshakeHeaderAllocations, ()> {
+    ) -> Result<HandshakeHeaderAllocations, OutOfMemory> {
         buf.push_u8(msg_type as u8)?;
 
         let length = buf.alloc_u24()?;
@@ -231,7 +235,10 @@ impl<'a> ClientHello<'a> {
     /// Encode a client hello payload in a Handshake. RFC 9147 section 5.3.
     ///
     /// Returns the allocated position for binders.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<Option<AllocSliceHandle>, ()> {
+    pub fn encode(
+        &self,
+        buf: &mut EncodingBuffer,
+    ) -> Result<Option<AllocSliceHandle>, OutOfMemory> {
         // struct {
         //     ProtocolVersion legacy_version = { 254,253 }; // DTLSv1.2
         //     Random random;
@@ -247,7 +254,7 @@ impl<'a> ClientHello<'a> {
 
         // Random.
         if self.random.len() != 32 {
-            return Err(());
+            panic!("Random is the wrong length");
         }
         buf.extend_from_slice(self.random)?;
 
@@ -456,7 +463,7 @@ pub struct ServerHello<'a> {
 
 impl<'a> ServerHello<'a> {
     /// Encode a server hello payload in a Handshake. RFC 8446 section 4.1.3.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         // struct {
         //     ProtocolVersion legacy_version = 0x0303;    /* TLS v1.2 */
         //     Random random;
@@ -599,7 +606,7 @@ pub struct Finished<'a> {
 
 impl<'a> Finished<'a> {
     /// Encode a Finished payload in an Handshake.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         buf.extend_from_slice(self.verify)
     }
 
@@ -622,7 +629,7 @@ pub struct KeyUpdate {
 
 impl KeyUpdate {
     /// Encode a KeyUpdate payload in an Handshake.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         buf.push_u8(self.request_update as u8)
     }
 

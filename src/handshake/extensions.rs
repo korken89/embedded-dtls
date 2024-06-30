@@ -15,7 +15,7 @@
 //! All this is defined in RFC 8446 (TLS 1.3) at Page 37.
 
 use crate::{
-    buffer::{AllocSliceHandle, EncodingBuffer, ParseBuffer},
+    buffer::{AllocSliceHandle, EncodingBuffer, OutOfMemory, ParseBuffer},
     record::EncodeOrParse,
 };
 use defmt_or_log::{derive_format_or_debug, error};
@@ -66,7 +66,10 @@ pub struct ClientExtensions<'a> {
 
 impl<'a> ClientExtensions<'a> {
     /// Encode client extensions.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<Option<AllocSliceHandle>, ()> {
+    pub fn encode(
+        &self,
+        buf: &mut EncodingBuffer,
+    ) -> Result<Option<AllocSliceHandle>, OutOfMemory> {
         if let Some(supported_version) = &self.supported_versions {
             buf.push_u8(ExtensionType::SupportedVersions as u8)?;
             encode_extension(buf, |buf| supported_version.encode(buf))??;
@@ -205,7 +208,7 @@ pub struct ServerExtensions<'a> {
 
 impl<'a> ServerExtensions<'a> {
     /// Encode server extensions.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         if let Some(supported_version) = &self.selected_supported_version {
             buf.push_u8(ExtensionType::SupportedVersions as u8)?;
             encode_extension(buf, |buf| supported_version.encode(buf))??;
@@ -309,7 +312,7 @@ impl<'a> ServerExtensions<'a> {
 fn encode_extension<R, F: FnOnce(&mut EncodingBuffer) -> R>(
     buf: &mut EncodingBuffer,
     f: F,
-) -> Result<R, ()> {
+) -> Result<R, OutOfMemory> {
     let extension_length_allocation = buf.alloc_u16()?;
     let content_start = buf.len();
 
@@ -331,7 +334,7 @@ pub struct PskKeyExchangeModes {
 
 impl PskKeyExchangeModes {
     /// Encode a `psk_key_exchange_modes` extension.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         buf.push_u8(1)?;
         buf.push_u8(self.ke_modes as u8)?;
 
@@ -360,7 +363,7 @@ pub struct KeyShareEntry<'a> {
 
 impl<'a> KeyShareEntry<'a> {
     /// Encode a `key_share` extension.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         buf.push_u16_be(2 + 2 + self.opaque.len() as u16)?;
 
         // one key-share
@@ -401,7 +404,7 @@ pub struct ClientSupportedVersions {
 
 impl ClientSupportedVersions {
     /// Encode a `supported_versions` extension. We only support DTLS 1.3.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         buf.push_u8(2)?;
 
         // DTLS 1.3, RFC 9147, section 5.3
@@ -430,7 +433,7 @@ pub struct ServerSupportedVersion {
 
 impl ServerSupportedVersion {
     /// Encode a `supported_versions` extension. We only support DTLS 1.3.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         // DTLS 1.3, RFC 8446, section 4.2.1 (pointed to from RFC 9147, section 5.4)
         buf.push_u16_be(self.version as u16)
     }
@@ -456,11 +459,11 @@ pub struct OfferedPsks<'a> {
 
 impl<'a> OfferedPsks<'a> {
     /// Encode the offered pre-shared keys. Returns a handle to write the binders.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<AllocSliceHandle, ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<AllocSliceHandle, OutOfMemory> {
         let (EncodeOrParse::Encode(identities), EncodeOrParse::Encode(hash_size)) =
             (&self.identities, self.hash_size)
         else {
-            return Err(());
+            panic!("Internal error, PSK was in decode during encode");
         };
 
         let ident_len = identities
@@ -622,7 +625,7 @@ impl<'a> defmt::Format for Psk<'a> {
 
 impl<'a> Psk<'a> {
     /// Encode a pre-shared key identity into the buffer.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         // Encode length.
         buf.push_u16_be(self.identity.len() as u16)?;
 
@@ -644,7 +647,7 @@ pub struct SelectedPsk {
 
 impl SelectedPsk {
     /// Encode the selected pre-shared key.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         buf.push_u16_be(self.selected_identity)
     }
 
@@ -668,7 +671,7 @@ pub struct HeartbeatExtension {
 
 impl HeartbeatExtension {
     /// Encode a `heartbeat` extension.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         buf.push_u8(self.mode as u8)
     }
 

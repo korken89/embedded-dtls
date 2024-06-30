@@ -1,5 +1,5 @@
 use crate::{
-    buffer::{AllocU16Handle, EncodingBuffer, ParseBuffer},
+    buffer::{AllocU16Handle, EncodingBuffer, OutOfMemory, ParseBuffer},
     cipher_suites::DtlsCipherSuite,
     client::config::ClientConfig,
     handshake::{
@@ -81,13 +81,12 @@ pub struct Ack<'a> {
 
 impl<'a> Ack<'a> {
     /// Encode an ACK.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         let EncodeOrParse::Encode(record_numbers) = &self.record_numbers else {
-            error!("ACK: Expected encode, got parse");
-            return Err(());
+            panic!("ACK: Expected encode, got parse");
         };
 
-        let size = u16::try_from(record_numbers.len() * 16).map_err(|_| ())?;
+        let size = u16::try_from(record_numbers.len() * 16).map_err(|_| OutOfMemory)?;
         buf.push_u16_be(size)?;
 
         for record_number in *record_numbers {
@@ -119,7 +118,7 @@ pub struct RecordNumber {
 
 impl RecordNumber {
     /// Encode a record number.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         buf.push_u64_be(self.epoch)?;
         buf.push_u64_be(self.sequence_number)
     }
@@ -314,7 +313,7 @@ pub struct Alert {
 
 impl Alert {
     /// Encode an alert.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
         buf.push_u8(self.level as u8)?;
         buf.push_u8(self.description as u8)
     }
@@ -417,7 +416,7 @@ impl<'a> Record<'a> {
         public_key: &PublicKey,
         rng: &mut Rng,
         key_schedule: &mut impl GenericKeySchedule,
-    ) -> Result<(), ()>
+    ) -> Result<(), OutOfMemory>
     where
         Rng: RngCore + CryptoRng,
         CipherSuite: DtlsCipherSuite,
@@ -474,7 +473,7 @@ impl<'a> Record<'a> {
         key_schedule: &mut impl GenericKeySchedule,
         hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &'buf mut EncodingBuffer<'_>,
-    ) -> Result<(), ()>
+    ) -> Result<(), OutOfMemory>
     where
         Rng: RngCore + CryptoRng,
     {
@@ -517,7 +516,7 @@ impl<'a> Record<'a> {
         key_schedule: &mut impl GenericKeySchedule,
         hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &mut EncodingBuffer<'_>,
-    ) -> Result<(), ()> {
+    ) -> Result<(), OutOfMemory> {
         let finished = Record::Handshake(
             Handshake::Finished(Finished { verify }),
             Encryption::Enabled,
@@ -535,7 +534,7 @@ impl<'a> Record<'a> {
         key_schedule: &mut impl GenericKeySchedule,
         hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &mut EncodingBuffer<'_>,
-    ) -> Result<(), ()> {
+    ) -> Result<(), OutOfMemory> {
         let ack = Ack {
             record_numbers: EncodeOrParse::Encode(record_numbers),
         };
@@ -557,7 +556,7 @@ impl<'a> Record<'a> {
         encrypted: Encryption,
         level: AlertLevel,
         description: AlertDescription,
-    ) -> Result<(), ()> {
+    ) -> Result<(), OutOfMemory> {
         let alert = Alert { level, description };
 
         debug!("Sending Alert");
@@ -574,7 +573,7 @@ impl<'a> Record<'a> {
         buf: &mut EncodingBuffer<'_>,
         key_schedule: &mut impl GenericKeySchedule,
         user_content: &[u8],
-    ) -> Result<(), ()> {
+    ) -> Result<(), OutOfMemory> {
         debug!("Sending application data");
         trace!("content = {:?}", user_content);
 
@@ -590,7 +589,7 @@ impl<'a> Record<'a> {
         hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &'buf mut EncodingBuffer<'_>,
         cipher: &mut impl GenericKeySchedule,
-    ) -> Result<(), ()> {
+    ) -> Result<(), OutOfMemory> {
         encode_record(
             buf,
             cipher,
@@ -605,7 +604,7 @@ impl<'a> Record<'a> {
         &self,
         hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &mut EncodingBuffer<'_>,
-    ) -> Result<(), ()> {
+    ) -> Result<(), OutOfMemory> {
         let start = buf.current_pos_ptr();
 
         let binders = match self {
@@ -789,7 +788,7 @@ pub struct DTlsPlaintextHeader {
 
 impl DTlsPlaintextHeader {
     /// Encode a DTlsPlaintext header, return the allocation for the length field.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<AllocU16Handle, ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<AllocU16Handle, OutOfMemory> {
         // DTlsPlaintext structure:
         //
         // type: ContentType,
@@ -873,7 +872,7 @@ impl<'a> DTlsCiphertextHeader<'a> {
     /// and allocation for the length field in case the length is not `None`.
     ///
     /// Follows section 4 in RFC9147.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<Option<AllocU16Handle>, ()> {
+    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<Option<AllocU16Handle>, OutOfMemory> {
         let header = {
             let epoch = self.epoch & 0b11;
             let length = match self.length {
@@ -969,7 +968,7 @@ impl<'a> DtlsInnerPlaintext<'a> {
         buf: &mut EncodingBuffer,
         content_size: usize,
         aead_tag_size: usize,
-    ) -> Result<(), ()> {
+    ) -> Result<(), OutOfMemory> {
         buf.push_u8(type_ as u8)?;
 
         // In accordance with Section 4.2.3 in RFC9147 we need that the cipher text, including tag,
@@ -1060,8 +1059,8 @@ pub async fn encode_record<'buf, Ret>(
     cipher: &mut impl GenericKeySchedule,
     is_encrypted: bool,
     content_type: ContentType,
-    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<Ret, ()>,
-) -> Result<Ret, ()> {
+    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<Ret, OutOfMemory>,
+) -> Result<Ret, OutOfMemory> {
     let epoch = cipher.epoch_number();
     let record_number = cipher.write_record_number();
 
@@ -1199,8 +1198,8 @@ fn encode_plaintext<Ret>(
     content_type: ContentType,
     epoch: u16,
     sequence_number: U48,
-    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<Ret, ()>,
-) -> Result<Ret, ()> {
+    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<Ret, OutOfMemory>,
+) -> Result<Ret, OutOfMemory> {
     let header = DTlsPlaintextHeader {
         type_: content_type,
         epoch,
@@ -1234,8 +1233,8 @@ async fn encode_ciphertext<'buf, Ret>(
     content_type: ContentType,
     epoch: u8,
     sequence_number: CiphertextSequenceNumber,
-    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<Ret, ()>,
-) -> Result<Ret, ()> {
+    encode_content: impl FnOnce(&mut EncodingBuffer) -> Result<Ret, OutOfMemory>,
+) -> Result<Ret, OutOfMemory> {
     let buf = &mut buf.new_from_existing();
 
     let header_start = buf.len();
@@ -1295,7 +1294,10 @@ async fn encode_ciphertext<'buf, Ret>(
             payload_with_tag,
         };
 
-        cipher.encrypt_record(cipher_args).await.map_err(|_| ())?;
+        cipher
+            .encrypt_record(cipher_args)
+            .await
+            .map_err(|_| OutOfMemory)?;
     }
 
     // ------ Finish record

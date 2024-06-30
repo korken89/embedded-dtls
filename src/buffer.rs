@@ -175,13 +175,17 @@ mod parse_buffer {
 }
 
 mod encoding_buffer {
-    use defmt_or_log::derive_format_or_debug;
-
     use crate::integers::{U24, U48};
     use core::{
         fmt,
         ops::{Deref, DerefMut, Range},
     };
+    use defmt_or_log::derive_format_or_debug;
+
+    /// Out of memory error.
+    #[derive_format_or_debug]
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    pub struct OutOfMemory;
 
     /// A buffer handler wrapping a mutable slice.
     pub struct EncodingBuffer<'a> {
@@ -257,10 +261,10 @@ mod encoding_buffer {
         }
 
         /// Extend with a slice.
-        pub fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), ()> {
+        pub fn extend_from_slice(&mut self, slice: &[u8]) -> Result<(), OutOfMemory> {
             self.buf
                 .get_mut(self.idx..self.idx + slice.len())
-                .ok_or(())?
+                .ok_or(OutOfMemory)?
                 .copy_from_slice(slice);
             self.idx += slice.len();
 
@@ -268,40 +272,40 @@ mod encoding_buffer {
         }
 
         /// Push a u8.
-        pub fn push_u8(&mut self, val: u8) -> Result<(), ()> {
-            *self.buf.get_mut(self.idx).ok_or(())? = val;
+        pub fn push_u8(&mut self, val: u8) -> Result<(), OutOfMemory> {
+            *self.buf.get_mut(self.idx).ok_or(OutOfMemory)? = val;
             self.idx += 1;
 
             Ok(())
         }
 
         /// Push a u16 in big-endian.
-        pub fn push_u16_be(&mut self, val: u16) -> Result<(), ()> {
+        pub fn push_u16_be(&mut self, val: u16) -> Result<(), OutOfMemory> {
             self.extend_from_slice(&val.to_be_bytes())
         }
 
         /// Push a u24 in big-endian.
-        pub fn push_u24_be(&mut self, val: U24) -> Result<(), ()> {
+        pub fn push_u24_be(&mut self, val: U24) -> Result<(), OutOfMemory> {
             self.extend_from_slice(&val.to_be_bytes())
         }
 
         /// Push a u32 in big-endian.
-        pub fn push_u32_be(&mut self, val: u32) -> Result<(), ()> {
+        pub fn push_u32_be(&mut self, val: u32) -> Result<(), OutOfMemory> {
             self.extend_from_slice(&val.to_be_bytes())
         }
 
         /// Push a u48 in big-endian.
-        pub fn push_u48_be(&mut self, val: U48) -> Result<(), ()> {
+        pub fn push_u48_be(&mut self, val: U48) -> Result<(), OutOfMemory> {
             self.extend_from_slice(&val.to_be_bytes())
         }
 
         /// Push a u64 in big-endian.
-        pub fn push_u64_be(&mut self, val: u64) -> Result<(), ()> {
+        pub fn push_u64_be(&mut self, val: u64) -> Result<(), OutOfMemory> {
             self.extend_from_slice(&val.to_be_bytes())
         }
 
         /// Allocate the space for a `u8` for later updating.
-        pub fn alloc_u8(&mut self) -> Result<AllocU8Handle, ()> {
+        pub fn alloc_u8(&mut self) -> Result<AllocU8Handle, OutOfMemory> {
             let index = self.index();
             self.push_u8(0)?;
 
@@ -309,7 +313,7 @@ mod encoding_buffer {
         }
 
         /// Allocate the space for a `u16` for later updating.
-        pub fn alloc_u16(&mut self) -> Result<AllocU16Handle, ()> {
+        pub fn alloc_u16(&mut self) -> Result<AllocU16Handle, OutOfMemory> {
             let index = self.index();
             self.push_u16_be(0)?;
 
@@ -317,7 +321,7 @@ mod encoding_buffer {
         }
 
         /// Allocate the space for a `u24` for later updating.
-        pub fn alloc_u24(&mut self) -> Result<AllocU24Handle, ()> {
+        pub fn alloc_u24(&mut self) -> Result<AllocU24Handle, OutOfMemory> {
             let index = self.index();
             self.push_u24_be(U24::new(0))?;
 
@@ -325,7 +329,7 @@ mod encoding_buffer {
         }
 
         /// Allocate the space for a `u48` for later updating.
-        pub fn alloc_u48(&mut self) -> Result<AllocU48Handle, ()> {
+        pub fn alloc_u48(&mut self) -> Result<AllocU48Handle, OutOfMemory> {
             let index = self.index();
             self.push_u48_be(U48::new(0))?;
 
@@ -333,7 +337,7 @@ mod encoding_buffer {
         }
 
         /// Allocate space for a slice for later updating.
-        pub fn alloc_slice(&mut self, len: usize) -> Result<AllocSliceHandle, ()> {
+        pub fn alloc_slice(&mut self, len: usize) -> Result<AllocSliceHandle, OutOfMemory> {
             let index = self.index();
 
             for _ in 0..len {

@@ -46,7 +46,7 @@ pub enum Error<D: Endpoint> {
     InvalidServerAck,
     /// An error related to sending on the socket.
     Send(D::SendError),
-    /// An error related to receivnig on the socket.
+    /// An error related to receiving on the socket.
     Recv(D::ReceiveError),
 }
 
