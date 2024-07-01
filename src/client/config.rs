@@ -1,4 +1,4 @@
-use crate::handshake::extensions::Psk;
+pub use crate::handshake::extensions::Psk;
 use defmt_or_log::derive_format_or_debug;
 
 /// Client configuration.

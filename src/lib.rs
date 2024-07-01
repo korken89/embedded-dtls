@@ -13,11 +13,12 @@
 #![cfg_attr(not(any(test, feature = "tokio-queue")), no_std)]
 #![allow(async_fn_in_trait)]
 
-use defmt_or_log::{derive_format_or_debug, FormatOrDebug};
+pub use defmt_or_log::{derive_format_or_debug, FormatOrDebug};
+pub use embedded_hal_async::delay::DelayNs;
 use handshake::{ClientHelloError, ServerHelloError};
 
 pub(crate) mod buffer;
-pub(crate) mod cipher_suites;
+pub mod cipher_suites;
 pub mod client;
 pub mod connection;
 pub(crate) mod handshake;

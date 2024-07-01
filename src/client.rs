@@ -8,7 +8,7 @@ use crate::{
     record::{EncodeOrParse, GenericKeySchedule, Record},
     Endpoint, Error,
 };
-use defmt_or_log::{debug, error, info, trace};
+use defmt_or_log::{debug, error, info, trace, unwrap};
 use digest::Digest;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::{EphemeralSecret, PublicKey};
@@ -70,8 +70,8 @@ where
             let binder_entry = key_schedule.create_binder(&transcript_hasher.clone().finalize());
 
             let mut binders_enc = EncodingBuffer::new(binders);
-            binders_enc.push_u8(binder_entry.len() as u8).unwrap();
-            binders_enc.extend_from_slice(&binder_entry).unwrap();
+            unwrap!(binders_enc.push_u8(binder_entry.len() as u8));
+            unwrap!(binders_enc.extend_from_slice(&binder_entry));
 
             transcript_hasher.update(&binders_enc);
         } else {

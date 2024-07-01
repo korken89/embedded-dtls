@@ -10,10 +10,12 @@ pub use no_std::*;
 
 #[cfg(any(test, feature = "tokio-queue"))]
 mod std {
+    use defmt_or_log::derive_format_or_debug;
     use tokio::sync::mpsc::{channel, Receiver as InnerReceiver, Sender as InnerSender};
 
     /// The queue is closed.
-    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+    #[derive_format_or_debug]
+    #[derive(Copy, Clone, PartialEq, Eq)]
     pub struct Closed;
 
     /// Create a framed queue with specific maximum depth in number of packets.
@@ -65,12 +67,11 @@ mod std {
 
 #[cfg(feature = "bb-queue")]
 mod no_std {
-    use core::{convert::Infallible, future::poll_fn, task::Poll};
-
     use bbqueue::{
         framed::{FrameConsumer, FrameGrantR, FrameProducer},
         BBBuffer,
     };
+    use core::{convert::Infallible, future::poll_fn, task::Poll};
     use defmt_or_log::derive_format_or_debug;
     use rtic_common::waker_registration::CriticalSectionWakerRegistration;
 
