@@ -48,6 +48,14 @@ where
     pub(crate) key_schedule: KeySchedule,
 }
 
+/// State that is shared between the RX and TX worker.
+struct SharedState<KeySchedule>
+where
+    KeySchedule: GenericKeySchedule,
+{
+    key_schedule: SelectSharing<KeySchedule>,
+}
+
 impl<Socket, KeySchedule> Connection<Socket, KeySchedule>
 where
     Socket: Endpoint,
@@ -69,20 +77,18 @@ where
         Sender: ApplicationDataSender,
         Receiver: ApplicationDataReceiver,
     {
-        // Make sure we can share the key schedule between each path in the select below.
-        // TODO: Can we use something different from a mutex here? A `NoopMutex` did not work
-        // as it poisons the entire future to become `!Send` even though it's only used here in
-        // local scope...
-        let key_schedule = &SelectSharing::new(self.key_schedule);
+        let shared_state = &SharedState {
+            key_schedule: SelectSharing::new(self.key_schedule),
+        };
         let socket = &self.socket;
 
         match select(
-            rx_worker::<Socket, Sender, Receiver>(socket, rx_sender, rx_buffer, key_schedule),
+            rx_worker::<Socket, Sender, Receiver>(socket, rx_sender, rx_buffer, shared_state),
             tx_worker::<Socket, Sender, Receiver>(
                 socket,
                 tx_receiver,
                 tx_buffer,
-                key_schedule,
+                shared_state,
                 delay,
             ),
         )
@@ -108,7 +114,7 @@ async fn tx_worker<Socket, Sender, Receiver>(
     socket: &Socket,
     tx_receiver: &mut Receiver,
     tx_buffer: &mut [u8],
-    key_schedule: &SelectSharing<impl GenericKeySchedule>,
+    shared_state: &SharedState<impl GenericKeySchedule>,
     delay: &mut impl DelayNs,
 ) -> Result<Infallible, ErrorHelper<Socket, Sender, Receiver>>
 where
@@ -119,7 +125,9 @@ where
     'outer: loop {
         let buf = &mut EncodingBuffer::new(tx_buffer);
 
-        if key_schedule.lock().await.write_record_number() > MAX_PACKETS_BEFORE_KEY_UPDATE {
+        if shared_state.key_schedule.lock().await.write_record_number()
+            > MAX_PACKETS_BEFORE_KEY_UPDATE
+        {
             // TODO: Perform key update.
             todo!()
         }
@@ -134,7 +142,7 @@ where
             // Encode payload, this is on a fresh buffer and should not fail.
             if let Err(e) = Record::encode_application_data(
                 buf,
-                key_schedule.lock().await.deref_mut(),
+                shared_state.key_schedule.lock().await.deref_mut(),
                 payload.as_ref(),
             )
             .await
@@ -167,7 +175,7 @@ where
             // Encode payload.
             if Record::encode_application_data(
                 buf,
-                key_schedule.lock().await.deref_mut(),
+                shared_state.key_schedule.lock().await.deref_mut(),
                 payload.as_ref(),
             )
             .await
@@ -190,7 +198,7 @@ async fn rx_worker<Socket, Sender, Receiver>(
     socket: &Socket,
     rx_sender: &mut Sender,
     rx_buffer: &mut [u8],
-    key_schedule: &SelectSharing<impl GenericKeySchedule>,
+    shared_state: &SharedState<impl GenericKeySchedule>,
 ) -> Result<Infallible, ErrorHelper<Socket, Sender, Receiver>>
 where
     Socket: Endpoint,
@@ -208,7 +216,7 @@ where
             match Record::parse(
                 |_| {},
                 &mut data,
-                Some(key_schedule.lock().await.deref_mut()),
+                Some(shared_state.key_schedule.lock().await.deref_mut()),
             )
             .await
             {
