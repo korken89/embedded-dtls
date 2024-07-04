@@ -1,7 +1,7 @@
 use crate::{
     buffer::EncodingBuffer,
     record::{GenericKeySchedule, Record, MINIMUM_CIPHERTEXT_OVERHEAD},
-    ApplicationDataReceiver, ApplicationDataSender, Endpoint, Error,
+    ApplicationDataReceiver, ApplicationDataSender, Error, RxEndpoint, TxEndpoint,
 };
 use core::{convert::Infallible, ops::DerefMut, pin::pin};
 use defmt_or_log::{debug, derive_format_or_debug, error, trace};
@@ -30,20 +30,23 @@ pub enum ConnectionError<E, S, R> {
     ReceiveError(R),
 }
 
-type ErrorHelper<E, S, R> = ConnectionError<
-    Error<E>,
+type ErrorHelper<RxE, TxE, S, R> = ConnectionError<
+    Error<RxE, TxE>,
     <S as ApplicationDataSender>::Error,
     <R as ApplicationDataReceiver>::Error,
 >;
 
 /// A DTLS 1.3 connection.
-pub struct Connection<Socket, KeySchedule>
+pub struct Connection<RxE, TxE, KeySchedule>
 where
-    Socket: Endpoint,
+    RxE: RxEndpoint,
+    TxE: TxEndpoint,
     KeySchedule: GenericKeySchedule,
 {
-    /// Sender/receiver of data.
-    pub(crate) socket: Socket,
+    /// Receiver of data.
+    pub(crate) rx_endpoint: RxE,
+    /// Sender of data.
+    pub(crate) tx_endpoint: TxE,
     /// Keys for client->server and server->client.
     pub(crate) key_schedule: KeySchedule,
 }
@@ -56,9 +59,10 @@ where
     key_schedule: SelectSharing<KeySchedule>,
 }
 
-impl<Socket, KeySchedule> Connection<Socket, KeySchedule>
+impl<RxE, TxE, KeySchedule> Connection<RxE, TxE, KeySchedule>
 where
-    Socket: Endpoint,
+    RxE: RxEndpoint,
+    TxE: TxEndpoint,
     KeySchedule: GenericKeySchedule,
 {
     /// Run the connection and serve the application data queues. This will return when the
@@ -72,7 +76,7 @@ where
         rx_sender: &mut Sender,
         tx_receiver: &mut Receiver,
         delay: &mut impl DelayNs,
-    ) -> Result<Infallible, ErrorHelper<Socket, Sender, Receiver>>
+    ) -> Result<Infallible, ErrorHelper<RxE, TxE, Sender, Receiver>>
     where
         Sender: ApplicationDataSender,
         Receiver: ApplicationDataReceiver,
@@ -80,12 +84,13 @@ where
         let shared_state = &SharedState {
             key_schedule: SelectSharing::new(self.key_schedule),
         };
-        let socket = &self.socket;
+        let rx_endpoint = self.rx_endpoint;
+        let tx_endpoint = self.tx_endpoint;
 
         match select(
-            rx_worker::<Socket, Sender, Receiver>(socket, rx_sender, rx_buffer, shared_state),
-            tx_worker::<Socket, Sender, Receiver>(
-                socket,
+            rx_worker::<_, TxE, _, Receiver>(rx_endpoint, rx_sender, rx_buffer, shared_state),
+            tx_worker::<RxE, _, Sender, _>(
+                tx_endpoint,
                 tx_receiver,
                 tx_buffer,
                 shared_state,
@@ -110,15 +115,16 @@ const MAX_PACKETS_BEFORE_KEY_UPDATE: u64 = 100;
 
 // TODO: How to indicate that TX should do something special for handling internal work?
 //       such as heartbeat request/response or send ACK ASAP?
-async fn tx_worker<Socket, Sender, Receiver>(
-    socket: &Socket,
+async fn tx_worker<RxE, TxE, Sender, Receiver>(
+    mut tx_endpoint: TxE,
     tx_receiver: &mut Receiver,
     tx_buffer: &mut [u8],
     shared_state: &SharedState<impl GenericKeySchedule>,
     delay: &mut impl DelayNs,
-) -> Result<Infallible, ErrorHelper<Socket, Sender, Receiver>>
+) -> Result<Infallible, ErrorHelper<RxE, TxE, Sender, Receiver>>
 where
-    Socket: Endpoint,
+    TxE: TxEndpoint,
+    RxE: RxEndpoint,
     Sender: ApplicationDataSender,
     Receiver: ApplicationDataReceiver,
 {
@@ -187,27 +193,28 @@ where
         }
 
         // Send the finished buffer.
-        socket
+        tx_endpoint
             .send(buf)
             .await
             .map_err(|e| ConnectionError::DtlsError(Error::Send(e)))?;
     }
 }
 
-async fn rx_worker<Socket, Sender, Receiver>(
-    socket: &Socket,
+async fn rx_worker<RxE, TxE, Sender, Receiver>(
+    mut rx_endpoint: RxE,
     rx_sender: &mut Sender,
     rx_buffer: &mut [u8],
     shared_state: &SharedState<impl GenericKeySchedule>,
-) -> Result<Infallible, ErrorHelper<Socket, Sender, Receiver>>
+) -> Result<Infallible, ErrorHelper<RxE, TxE, Sender, Receiver>>
 where
-    Socket: Endpoint,
+    RxE: RxEndpoint,
+    TxE: TxEndpoint,
     Sender: ApplicationDataSender,
     Receiver: ApplicationDataReceiver,
 {
     loop {
         debug!("RX waiting for data");
-        let mut data = socket
+        let mut data = rx_endpoint
             .recv(rx_buffer)
             .await
             .map_err(|e| ConnectionError::DtlsError(Error::Recv(e)))?;

@@ -12,6 +12,7 @@
 
 #![cfg_attr(not(any(test, feature = "tokio-queue")), no_std)]
 #![allow(async_fn_in_trait)]
+#![allow(dead_code)]
 
 pub use defmt_or_log::{derive_format_or_debug, FormatOrDebug};
 pub use embedded_hal_async::delay::DelayNs;
@@ -31,7 +32,7 @@ pub mod server;
 /// Error definitions.
 #[derive_format_or_debug]
 #[derive(Copy, Clone)]
-pub enum Error<D: Endpoint> {
+pub enum Error<RxE: RxEndpoint, TxE: TxEndpoint> {
     /// The backing buffer ran out of space.
     InsufficientSpace,
     /// Failed to parse a message.
@@ -49,27 +50,34 @@ pub enum Error<D: Endpoint> {
     /// The server ACK was invalid.
     InvalidServerAck,
     /// An error related to sending on the socket.
-    Send(D::SendError),
+    Send(TxE::SendError),
     /// An error related to receiving on the socket.
-    Recv(D::ReceiveError),
+    Recv(RxE::ReceiveError),
 }
 
-/// Datagram trait, send and receives datagrams from/to a single endpoint.
+/// Datagram trait, receives datagrams from a single endpoint.
 ///
 /// This means on `std` that it cannot be implemented directly on a socket, but probably a
 /// sender/receiver pair which splits the incoming packets based on IP or similar.
 ///
 /// The debug implementation should indicate the identifier for this endpoint.
-pub trait Endpoint: FormatOrDebug {
-    /// Error type for sending.
-    type SendError: FormatOrDebug;
+pub trait RxEndpoint: FormatOrDebug {
     /// Error type for receiving.
     type ReceiveError: FormatOrDebug;
 
-    /// Send a complete datagram.
-    async fn send(&self, buf: &[u8]) -> Result<(), Self::SendError>;
     /// Receive a complete datagram.
-    async fn recv<'a>(&self, buf: &'a mut [u8]) -> Result<&'a mut [u8], Self::ReceiveError>;
+    async fn recv<'a>(&mut self, buf: &'a mut [u8]) -> Result<&'a mut [u8], Self::ReceiveError>;
+}
+
+/// Datagram trait, send datagrams to a single endpoint.
+///
+/// The debug implementation should indicate the identifier for this endpoint.
+pub trait TxEndpoint: FormatOrDebug {
+    /// Error type for sending.
+    type SendError: FormatOrDebug;
+
+    /// Send a complete datagram.
+    async fn send(&mut self, buf: &[u8]) -> Result<(), Self::SendError>;
 }
 
 /// Producer side of an application data queue.
@@ -116,10 +124,7 @@ mod test {
     use embedded_hal_async::delay::DelayNs;
     use queue_helpers::framed_queue;
     use rand::{rngs::StdRng, SeedableRng};
-    use tokio::sync::{
-        mpsc::{channel, Receiver, Sender},
-        Mutex,
-    };
+    use tokio::sync::mpsc::{channel, Receiver, Sender};
 
     #[allow(unused)]
     struct FakeRandom {
@@ -155,23 +160,46 @@ mod test {
         }
     }
 
-    struct ChannelSocket {
+    struct RxEndpoint {
         who: &'static str,
-        rx: Mutex<Receiver<Vec<u8>>>,
+        rx: Receiver<Vec<u8>>,
+    }
+
+    struct TxEndpoint {
+        who: &'static str,
         tx: Sender<Vec<u8>>,
     }
 
-    impl core::fmt::Debug for ChannelSocket {
+    impl core::fmt::Debug for RxEndpoint {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "Socket {{ who: {} }}", self.who)
         }
     }
 
-    impl Endpoint for ChannelSocket {
-        type SendError = ();
+    impl core::fmt::Debug for TxEndpoint {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Socket {{ who: {} }}", self.who)
+        }
+    }
+
+    impl crate::RxEndpoint for RxEndpoint {
         type ReceiveError = ();
 
-        async fn send(&self, buf: &[u8]) -> Result<(), Self::SendError> {
+        async fn recv<'a>(
+            &mut self,
+            buf: &'a mut [u8],
+        ) -> Result<&'a mut [u8], Self::ReceiveError> {
+            let r = self.rx.recv().await.ok_or(())?;
+
+            buf[..r.len()].copy_from_slice(&r);
+
+            Ok(&mut buf[..r.len()])
+        }
+    }
+    impl crate::TxEndpoint for TxEndpoint {
+        type SendError = ();
+
+        async fn send(&mut self, buf: &[u8]) -> Result<(), Self::SendError> {
             let r = self.tx.send(buf.into()).await;
             trace!(
                 "{} send ({}) (r = {r:?}): {:02x?}",
@@ -182,35 +210,37 @@ mod test {
 
             r.map_err(|_| ())
         }
-
-        async fn recv<'a>(&self, buf: &'a mut [u8]) -> Result<&'a mut [u8], Self::ReceiveError> {
-            let r = self.rx.lock().await.recv().await.ok_or(())?;
-
-            buf[..r.len()].copy_from_slice(&r);
-
-            Ok(&mut buf[..r.len()])
-        }
     }
 
-    fn make_server_client_channel() -> (ChannelSocket, ChannelSocket) {
+    fn make_server_client_channel() -> ((RxEndpoint, TxEndpoint), (RxEndpoint, TxEndpoint)) {
         let (s1, r1) = channel(10);
         let (s2, r2) = channel(10);
 
         (
-            ChannelSocket {
-                who: "server",
-                rx: Mutex::new(r1),
-                tx: s2,
-            },
-            ChannelSocket {
-                who: "client",
-                rx: Mutex::new(r2),
-                tx: s1,
-            },
+            (
+                RxEndpoint {
+                    who: "server",
+                    rx: r1,
+                },
+                TxEndpoint {
+                    who: "server",
+                    tx: s2,
+                },
+            ),
+            (
+                RxEndpoint {
+                    who: "client",
+                    rx: r2,
+                },
+                TxEndpoint {
+                    who: "client",
+                    tx: s1,
+                },
+            ),
         )
     }
 
-    async fn client(client_socket: ChannelSocket) {
+    async fn client(endpoint: (RxEndpoint, TxEndpoint)) {
         let client_buf = &mut [0; 1024];
         // let mut rng = FakeRandom { fill: 0xaa };
         let mut rng: StdRng = SeedableRng::from_entropy();
@@ -221,11 +251,14 @@ mod test {
             },
         };
 
+        let (rx_endpoint, tx_endpoint) = endpoint;
+
         let cipher = ChaCha20Poly1305Cipher::default();
-        let client_connection = open_client::<_, _, DtlsEcdhePskWithChacha20Poly1305Sha256>(
+        let client_connection = open_client::<_, _, _, DtlsEcdhePskWithChacha20Poly1305Sha256>(
             &mut rng,
             client_buf,
-            client_socket,
+            rx_endpoint,
+            tx_endpoint,
             cipher,
             &client_config,
         )
@@ -281,7 +314,7 @@ mod test {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    async fn server(server_socket: ChannelSocket) {
+    async fn server(endpoint: (RxEndpoint, TxEndpoint)) {
         let psk = [(
             server::config::Identity::from(b"hello world"),
             server::config::Key::from(b"11111234567890qwertyuiopasdfghjklzxc"),
@@ -293,7 +326,8 @@ mod test {
         let rng = &mut rand::rngs::OsRng;
         // let rng = &mut FakeRandom { fill: 0xbb };
 
-        let server_connection = open_server(server_socket, &server_config, rng, buf)
+        let (rx_endpoint, tx_endpoint) = endpoint;
+        let server_connection = open_server(rx_endpoint, tx_endpoint, &server_config, rng, buf)
             .await
             .unwrap();
 

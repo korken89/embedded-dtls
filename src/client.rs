@@ -6,7 +6,7 @@ use crate::{
     handshake::{Handshake, ServerHelloError},
     key_schedule::KeySchedule,
     record::{EncodeOrParse, GenericKeySchedule, Record},
-    Endpoint, Error,
+    Error, RxEndpoint, TxEndpoint,
 };
 use defmt_or_log::{debug, error, info, trace, unwrap};
 use digest::Digest;
@@ -19,19 +19,24 @@ pub mod config;
 /// This returns an active connection after handshake is completed.
 ///
 /// NOTE: This does not do timeout, it's up to the caller to give up.
-pub async fn open_client<Rng, Socket, CipherSuite>(
+pub async fn open_client<Rng, RxE, TxE, CipherSuite>(
     rng: &mut Rng,
     buf: &mut [u8],
-    socket: Socket,
+    mut rx_endpoint: RxE,
+    mut tx_endpoint: TxE,
     cipher: <CipherSuite as DtlsCipherSuite>::Cipher,
     config: &ClientConfig<'_>,
-) -> Result<Connection<Socket, KeySchedule<CipherSuite, false>>, Error<Socket>>
+) -> Result<Connection<RxE, TxE, KeySchedule<CipherSuite, false>>, Error<RxE, TxE>>
 where
     Rng: RngCore + CryptoRng,
-    Socket: Endpoint,
+    RxE: RxEndpoint,
+    TxE: TxEndpoint,
     CipherSuite: DtlsCipherSuite,
 {
-    info!("Starting handshake for client connection {:?}", socket);
+    info!(
+        "Starting handshake for client connection {:?}",
+        (&tx_endpoint, &rx_endpoint)
+    );
 
     let mut key_schedule = KeySchedule::new_client(cipher);
     let mut transcript_hasher = <CipherSuite::Hash as Digest>::new();
@@ -85,12 +90,15 @@ where
             transcript_hasher.clone().finalize()
         );
 
-        socket.send(&ser_buf).await.map_err(|e| Error::Send(e))?;
+        tx_endpoint
+            .send(&ser_buf)
+            .await
+            .map_err(|e| Error::Send(e))?;
     }
 
     // Wait for response (ServerHello and Finished).
     {
-        let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+        let mut resp = rx_endpoint.recv(buf).await.map_err(|e| Error::Recv(e))?;
         trace!("Got datagram!");
 
         // Parse and validate ServerHello.
@@ -139,7 +147,7 @@ where
         let finished = {
             let mut buf = if resp.is_empty() {
                 // Wait for finished.
-                socket.recv(buf).await.map_err(|e| Error::Recv(e))?
+                rx_endpoint.recv(buf).await.map_err(|e| Error::Recv(e))?
             } else {
                 resp
             };
@@ -181,7 +189,10 @@ where
             .await
             .map_err(|_| Error::InsufficientSpace)?;
 
-        socket.send(ser_buf).await.map_err(|e| Error::Send(e))?;
+        tx_endpoint
+            .send(ser_buf)
+            .await
+            .map_err(|e| Error::Send(e))?;
     }
 
     // Update key schedule to Master Secret.
@@ -189,7 +200,7 @@ where
 
     // Wait for server ACK.
     {
-        let mut ack = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+        let mut ack = rx_endpoint.recv(buf).await.map_err(|e| Error::Recv(e))?;
 
         let ack = if let (Record::Ack(ack, _), _) =
             Record::parse(|_| {}, &mut ack, Some(&mut key_schedule))
@@ -221,10 +232,14 @@ where
         }
     }
 
-    info!("New client connection created for {:?}", socket);
+    info!(
+        "New client connection created for {:?}",
+        (&rx_endpoint, &tx_endpoint)
+    );
 
     Ok(Connection {
-        socket,
+        rx_endpoint,
+        tx_endpoint,
         key_schedule,
     })
 }

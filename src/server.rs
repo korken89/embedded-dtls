@@ -12,7 +12,7 @@ use crate::{
         RecordNumber,
     },
     server::config::{Identity, Key, ServerConfig},
-    Endpoint, Error,
+    Error, RxEndpoint, TxEndpoint,
 };
 use defmt_or_log::{debug, error, info, trace};
 use digest::Digest;
@@ -31,20 +31,25 @@ const MAX_HASH_SIZE: usize = 32;
 /// This returns an active connection after handshake is completed.
 ///
 /// NOTE: This does not do timeout, it's up to the caller to give up.
-pub async fn open_server<Rng, Socket>(
-    socket: Socket,
+pub async fn open_server<Rng, RxE, TxE>(
+    mut rx_endpoint: RxE,
+    mut tx_endpoint: TxE,
     server_config: &ServerConfig<'_, '_>,
     rng: &mut Rng,
     buf: &mut [u8],
-) -> Result<Connection<Socket, ServerKeySchedule>, Error<Socket>>
+) -> Result<Connection<RxE, TxE, ServerKeySchedule>, Error<RxE, TxE>>
 where
     Rng: RngCore + CryptoRng,
-    Socket: Endpoint,
+    RxE: RxEndpoint,
+    TxE: TxEndpoint,
 {
     // TODO: If any part fails with error, make sure to send the correct ALERT.
-    info!("Starting handshake for server connection {:?}", socket);
+    info!(
+        "Starting handshake for server connection {:?}",
+        (&rx_endpoint, &tx_endpoint)
+    );
 
-    let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+    let mut resp = rx_endpoint.recv(buf).await.map_err(|e| Error::Recv(e))?;
     trace!("Got datagram!");
 
     let (client_hello, positions, buffer_that_was_parsed) = {
@@ -180,12 +185,15 @@ where
         .await
         .map_err(|_| Error::InsufficientSpace)?;
 
-        socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
+        tx_endpoint
+            .send(&enc_buf)
+            .await
+            .map_err(|e| Error::Send(e))?;
     }
 
     // Finished from client
     {
-        let mut resp = socket.recv(buf).await.map_err(|e| Error::Recv(e))?;
+        let mut resp = rx_endpoint.recv(buf).await.map_err(|e| Error::Recv(e))?;
 
         // Check if we got more datagrams, we're expecting a finished.
         let expected_verify =
@@ -232,14 +240,21 @@ where
         .await
         .map_err(|_| Error::InsufficientSpace)?;
 
-        socket.send(&enc_buf).await.map_err(|e| Error::Send(e))?;
+        tx_endpoint
+            .send(&enc_buf)
+            .await
+            .map_err(|e| Error::Send(e))?;
     }
 
     // Handshake complete!
-    info!("New server connection created for {:?}", socket);
+    info!(
+        "New server connection created for {:?}",
+        (&rx_endpoint, &tx_endpoint)
+    );
 
     Ok(Connection {
-        socket,
+        rx_endpoint,
+        tx_endpoint,
         key_schedule,
     })
 }
