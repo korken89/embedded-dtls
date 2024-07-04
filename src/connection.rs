@@ -1,13 +1,19 @@
 use crate::{
     buffer::EncodingBuffer,
+    handshake::{Handshake, KeyUpdateRequest},
     record::{GenericKeySchedule, Record, MINIMUM_CIPHERTEXT_OVERHEAD},
     ApplicationDataReceiver, ApplicationDataSender, Error, RxEndpoint, TxEndpoint,
 };
-use core::{convert::Infallible, ops::DerefMut, pin::pin};
+use core::{
+    convert::Infallible,
+    ops::DerefMut,
+    pin::pin,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use defmt_or_log::{debug, derive_format_or_debug, error, trace};
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either, Either3};
 use embedded_hal_async::delay::DelayNs;
-use select_sharing::SelectSharing;
+use select_sharing::{Mutex, Signal};
 
 // Tasks:
 //
@@ -56,7 +62,10 @@ struct SharedState<KeySchedule>
 where
     KeySchedule: GenericKeySchedule,
 {
-    key_schedule: SelectSharing<KeySchedule>,
+    /// Sharing of the `KeySchedule`.
+    key_schedule: Mutex<KeySchedule>,
+    /// Key update state.
+    key_update_state: KeyUpdateWorkerState,
 }
 
 impl<RxE, TxE, KeySchedule> Connection<RxE, TxE, KeySchedule>
@@ -82,12 +91,13 @@ where
         Receiver: ApplicationDataReceiver,
     {
         let shared_state = &SharedState {
-            key_schedule: SelectSharing::new(self.key_schedule),
+            key_schedule: Mutex::new(self.key_schedule),
+            key_update_state: KeyUpdateWorkerState::new(),
         };
         let rx_endpoint = self.rx_endpoint;
         let tx_endpoint = self.tx_endpoint;
 
-        match select(
+        match select3(
             rx_worker::<_, TxE, _, Receiver>(rx_endpoint, rx_sender, rx_buffer, shared_state),
             tx_worker::<RxE, _, Sender, _>(
                 tx_endpoint,
@@ -96,11 +106,13 @@ where
                 shared_state,
                 delay,
             ),
+            key_update_worker::<Socket, Sender, Receiver>(shared_state),
         )
         .await
         {
-            Either::First(f) => f,
-            Either::Second(s) => s,
+            Either3::First(f) => f,
+            Either3::Second(s) => s,
+            Either3::Third(t) => t,
         }
     }
 }
@@ -131,11 +143,36 @@ where
     'outer: loop {
         let buf = &mut EncodingBuffer::new(tx_buffer);
 
-        if shared_state.key_schedule.lock().await.write_record_number()
-            > MAX_PACKETS_BEFORE_KEY_UPDATE
         {
-            // TODO: Perform key update.
-            todo!()
+            if shared_state.key_schedule.lock().await.write_record_number()
+                > MAX_PACKETS_BEFORE_KEY_UPDATE
+                || shared_state.key_update_requested.load(Ordering::Relaxed)
+            {
+                if let Err(e) = Record::encode_key_update(
+                    buf,
+                    shared_state.key_schedule.lock().await.deref_mut(),
+                    false, // TODO: How should the receiver key update be configured?
+                           // False for now so the receiving side is responsible for its own key
+                           // update. Maybe check estimated read record number? If it's too high we
+                           // request.
+                )
+                .await
+                {
+                    error!("Encoding of key update failed with error = {:?}", e);
+                    continue 'outer;
+                }
+
+                socket
+                    .send(buf)
+                    .await
+                    .map_err(|e| ConnectionError::DtlsError(Error::Send(e)))?;
+
+                shared_state
+                    .key_update_requested
+                    .store(false, Ordering::Relaxed);
+
+                continue 'outer;
+            }
         }
 
         {
@@ -227,13 +264,32 @@ where
             )
             .await
             {
-                Some((r, _)) => match r {
-                    Record::Handshake(_, _) => {
+                Some((r, _)) => match &r {
+                    Record::Handshake(h, _) => {
                         debug!("Parsed a handshake");
                         trace!("{:?}", r);
-                        // TODO: Perform key update (if it is key update)
 
-                        todo!();
+                        match h {
+                            Handshake::KeyUpdate(key_update) => {
+                                if matches!(
+                                    key_update.request_update,
+                                    KeyUpdateRequest::UpdateRequested
+                                ) {
+                                    shared_state
+                                        .key_update_requested
+                                        .store(true, Ordering::Relaxed);
+                                }
+
+                                // TODO: Send ack.
+
+                                // TODO: Implement key update.
+                                todo!();
+                            }
+                            _ => {
+                                // TODO: What to do if we don't get a key update?
+                                todo!();
+                            }
+                        }
                     }
                     Record::Alert(_, _) => {
                         debug!("Parsed an alert");
@@ -274,97 +330,45 @@ where
     }
 }
 
-mod select_sharing {
-    use core::{
-        cell::UnsafeCell,
-        future::poll_fn,
-        ops::{Deref, DerefMut},
-        sync::atomic::{AtomicBool, Ordering},
-        task::{Poll, Waker},
-    };
-
-    /// Simple helper to share a T between the `select` arms in `Connection::run`.
-    /// If this is locked, then the `do_poll` will be set, causing the waker to be run on unlock.
-    ///
-    /// Must only be used in a select statement where no external tasks are spawned.
-    pub struct SelectSharing<T> {
-        inner: UnsafeCell<T>,
-        locked: AtomicBool,
-        do_poll: AtomicBool,
-    }
-
-    unsafe impl<T> Send for SelectSharing<T> {}
-    unsafe impl<T> Sync for SelectSharing<T> {}
-
-    impl<T> SelectSharing<T> {
-        /// Create a new `SelectSharing` wrapper.
-        pub const fn new(val: T) -> Self {
-            Self {
-                inner: UnsafeCell::new(val),
-                locked: AtomicBool::new(false),
-                do_poll: AtomicBool::new(false),
-            }
-        }
-
-        /// Lock the shared resource and gain access to it.
-        pub async fn lock(&self) -> SelectSharingGuard<T> {
-            poll_fn(|cx| {
-                // Try lock.
-                if self
-                    .locked
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    Poll::Ready(SelectSharingGuard {
-                        parent: self,
-                        to_wake: cx.waker().clone(),
-                    })
-                } else {
-                    // If locked, poll the select when done.
-                    self.do_poll.store(true, Ordering::Relaxed);
-
-                    Poll::Pending
-                }
-            })
-            .await
-        }
-    }
-
-    /// This type signifies exclusive access to the object protected by `SelectSharing`.
-    pub struct SelectSharingGuard<'a, T> {
-        parent: &'a SelectSharing<T>,
-        to_wake: Waker,
-    }
-
-    impl<'a, T> Deref for SelectSharingGuard<'a, T> {
-        type Target = T;
-
-        fn deref(&self) -> &Self::Target {
-            // SAFETY: This is protected via the `locked` atomic flag.
-            unsafe { &*self.parent.inner.get() }
-        }
-    }
-
-    impl<'a, T> DerefMut for SelectSharingGuard<'a, T> {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            // SAFETY: This is protected via the `locked` atomic flag.
-            unsafe { &mut *self.parent.inner.get() }
-        }
-    }
-
-    impl<'a, T> Drop for SelectSharingGuard<'a, T> {
-        fn drop(&mut self) {
-            // Unlock.
-            self.parent.locked.store(false, Ordering::Release);
-
-            // Poll if requested.
-            if self.parent.do_poll.load(Ordering::Relaxed) {
-                self.parent.do_poll.store(false, Ordering::Relaxed);
-                self.to_wake.wake_by_ref();
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod test {}
+struct KeyUpdateWorkerState {
+    /// External signal to start doing a key update.
+    do_key_update: Signal<()>,
+    /// Send a key update message, with support for knowing that it has been sent.
+    send_key_update: Signal<()>,
+    /// Marker to show that a key update is ongoing.
+    key_update_ongoing: AtomicBool,
 }
+impl KeyUpdateWorkerState {
+    const fn new() -> Self {
+        Self {
+            do_key_update: Signal::new(),
+            send_key_update: Signal::new(),
+            key_update_ongoing: AtomicBool::new(false),
+        }
+    }
+
+    /// Start a key update.
+    fn start_key_update(&self) {
+        self.do_key_update.try_send(());
+    }
+}
+
+async fn key_update_worker<Socket, Sender, Receiver>(
+    shared_state: &SharedState<impl GenericKeySchedule>,
+) -> Result<Infallible, ErrorHelper<Socket, Sender, Receiver>>
+where
+    Socket: Endpoint,
+    Sender: ApplicationDataSender,
+    Receiver: ApplicationDataReceiver,
+{
+    loop {
+        // TODO
+        //
+        // 1. Wait for key update request.
+        // 2. Send a key update request
+        // 3. When sent, update key schedule to new keys
+        // 4. Wait for ack, TODO: what needs to happen if no ACK?
+    }
+}
+
+mod select_sharing;
