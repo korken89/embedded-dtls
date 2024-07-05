@@ -4,16 +4,16 @@ use crate::{
     record::{GenericKeySchedule, Record, MINIMUM_CIPHERTEXT_OVERHEAD},
     ApplicationDataReceiver, ApplicationDataSender, Error, RxEndpoint, TxEndpoint,
 };
-use core::{
-    convert::Infallible,
-    ops::DerefMut,
-    pin::pin,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::{convert::Infallible, ops::DerefMut, pin::pin};
 use defmt_or_log::{debug, derive_format_or_debug, error, trace};
 use embassy_futures::select::{select, select3, Either, Either3};
 use embedded_hal_async::delay::DelayNs;
-use select_sharing::{Mutex, Signal};
+use select_sharing::Mutex;
+
+use self::key_update::{key_update_worker, KeyUpdateWorkerState};
+
+mod key_update;
+mod select_sharing;
 
 // Tasks:
 //
@@ -64,8 +64,8 @@ where
 {
     /// Sharing of the `KeySchedule`.
     key_schedule: Mutex<KeySchedule>,
-    /// Key update state.
-    key_update_state: KeyUpdateWorkerState,
+    /// Key update worker.
+    key_update_worker: KeyUpdateWorkerState,
 }
 
 impl<RxE, TxE, KeySchedule> Connection<RxE, TxE, KeySchedule>
@@ -92,7 +92,7 @@ where
     {
         let shared_state = &SharedState {
             key_schedule: Mutex::new(self.key_schedule),
-            key_update_state: KeyUpdateWorkerState::new(),
+            key_update_worker: KeyUpdateWorkerState::new(),
         };
         let rx_endpoint = self.rx_endpoint;
         let tx_endpoint = self.tx_endpoint;
@@ -106,7 +106,7 @@ where
                 shared_state,
                 delay,
             ),
-            key_update_worker::<Socket, Sender, Receiver>(shared_state),
+            key_update_worker::<_, _, Sender, Receiver>(shared_state),
         )
         .await
         {
@@ -143,36 +143,40 @@ where
     'outer: loop {
         let buf = &mut EncodingBuffer::new(tx_buffer);
 
+        if shared_state.key_schedule.lock().await.write_record_number()
+            > MAX_PACKETS_BEFORE_KEY_UPDATE
         {
-            if shared_state.key_schedule.lock().await.write_record_number()
-                > MAX_PACKETS_BEFORE_KEY_UPDATE
-                || shared_state.key_update_requested.load(Ordering::Relaxed)
-            {
-                if let Err(e) = Record::encode_key_update(
-                    buf,
-                    shared_state.key_schedule.lock().await.deref_mut(),
-                    false, // TODO: How should the receiver key update be configured?
-                           // False for now so the receiving side is responsible for its own key
-                           // update. Maybe check estimated read record number? If it's too high we
-                           // request.
-                )
-                .await
-                {
-                    error!("Encoding of key update failed with error = {:?}", e);
-                    continue 'outer;
-                }
+            shared_state.key_update_worker.start_key_update();
+        }
 
-                socket
-                    .send(buf)
-                    .await
-                    .map_err(|e| ConnectionError::DtlsError(Error::Send(e)))?;
+        // Check if we need to send any special packets.
+        {
+            // if let Err(e) = Record::encode_key_update(
+            //     buf,
+            //     shared_state.key_schedule.lock().await.deref_mut(),
+            //     false, // TODO: How should the receiver key update be configured?
+            //            // False for now so the receiving side is responsible for its own key
+            //            // update. Maybe check estimated read record number? If it's too high we
+            //            // request.
+            // )
+            // .await
+            // {
+            //     error!("Encoding of key update failed with error = {:?}", e);
+            //     continue 'outer;
+            // }
+            //
+            // socket
+            //     .send(buf)
+            //     .await
+            //     .map_err(|e| ConnectionError::DtlsError(Error::Send(e)))?;
+            //
+            // shared_state
+            //     .key_update_requested
+            //     .store(false, Ordering::Relaxed);
+            //
+            // continue 'outer;
 
-                shared_state
-                    .key_update_requested
-                    .store(false, Ordering::Relaxed);
-
-                continue 'outer;
-            }
+            // ..
         }
 
         {
@@ -275,9 +279,7 @@ where
                                     key_update.request_update,
                                     KeyUpdateRequest::UpdateRequested
                                 ) {
-                                    shared_state
-                                        .key_update_requested
-                                        .store(true, Ordering::Relaxed);
+                                    shared_state.key_update_worker.start_key_update();
                                 }
 
                                 // TODO: Send ack.
@@ -329,46 +331,3 @@ where
         }
     }
 }
-
-struct KeyUpdateWorkerState {
-    /// External signal to start doing a key update.
-    do_key_update: Signal<()>,
-    /// Send a key update message, with support for knowing that it has been sent.
-    send_key_update: Signal<()>,
-    /// Marker to show that a key update is ongoing.
-    key_update_ongoing: AtomicBool,
-}
-impl KeyUpdateWorkerState {
-    const fn new() -> Self {
-        Self {
-            do_key_update: Signal::new(),
-            send_key_update: Signal::new(),
-            key_update_ongoing: AtomicBool::new(false),
-        }
-    }
-
-    /// Start a key update.
-    fn start_key_update(&self) {
-        self.do_key_update.try_send(());
-    }
-}
-
-async fn key_update_worker<Socket, Sender, Receiver>(
-    shared_state: &SharedState<impl GenericKeySchedule>,
-) -> Result<Infallible, ErrorHelper<Socket, Sender, Receiver>>
-where
-    Socket: Endpoint,
-    Sender: ApplicationDataSender,
-    Receiver: ApplicationDataReceiver,
-{
-    loop {
-        // TODO
-        //
-        // 1. Wait for key update request.
-        // 2. Send a key update request
-        // 3. When sent, update key schedule to new keys
-        // 4. Wait for ack, TODO: what needs to happen if no ACK?
-    }
-}
-
-mod select_sharing;
