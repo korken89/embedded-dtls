@@ -152,6 +152,7 @@ mod test {
 
     impl rand::CryptoRng for FakeRandom {}
 
+    #[derive(Copy, Clone)]
     struct Delay {}
 
     impl DelayNs for Delay {
@@ -273,13 +274,7 @@ mod test {
             let tx_buf = &mut vec![0; 1536];
 
             if let Err(e) = client_connection
-                .run(
-                    rx_buf,
-                    tx_buf,
-                    &mut rx_sender,
-                    &mut tx_receiver,
-                    &mut Delay {},
-                )
+                .run(rx_buf, tx_buf, &mut rx_sender, &mut tx_receiver, Delay {})
                 .await
             {
                 error!("Client connection closed with {:?}", e);
@@ -339,13 +334,7 @@ mod test {
             let tx_buf = &mut vec![0; 1536];
 
             if let Err(e) = server_connection
-                .run(
-                    rx_buf,
-                    tx_buf,
-                    &mut rx_sender,
-                    &mut tx_receiver,
-                    &mut Delay {},
-                )
+                .run(rx_buf, tx_buf, &mut rx_sender, &mut tx_receiver, Delay {})
                 .await
             {
                 error!("Server connection closed with {:?}", e);

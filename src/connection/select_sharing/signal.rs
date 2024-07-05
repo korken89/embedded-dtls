@@ -64,6 +64,7 @@ impl<T> Signal<T> {
             if self.available.load(Ordering::Acquire) {
                 let val = unsafe { (self.inner.get() as *const T).read() };
                 self.available.store(false, Ordering::Release);
+                self.send_waker.wake();
                 Poll::Ready(val)
             } else {
                 self.recv_waker.register(cx.waker());

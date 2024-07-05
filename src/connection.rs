@@ -1,3 +1,4 @@
+use self::key_update::{key_update_worker, KeyUpdateWorkerState};
 use crate::{
     buffer::EncodingBuffer,
     handshake::{Handshake, KeyUpdateRequest},
@@ -9,8 +10,6 @@ use defmt_or_log::{debug, derive_format_or_debug, error, trace};
 use embassy_futures::select::{select, select3, Either, Either3};
 use embedded_hal_async::delay::DelayNs;
 use select_sharing::Mutex;
-
-use self::key_update::{key_update_worker, KeyUpdateWorkerState};
 
 mod key_update;
 mod select_sharing;
@@ -84,7 +83,7 @@ where
         tx_buffer: &mut [u8],
         rx_sender: &mut Sender,
         tx_receiver: &mut Receiver,
-        delay: &mut impl DelayNs,
+        delay: impl DelayNs + Clone,
     ) -> Result<Infallible, ErrorHelper<RxE, TxE, Sender, Receiver>>
     where
         Sender: ApplicationDataSender,
@@ -104,9 +103,9 @@ where
                 tx_receiver,
                 tx_buffer,
                 shared_state,
-                delay,
+                delay.clone(),
             ),
-            key_update_worker::<_, _, Sender, Receiver>(shared_state),
+            key_update_worker::<_, _, Sender, Receiver>(shared_state, delay),
         )
         .await
         {
@@ -132,7 +131,7 @@ async fn tx_worker<RxE, TxE, Sender, Receiver>(
     tx_receiver: &mut Receiver,
     tx_buffer: &mut [u8],
     shared_state: &SharedState<impl GenericKeySchedule>,
-    delay: &mut impl DelayNs,
+    mut delay: impl DelayNs,
 ) -> Result<Infallible, ErrorHelper<RxE, TxE, Sender, Receiver>>
 where
     TxE: TxEndpoint,
