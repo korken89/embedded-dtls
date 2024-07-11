@@ -342,6 +342,10 @@ pub trait GenericKeySchedule {
     /// Returns the size of the AEAD tag.
     fn tag_size(&self) -> usize;
 
+    fn update_sending_keys(&mut self) {
+        todo!("just filled the gaps for now");
+    }
+
     /// Get the current write record number.
     fn write_record_number(&self) -> u64;
 

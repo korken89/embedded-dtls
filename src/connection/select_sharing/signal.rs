@@ -6,9 +6,9 @@ use core::{
     task::Poll,
 };
 
-use embassy_sync::waitqueue::AtomicWaker;
+use super::atomic_waker::AtomicWaker;
 
-/// ...
+/// FIXME: docs
 pub struct Signal<T> {
     inner: UnsafeCell<MaybeUninit<T>>,
     available: AtomicBool,
@@ -17,7 +17,7 @@ pub struct Signal<T> {
 }
 
 unsafe impl<T> Send for Signal<T> {}
-unsafe impl<T> Sync for Signal<T> {}
+unsafe impl<T: Send> Sync for Signal<T> {}
 
 impl<T> Signal<T> {
     /// Create a new signal.
