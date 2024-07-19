@@ -77,7 +77,7 @@ where
         tx_buffer: &mut [u8],
         rx_sender: &mut Sender,
         tx_receiver: &mut Receiver,
-        delay: &mut impl DelayNs,
+        delay: impl DelayNs + Clone,
     ) -> Result<Infallible, ErrorHelper<RxE, TxE, Sender, Receiver>>
     where
         Sender: ApplicationDataSender,
@@ -96,7 +96,7 @@ where
                 tx_receiver,
                 tx_buffer,
                 shared_state,
-                delay,
+                delay.clone(),
             ),
         )
         .await
@@ -122,7 +122,7 @@ async fn tx_worker<RxE, TxE, Sender, Receiver>(
     tx_receiver: &mut Receiver,
     tx_buffer: &mut [u8],
     shared_state: &SharedState<impl GenericKeySchedule>,
-    delay: &mut impl DelayNs,
+    mut delay: impl DelayNs,
 ) -> Result<Infallible, ErrorHelper<RxE, TxE, Sender, Receiver>>
 where
     TxE: TxEndpoint,

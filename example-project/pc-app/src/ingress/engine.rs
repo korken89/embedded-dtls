@@ -173,9 +173,8 @@ async fn communication_worker(ip: IpAddr, packet_recv: Receiver<Vec<u8>>) {
     let mut rx_buf = vec![0; 1536];
     let mut tx_buf = vec![0; 1536];
 
-    let mut delay = Delay;
     tokio::select! {
-        e = server_connection.run(&mut rx_buf, &mut tx_buf, &mut rx_sender, &mut tx_receiver, &mut delay) => {
+        e = server_connection.run(&mut rx_buf, &mut tx_buf, &mut rx_sender, &mut tx_receiver, Delay) => {
             let e = e.unwrap_err();
             error!("{ip}: Edtls connection stopped: {e:?}");
         },

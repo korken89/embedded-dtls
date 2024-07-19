@@ -1,4 +1,4 @@
-use crate::app;
+use crate::{app, ethernet::edtls::CloneableSystick};
 use embassy_futures::join::join3;
 use embassy_net::{
     udp::{PacketMetadata, UdpSocket},
@@ -16,7 +16,6 @@ use embedded_dtls::{
 };
 use heapless::Vec;
 use rpc_definition::endpoints::sleep::Sleep;
-use rtic_monotonics::systick::Systick;
 use rtic_sync::channel::{Receiver, Sender};
 
 // Backend IP.
@@ -104,7 +103,7 @@ pub async fn run_comms(
                         &mut tx_buf,
                         &mut rx_sender,
                         &mut tx_receiver,
-                        &mut Systick,
+                        CloneableSystick,
                     )
                     .await
                 {
@@ -146,6 +145,17 @@ pub async fn handle_stack(cx: app::handle_stack::Context<'_>) -> ! {
 
 pub mod edtls {
     use embassy_net::{udp::UdpSocket, IpEndpoint};
+    use embedded_dtls::DelayNs;
+    use rtic_monotonics::systick::Systick;
+
+    #[derive(Clone)]
+    pub struct CloneableSystick;
+
+    impl DelayNs for CloneableSystick {
+        async fn delay_ns(&mut self, ns: u32) {
+            Systick.delay_ns(ns).await
+        }
+    }
 
     pub struct DtlsSocket<'stack, 'socket> {
         inner: &'socket UdpSocket<'stack>,

@@ -6,6 +6,7 @@ use tokio::{
     time::{error::Elapsed, timeout},
 };
 
+#[derive(Clone)]
 pub struct Delay;
 
 impl DelayNs for Delay {
