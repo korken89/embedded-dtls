@@ -8,7 +8,7 @@ use crate::{
             HeartbeatMode, KeyShareEntry, NamedGroup, OfferedPsks, PskKeyExchangeMode,
             PskKeyExchangeModes, SelectedPsk, ServerExtensions, ServerSupportedVersion,
         },
-        ClientHello, Finished, Handshake, Random, ServerHello,
+        ClientHello, Finished, Handshake, KeyUpdate, KeyUpdateRequest, Random, ServerHello,
     },
     integers::U48,
 };
@@ -342,6 +342,10 @@ pub trait GenericKeySchedule {
     /// Returns the size of the AEAD tag.
     fn tag_size(&self) -> usize;
 
+    fn update_sending_keys(&mut self) {
+        todo!("just filled the gaps for now");
+    }
+
     /// Get the current write record number.
     fn write_record_number(&self) -> u64;
 
@@ -409,6 +413,7 @@ pub enum Record<'a> {
 }
 
 impl<'a> Record<'a> {
+    /// Create a client hello handshake.
     pub async fn encode_client_hello<CipherSuite, Rng>(
         hasher: impl FnOnce((RecordPayloadPositions, &[u8])),
         buf: &mut EncodingBuffer<'_>,
@@ -459,6 +464,28 @@ impl<'a> Record<'a> {
 
         Record::Handshake(Handshake::ClientHello(client_hello), Encryption::Disabled)
             .encode(hasher, buf, key_schedule)
+            .await
+    }
+
+    /// Create a key update handshake.
+    pub async fn encode_key_update(
+        buf: &mut EncodingBuffer<'_>,
+        key_schedule: &mut impl GenericKeySchedule,
+        request_receiver_key_update: bool,
+    ) -> Result<(), OutOfMemory> {
+        let key_update = KeyUpdate {
+            request_update: if request_receiver_key_update {
+                KeyUpdateRequest::UpdateRequested
+            } else {
+                KeyUpdateRequest::UpdateNotRequested
+            },
+        };
+
+        debug!("Sending key update");
+        trace!("{:?}", key_update);
+
+        Record::Handshake(Handshake::KeyUpdate(key_update), Encryption::Enabled)
+            .encode(|_| {}, buf, key_schedule)
             .await
     }
 

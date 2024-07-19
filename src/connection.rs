@@ -1,14 +1,17 @@
+use self::key_update::{key_update_worker, KeyUpdateWorkerState};
 use crate::{
     buffer::EncodingBuffer,
+    handshake::{Handshake, KeyUpdateRequest},
     record::{GenericKeySchedule, Record, MINIMUM_CIPHERTEXT_OVERHEAD},
     ApplicationDataReceiver, ApplicationDataSender, Error, RxEndpoint, TxEndpoint,
 };
 use core::{convert::Infallible, ops::DerefMut, pin::pin};
 use defmt_or_log::{debug, derive_format_or_debug, error, trace};
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either, Either3};
 use embedded_hal_async::delay::DelayNs;
 use select_sharing::Mutex;
 
+mod key_update;
 mod select_sharing;
 
 // Tasks:
@@ -58,7 +61,10 @@ struct SharedState<KeySchedule>
 where
     KeySchedule: GenericKeySchedule,
 {
+    /// Sharing of the `KeySchedule`.
     key_schedule: Mutex<KeySchedule>,
+    /// Key update worker.
+    key_update_worker: KeyUpdateWorkerState,
 }
 
 impl<RxE, TxE, KeySchedule> Connection<RxE, TxE, KeySchedule>
@@ -85,11 +91,12 @@ where
     {
         let shared_state = &SharedState {
             key_schedule: Mutex::new(self.key_schedule),
+            key_update_worker: KeyUpdateWorkerState::new(),
         };
         let rx_endpoint = self.rx_endpoint;
         let tx_endpoint = self.tx_endpoint;
 
-        match select(
+        match select3(
             rx_worker::<_, TxE, _, Receiver>(rx_endpoint, rx_sender, rx_buffer, shared_state),
             tx_worker::<RxE, _, Sender, _>(
                 tx_endpoint,
@@ -98,11 +105,13 @@ where
                 shared_state,
                 delay.clone(),
             ),
+            key_update_worker::<_, _, Sender, Receiver>(shared_state, delay),
         )
         .await
         {
-            Either::First(f) => f,
-            Either::Second(s) => s,
+            Either3::First(f) => f,
+            Either3::Second(s) => s,
+            Either3::Third(t) => t,
         }
     }
 }
@@ -136,8 +145,37 @@ where
         if shared_state.key_schedule.lock().await.write_record_number()
             > MAX_PACKETS_BEFORE_KEY_UPDATE
         {
-            // TODO: Perform key update.
-            todo!()
+            shared_state.key_update_worker.start_key_update();
+        }
+
+        // Check if we need to send any special packets.
+        {
+            // if let Err(e) = Record::encode_key_update(
+            //     buf,
+            //     shared_state.key_schedule.lock().await.deref_mut(),
+            //     false, // TODO: How should the receiver key update be configured?
+            //            // False for now so the receiving side is responsible for its own key
+            //            // update. Maybe check estimated read record number? If it's too high we
+            //            // request.
+            // )
+            // .await
+            // {
+            //     error!("Encoding of key update failed with error = {:?}", e);
+            //     continue 'outer;
+            // }
+            //
+            // socket
+            //     .send(buf)
+            //     .await
+            //     .map_err(|e| ConnectionError::DtlsError(Error::Send(e)))?;
+            //
+            // shared_state
+            //     .key_update_requested
+            //     .store(false, Ordering::Relaxed);
+            //
+            // continue 'outer;
+
+            // ..
         }
 
         {
@@ -229,13 +267,30 @@ where
             )
             .await;
             match record {
-                Some((r, _)) => match r {
-                    Record::Handshake(_, _) => {
+                Some((r, _)) => match &r {
+                    Record::Handshake(h, _) => {
                         debug!("Parsed a handshake");
                         trace!("{:?}", r);
-                        // TODO: Perform key update (if it is key update)
 
-                        todo!();
+                        match h {
+                            Handshake::KeyUpdate(key_update) => {
+                                if matches!(
+                                    key_update.request_update,
+                                    KeyUpdateRequest::UpdateRequested
+                                ) {
+                                    shared_state.key_update_worker.start_key_update();
+                                }
+
+                                // TODO: Send ack.
+
+                                // TODO: Implement key update.
+                                todo!();
+                            }
+                            _ => {
+                                // TODO: What to do if we don't get a key update?
+                                todo!();
+                            }
+                        }
                     }
                     Record::Alert(_, _) => {
                         debug!("Parsed an alert");
