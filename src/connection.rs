@@ -7,7 +7,9 @@ use core::{convert::Infallible, ops::DerefMut, pin::pin};
 use defmt_or_log::{debug, derive_format_or_debug, error, trace};
 use embassy_futures::select::{select, Either};
 use embedded_hal_async::delay::DelayNs;
-use select_sharing::SelectSharing;
+use select_sharing::Mutex;
+
+mod select_sharing;
 
 // Tasks:
 //
@@ -56,7 +58,7 @@ struct SharedState<KeySchedule>
 where
     KeySchedule: GenericKeySchedule,
 {
-    key_schedule: SelectSharing<KeySchedule>,
+    key_schedule: Mutex<KeySchedule>,
 }
 
 impl<RxE, TxE, KeySchedule> Connection<RxE, TxE, KeySchedule>
@@ -82,7 +84,7 @@ where
         Receiver: ApplicationDataReceiver,
     {
         let shared_state = &SharedState {
-            key_schedule: SelectSharing::new(self.key_schedule),
+            key_schedule: Mutex::new(self.key_schedule),
         };
         let rx_endpoint = self.rx_endpoint;
         let tx_endpoint = self.tx_endpoint;
@@ -272,99 +274,4 @@ where
             }
         }
     }
-}
-
-mod select_sharing {
-    use core::{
-        cell::UnsafeCell,
-        future::poll_fn,
-        ops::{Deref, DerefMut},
-        sync::atomic::{AtomicBool, Ordering},
-        task::{Poll, Waker},
-    };
-
-    /// Simple helper to share a T between the `select` arms in `Connection::run`.
-    /// If this is locked, then the `do_poll` will be set, causing the waker to be run on unlock.
-    ///
-    /// Must only be used in a select statement where no external tasks are spawned.
-    pub struct SelectSharing<T> {
-        inner: UnsafeCell<T>,
-        locked: AtomicBool,
-        do_poll: AtomicBool,
-    }
-
-    unsafe impl<T> Send for SelectSharing<T> {}
-    unsafe impl<T> Sync for SelectSharing<T> {}
-
-    impl<T> SelectSharing<T> {
-        /// Create a new `SelectSharing` wrapper.
-        pub const fn new(val: T) -> Self {
-            Self {
-                inner: UnsafeCell::new(val),
-                locked: AtomicBool::new(false),
-                do_poll: AtomicBool::new(false),
-            }
-        }
-
-        /// Lock the shared resource and gain access to it.
-        pub async fn lock(&self) -> SelectSharingGuard<T> {
-            poll_fn(|cx| {
-                // Try lock.
-                if self
-                    .locked
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    Poll::Ready(SelectSharingGuard {
-                        parent: self,
-                        to_wake: cx.waker().clone(),
-                    })
-                } else {
-                    // If locked, poll the select when done.
-                    self.do_poll.store(true, Ordering::Relaxed);
-
-                    Poll::Pending
-                }
-            })
-            .await
-        }
-    }
-
-    /// This type signifies exclusive access to the object protected by `SelectSharing`.
-    pub struct SelectSharingGuard<'a, T> {
-        parent: &'a SelectSharing<T>,
-        to_wake: Waker,
-    }
-
-    impl<'a, T> Deref for SelectSharingGuard<'a, T> {
-        type Target = T;
-
-        fn deref(&self) -> &Self::Target {
-            // SAFETY: This is protected via the `locked` atomic flag.
-            unsafe { &*self.parent.inner.get() }
-        }
-    }
-
-    impl<'a, T> DerefMut for SelectSharingGuard<'a, T> {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            // SAFETY: This is protected via the `locked` atomic flag.
-            unsafe { &mut *self.parent.inner.get() }
-        }
-    }
-
-    impl<'a, T> Drop for SelectSharingGuard<'a, T> {
-        fn drop(&mut self) {
-            // Unlock.
-            self.parent.locked.store(false, Ordering::Release);
-
-            // Poll if requested.
-            if self.parent.do_poll.load(Ordering::Relaxed) {
-                self.parent.do_poll.store(false, Ordering::Relaxed);
-                self.to_wake.wake_by_ref();
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod test {}
 }
