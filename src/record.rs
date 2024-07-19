@@ -19,6 +19,9 @@ use num_enum::TryFromPrimitive;
 use rand_core::{CryptoRng, RngCore};
 use x25519_dalek::PublicKey;
 
+mod heartbeat;
+pub use heartbeat::*;
+
 /// The number of bytes that header (4), encoding (1), and encryption (16) will at a minimum use.
 pub(crate) const MINIMUM_CIPHERTEXT_OVERHEAD: usize = 4 + 1 + 16;
 
@@ -404,7 +407,7 @@ pub enum Record<'a> {
     Handshake(Handshake<'a>, Encryption),
     Alert(Alert, Encryption),
     Ack(Ack<'a>, Encryption),
-    Heartbeat(()),
+    Heartbeat(heartbeat::Heartbeat<'a>),
     ApplicationData(&'a [u8]),
 }
 
@@ -583,6 +586,19 @@ impl<'a> Record<'a> {
             .map(|_| ())
     }
 
+    pub async fn encode_heartbeat(
+        buf: &mut EncodingBuffer<'_>,
+        key_schedule: &mut impl GenericKeySchedule,
+        payload: &[u8],
+        type_: HeartbeatMessageType,
+    ) -> Result<(), OutOfMemory> {
+        debug!("Sending heartbeat: {:?}", type_);
+
+        Record::Heartbeat(heartbeat::Heartbeat { type_, payload })
+            .encode(|_| {}, buf, key_schedule)
+            .await
+    }
+
     /// Encode the record into a buffer. Returns (packet to send, content to hash).
     async fn encode<'buf>(
         &self,
@@ -614,7 +630,7 @@ impl<'a> Record<'a> {
                 alert.encode(buf)?;
                 None
             }
-            Record::Heartbeat(_) => todo!(),
+            Record::Heartbeat(heartbeat) => heartbeat.encode(buf).map(|_| None)?,
             Record::Ack(ack, _) => ack.encode(buf).map(|_| None)?,
             Record::ApplicationData(user_data) => {
                 buf.extend_from_slice(user_data)?;
@@ -695,7 +711,7 @@ impl<'a> Record<'a> {
                 (Record::Handshake(hs, encryption), binders)
             }
             ContentType::Ack => (Record::Ack(Ack::parse(buf)?, encryption), None),
-            ContentType::Heartbeat => todo!(),
+            ContentType::Heartbeat => (Record::Heartbeat(heartbeat::Heartbeat::parse(buf)?), None),
             ContentType::Alert => (Record::Alert(Alert::parse(buf)?, encryption), None),
             ContentType::ApplicationData => (Record::ApplicationData(buf.pop_rest()), None),
             ContentType::ChangeCipherSpec => todo!(),
@@ -1248,7 +1264,8 @@ async fn encode_ciphertext<'buf, Ret>(
     }
     .encode(buf)?;
 
-    trace!("encoded header = {:?}", buf);
+    // TODO: Fix format trait
+    // trace!("encoded header = {:?}", buf);
 
     // ------ Start record
 
@@ -1301,7 +1318,8 @@ async fn encode_ciphertext<'buf, Ret>(
     }
 
     // ------ Finish record
-    trace!("encoded record = {:?}", buf);
+    // TODO: Fix format trait
+    // trace!("encoded record = {:?}", buf);
 
     Ok(r)
 }

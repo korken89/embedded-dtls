@@ -61,7 +61,7 @@ mod app {
         )
         .ok();
         handle_sleep_command::spawn(sleep_request_receiver, ethernet_tx_sender.clone()).ok();
-        send_heartbeat::spawn(ethernet_tx_sender).ok();
+        // send_heartbeat::spawn(ethernet_tx_sender).ok();
 
         (Shared { network_stack }, Local { rng })
     }

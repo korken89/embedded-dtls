@@ -1,17 +1,50 @@
 use std::{fmt::Debug, net::IpAddr, time::Duration};
 
-use embedded_dtls::{self, DelayNs};
-use tokio::{
-    sync::mpsc::Receiver,
-    time::{error::Elapsed, timeout},
-};
+use embedded_dtls;
+use tokio::sync::mpsc::Receiver;
+
+type Instant = tokio::time::Instant;
+pub struct InstantWrapper(Instant);
+
+impl From<Instant> for InstantWrapper {
+    fn from(value: Instant) -> Self {
+        Self(value)
+    }
+}
+
+impl From<InstantWrapper> for Instant {
+    fn from(value: InstantWrapper) -> Self {
+        value.0
+    }
+}
+
+// TODO: Overflows? IDC for now
+impl embedded_dtls::Instant for InstantWrapper {
+    fn add_s(&self, s: u32) -> Self {
+        Self(self.0 + Duration::from_secs(s as _))
+    }
+
+    fn sub_as_ms(&self, rhs: &Self) -> u32 {
+        (self.0 - rhs.0).as_secs() as _
+    }
+}
 
 #[derive(Clone)]
 pub struct Delay;
 
-impl DelayNs for Delay {
-    async fn delay_ns(&mut self, ns: u32) {
-        tokio::time::sleep(Duration::from_nanos(ns as _)).await;
+impl embedded_dtls::Delay for Delay {
+    async fn delay_ms(&mut self, ms: u32) {
+        tokio::time::sleep(Duration::from_millis(ms as _)).await;
+    }
+
+    type Instant = InstantWrapper;
+
+    async fn delay_until(&mut self, instant: Self::Instant) {
+        tokio::time::sleep_until(instant.into()).await
+    }
+
+    fn now(&self) -> Self::Instant {
+        tokio::time::Instant::now().into()
     }
 }
 
@@ -56,8 +89,8 @@ impl embedded_dtls::RxEndpoint for RxEndpoint {
     type ReceiveError = anyhow::Error;
 
     async fn recv<'a>(&mut self, buf: &'a mut [u8]) -> Result<&'a mut [u8], Self::ReceiveError> {
-        match timeout(Duration::from_secs(5), self.rx.recv()).await {
-            Ok(Some(received_data)) => {
+        match self.rx.recv().await {
+            Some(received_data) => {
                 let n = received_data.len();
                 if buf.len() < n {
                     return Err(anyhow::anyhow!(
@@ -68,8 +101,7 @@ impl embedded_dtls::RxEndpoint for RxEndpoint {
                 buf.copy_from_slice(&received_data);
                 Ok(buf)
             }
-            Ok(None) => Err(anyhow::anyhow!("All senders were closed")),
-            Err(Elapsed { .. }) => Err(anyhow::anyhow!("Connection timed out")),
+            None => Err(anyhow::anyhow!("All senders were closed")),
         }
     }
 }

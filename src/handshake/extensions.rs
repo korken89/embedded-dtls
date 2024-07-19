@@ -21,6 +21,11 @@ use crate::{
 use defmt_or_log::{derive_format_or_debug, error};
 use num_enum::TryFromPrimitive;
 
+mod heartbeat;
+
+pub use heartbeat::HeartbeatExtension;
+pub use heartbeat::HeartbeatMode;
+
 /// Version numbers.
 #[repr(u16)]
 #[derive_format_or_debug]
@@ -657,41 +662,6 @@ impl SelectedPsk {
             selected_identity: buf.pop_u16_be()?,
         })
     }
-}
-
-/// The heartbeat extension.
-///
-/// From Section 2, RFC6520.
-#[derive_format_or_debug]
-#[derive(Clone, PartialOrd, PartialEq)]
-pub struct HeartbeatExtension {
-    /// Supported heartbeat mode.
-    pub mode: HeartbeatMode,
-}
-
-impl HeartbeatExtension {
-    /// Encode a `heartbeat` extension.
-    pub fn encode(&self, buf: &mut EncodingBuffer) -> Result<(), OutOfMemory> {
-        buf.push_u8(self.mode as u8)
-    }
-
-    /// Parse a supported heartbeat.
-    pub fn parse(buf: &mut ParseBuffer) -> Option<Self> {
-        Some(Self {
-            mode: HeartbeatMode::try_from(buf.pop_u8()?).ok()?,
-        })
-    }
-}
-
-/// Heartbeat mode.
-///
-/// From Section 2, RFC6520.
-#[repr(u8)]
-#[derive_format_or_debug]
-#[derive(Copy, Clone, PartialOrd, PartialEq, TryFromPrimitive)]
-pub enum HeartbeatMode {
-    PeerAllowedToSend = 1,
-    PeerNotAllowedToSend = 2,
 }
 
 /// Pre-Shared Key Exchange Modes (RFC 8446, 4.2.9)

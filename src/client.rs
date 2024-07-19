@@ -85,10 +85,11 @@ where
             transcript_hasher.update(buf);
         }
 
-        trace!(
-            "Client transcript after client hello: {:?}",
-            transcript_hasher.clone().finalize()
-        );
+        // TODO: Formatter missing
+        // trace!(
+        //     "Client transcript after client hello: {:?}",
+        //     transcript_hasher.clone().finalize()
+        // );
 
         tx_endpoint
             .send(&ser_buf)
@@ -123,10 +124,11 @@ where
                 return Err(Error::InvalidServerHello(ServerHelloError::NotAServerHello));
             };
 
-            trace!(
-                "Client transcript after server hello: {:?}",
-                transcript_hasher.clone().finalize()
-            );
+            // TODO: Formatter missing
+            // trace!(
+            //     "Client transcript after server hello: {:?}",
+            //     transcript_hasher.clone().finalize()
+            // );
 
             // Update key schedule to Handshake Secret using public keys.
             let their_public_key = server_hello

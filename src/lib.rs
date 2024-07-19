@@ -15,8 +15,28 @@
 #![allow(dead_code)]
 
 pub use defmt_or_log::{derive_format_or_debug, FormatOrDebug};
-pub use embedded_hal_async::delay::DelayNs;
 use handshake::{ClientHelloError, ServerHelloError};
+
+pub use delay::Delay;
+pub use delay::Instant;
+mod delay {
+    pub trait Instant {
+        /// Add `s` amount of seconds to an instant
+        fn add_s(&self, s: u32) -> Self;
+        /// Calculate a duration between two instants in milliseconds
+        fn sub_as_ms(&self, rhs: &Self) -> u32;
+    }
+
+    pub trait Delay: Clone {
+        type Instant: Instant;
+
+        async fn delay_ms(&mut self, ms: u32);
+
+        async fn delay_until(&mut self, instant: Self::Instant);
+
+        fn now(&self) -> Self::Instant;
+    }
+}
 
 pub(crate) mod buffer;
 pub mod cipher_suites;
@@ -33,6 +53,8 @@ pub mod server;
 #[derive_format_or_debug]
 #[derive(Copy, Clone)]
 pub enum Error<RxE: RxEndpoint, TxE: TxEndpoint> {
+    // TODO: HeartbeatFailure(HeartbeatFailureEnum)?
+    Placeholder,
     /// The backing buffer ran out of space.
     InsufficientSpace,
     /// Failed to parse a message.

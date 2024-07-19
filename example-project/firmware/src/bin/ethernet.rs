@@ -96,11 +96,13 @@ pub async fn run_comms(
 
                 let mut rx_buf = [0; 1536];
                 let mut tx_buf = [0; 1536];
+                let mut hb_buf = [0; 64];
 
                 if let Err(e) = client_connection
                     .run(
                         &mut rx_buf,
                         &mut tx_buf,
+                        &mut hb_buf,
                         &mut rx_sender,
                         &mut tx_receiver,
                         CloneableSystick,
@@ -145,15 +147,61 @@ pub async fn handle_stack(cx: app::handle_stack::Context<'_>) -> ! {
 
 pub mod edtls {
     use embassy_net::{udp::UdpSocket, IpEndpoint};
-    use embedded_dtls::DelayNs;
-    use rtic_monotonics::systick::Systick;
+    use embedded_dtls::{Delay, Instant as EdtlsInstant};
+    use rtic_monotonics::{
+        systick::{fugit, Systick},
+        Monotonic,
+    };
+
+    type Instant = fugit::Instant<u64, 1, 1000>;
+    pub struct InstantWrapper(Instant);
+
+    impl From<Instant> for InstantWrapper {
+        fn from(value: Instant) -> Self {
+            Self(value)
+        }
+    }
+
+    impl From<InstantWrapper> for Instant {
+        fn from(value: InstantWrapper) -> Self {
+            value.0
+        }
+    }
+
+    impl EdtlsInstant for InstantWrapper {
+        // Overflow with `u64` will happen in 584 million years
+        fn add_s(&self, s: u32) -> Self {
+            Self(self.0 + <Systick as Monotonic>::Duration::secs(s as u64))
+        }
+
+        fn sub_as_ms(&self, rhs: &Self) -> u32 {
+            match self.0.checked_duration_since(rhs.0) {
+                // TODO: `as` cast is probably incorrect here,
+                // IDC for now.
+                Some(diff) => diff.to_millis() as u32,
+                None => {
+                    defmt::error!("rhs > self when diffing instants");
+                    0
+                }
+            }
+        }
+    }
 
     #[derive(Clone)]
     pub struct CloneableSystick;
 
-    impl DelayNs for CloneableSystick {
-        async fn delay_ns(&mut self, ns: u32) {
-            Systick.delay_ns(ns).await
+    impl Delay for CloneableSystick {
+        type Instant = InstantWrapper;
+        async fn delay_ms(&mut self, ms: u32) {
+            Systick::delay(<Systick as Monotonic>::Duration::millis(ms as u64)).await
+        }
+
+        async fn delay_until(&mut self, instant: Self::Instant) {
+            Systick::delay_until(instant.into()).await
+        }
+
+        fn now(&self) -> Self::Instant {
+            Systick::now().into()
         }
     }
 
