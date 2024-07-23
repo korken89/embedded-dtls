@@ -26,7 +26,6 @@ typenum = { version = "1.17.0", default-features = false, features = ["no_std"] 
 hkdf = { version = "0.12.4", default-features = false }
 heapless = { version = "0.8.0" }
 embassy-futures = "0.1.1"
-embassy-sync = "0.6.0"
 tokio = { version = "1", features = ["sync"], optional = true }
 bbqueue = { version = "0.5.1", optional = true }
 rtic-common = { version = "1.0.0", optional = true }
@@ -41,8 +40,8 @@ defmt = { version = "0.3", optional = true }
 default = []
 tokio-queue = ["dep:tokio"] # Enables the tokio based framed queue (for `std`)
 bb-queue = ["dep:bbqueue", "dep:rtic-common"] # Enables the BBQueue based framed queue (for `no_std`)
-defmt = ["dep:defmt", "defmt-or-log/defmt", "heapless/defmt-03", "embassy-sync/defmt", "embedded-hal-async/defmt-03"]
-log = ["dep:log", "defmt-or-log/log", "embassy-sync/log"]
+defmt = ["dep:defmt", "defmt-or-log/defmt", "heapless/defmt-03", "embedded-hal-async/defmt-03"]
+log = ["dep:log", "defmt-or-log/log"]
 
 # UNSAFE: This will print encryption keys, pre-shared keys and nonces in plaintext for debuging
 # purposes for built-in ciphers. NEVER have this feature enabled in production.
