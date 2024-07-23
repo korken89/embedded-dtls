@@ -1,4 +1,8 @@
-use core::{cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, task::Waker};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, Ordering},
+    task::Waker,
+};
 
 /// Utility struct used to register and wake a waker across the select branches
 pub struct AtomicWaker {
@@ -25,7 +29,7 @@ impl AtomicWaker {
         {
             // Safety:
             // 1. self.waker access is protected by self.locked against multiple exclusive borrows
-            let maybe_waker = unsafe { &mut self.waker.get().read() };
+            let maybe_waker = unsafe { &mut *self.waker.get() };
             f(maybe_waker);
             // FIXME: Memory ordering?
             self.locked.store(false, Ordering::Release);
