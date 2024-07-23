@@ -414,6 +414,10 @@ where
     Delay: crate::Delay,
 {
     'outer: loop {
+        // TODO: This logic has to be moved out into the separate worker
+        // I think that all code that tries to access `key_schedule`
+        // (that is encrypt the message), should block and wait until the
+        // "key_schedule_update_worker" provides fresh keys.
         if shared_state.key_schedule.lock().await.write_record_number()
             > MAX_PACKETS_BEFORE_KEY_UPDATE
         {
