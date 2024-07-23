@@ -89,7 +89,11 @@ where
             key_schedule: Mutex::new(self.key_schedule),
         };
         let rx_endpoint = self.rx_endpoint;
-        let tx_endpoint = self.tx_endpoint;
+        let record_transmitter = Mutex::new(RecordTransmitter::new(
+            tx_buffer,
+            self.tx_endpoint,
+            shared_state,
+        ));
         let hb = Heartbeat::new(hb_buffer, delay.clone());
 
         match select3(
@@ -101,9 +105,8 @@ where
                 &hb,
             ),
             tx_worker::<RxE, TxE, Sender, Receiver, Delay>(
-                tx_endpoint,
+                &record_transmitter,
                 tx_receiver,
-                tx_buffer,
                 shared_state,
                 delay.clone(),
                 &hb,
@@ -379,9 +382,8 @@ const MAX_PACKETS_BEFORE_KEY_UPDATE: u64 = 100;
 // TODO: How to indicate that TX should do something special for handling internal work?
 //       such as heartbeat request/response or send ACK ASAP?
 async fn tx_worker<'a, RxE, TxE, Sender, Receiver, Delay>(
-    mut tx_endpoint: TxE,
+    record_transmitter: &Mutex<RecordTransmitter<'a, TxE, impl GenericKeySchedule>>,
     tx_receiver: &mut Receiver,
-    tx_buffer: &mut [u8],
     shared_state: &SharedState<impl GenericKeySchedule>,
     mut delay: Delay,
     hb: &heartbeat::Heartbeat<'a, Delay>,
@@ -394,8 +396,6 @@ where
     Delay: crate::Delay,
 {
     'outer: loop {
-        let buf = &mut EncodingBuffer::new(tx_buffer);
-
         if shared_state.key_schedule.lock().await.write_record_number()
             > MAX_PACKETS_BEFORE_KEY_UPDATE
         {
@@ -418,23 +418,19 @@ where
                     let (buffer, state) = &mut *guard;
                     match *state {
                         heartbeat::ForeignHeartbeatState::In => {
-                            Record::encode_heartbeat(
-                                buf,
-                                shared_state.key_schedule.lock().await.deref_mut(),
-                                &buffer[..response_payload_len],
-                                HeartbeatMessageType::Response,
-                            )
-                            .await
-                            .map_err(|_| {
-                                // TODO: Should only happen if tx_buffer is smaller than rx_buffer and hb_buffer?
-                                error!("Heartbeat response does not fit in the encoding buffer! Terminating connection.");
-                                ConnectionError::DtlsError(Error::InsufficientSpace)
-                            })?;
+                            let mut rt = record_transmitter.lock().await;
+                            rt.enqueue_heartbeat(
+                                 HeartbeatMessageType::Response,
+                                 &buffer[..response_payload_len],
+                            ).await
+                             .inspect_err(|e| {
+                                 // TODO: Should only happen if tx_buffer is smaller than rx_buffer and hb_buffer?
+                                 error!("Heartbeat response enqueuing failed ({:?})! Terminating connection.", e);
+                             })?;
                             trace!("Sending heartbeat response");
-                            tx_endpoint
-                                .send(buf)
-                                .await
-                                .map_err(|e| ConnectionError::DtlsError(Error::Send(e)))?;
+                            rt.flush().await.inspect_err(|e| {
+                                 error!("Heartbeat response sending failed ({:?})! Terminating connection.", e);
+                            })?;
                             *state = heartbeat::ForeignHeartbeatState::Empty;
                         }
                         state => {
@@ -458,22 +454,22 @@ where
                     let (buffer, state) = &mut *guard;
                     match *state {
                         heartbeat::DomesticHeartbeatState::Out => {
-                            Record::encode_heartbeat(
-                                buf,
-                                shared_state.key_schedule.lock().await.deref_mut(),
-                                &buffer[..request_payload_len],
+                            let mut rt = record_transmitter.lock().await;
+                            rt.enqueue_heartbeat(
                                 HeartbeatMessageType::Request,
+                                &buffer[..request_payload_len],
                             )
                             .await
-                            .map_err(|_| {
-                                error!("Heartbeat request does not fit in the encoding buffer! Terminating connection.");
-                                ConnectionError::DtlsError(Error::InsufficientSpace)
+                            .inspect_err(|e| {
+                                error!(
+                                    "Heartbeat request enqueuing failed ({:?})! Terminating connection.",
+                                    e
+                                );
                             })?;
                             trace!("Sending heartbeat request");
-                            tx_endpoint
-                                .send(buf)
-                                .await
-                                .map_err(|e| ConnectionError::DtlsError(Error::Send(e)))?;
+                            rt.flush().await.inspect_err(|e| {
+                                 error!("Heartbeat request sending failed ({:?})! Terminating connection.", e);
+                            })?;
                             *state = heartbeat::DomesticHeartbeatState::InFlight;
                             trace!("request_transmitted::send(_) WAIT");
                             hb.request_transmitted.send(delay.now()).await;
@@ -493,12 +489,11 @@ where
             };
 
             // Encode payload, this is on a fresh buffer and should not fail.
-            if let Err(e) = Record::encode_application_data(
-                buf,
-                shared_state.key_schedule.lock().await.deref_mut(),
-                payload.as_ref(),
-            )
-            .await
+            if let Err(e) = record_transmitter
+                .lock()
+                .await
+                .enqueue_application_data(payload.as_ref())
+                .await
             {
                 error!("Encoding of application data failed with error = {:?}", e);
                 continue 'outer;
@@ -519,31 +514,23 @@ where
                 Either::Second(p) => p.map_err(ConnectionError::ReceiveError)?,
             };
 
+            let mut rt = record_transmitter.lock().await;
+
             // No need to waste time encoding the payload if we know it won't fit.
-            if payload.as_ref().len() + MINIMUM_CIPHERTEXT_OVERHEAD > buf.space_left() {
+            if payload.as_ref().len() + MINIMUM_CIPHERTEXT_OVERHEAD > rt.space_left() {
                 debug!("Predicted TX buffer full");
                 break 'stuffer;
             }
 
             // Encode payload.
-            if Record::encode_application_data(
-                buf,
-                shared_state.key_schedule.lock().await.deref_mut(),
-                payload.as_ref(),
-            )
-            .await
-            .is_err()
-            {
+            if rt.enqueue_application_data(payload.as_ref()).await.is_err() {
                 debug!("TX buffer full, without predicting");
                 break 'stuffer;
             }
         }
 
         // Send the finished buffer.
-        tx_endpoint
-            .send(buf)
-            .await
-            .map_err(|e| ConnectionError::DtlsError(Error::Send(e)))?;
+        record_transmitter.lock().await.flush().await?;
     }
 }
 
@@ -634,6 +621,17 @@ pub enum RecordTransmitterError<TxE: TxEndpoint> {
     Send(TxE::SendError),
 }
 
+impl<RxE: RxEndpoint, TxE: TxEndpoint, S, R> From<RecordTransmitterError<TxE>>
+    for ConnectionError<Error<RxE, TxE>, S, R>
+{
+    fn from(value: RecordTransmitterError<TxE>) -> Self {
+        match value {
+            RecordTransmitterError::OutOfMemory => Self::DtlsError(Error::InsufficientSpace),
+            RecordTransmitterError::Send(e) => Self::DtlsError(Error::Send(e)),
+        }
+    }
+}
+
 impl<'a, TxE, KeySchedule> RecordTransmitter<'a, TxE, KeySchedule> {
     fn new(
         buffer: &'a mut [u8],
@@ -676,8 +674,13 @@ impl<'a, TxE: TxEndpoint, KeySchedule: GenericKeySchedule> RecordTransmitter<'a,
         .map_err(|_: crate::buffer::OutOfMemory| RecordTransmitterError::OutOfMemory)
     }
 
+    fn space_left(&self) -> usize {
+        self.encoding_buffer.space_left()
+    }
+
     async fn flush(&mut self) -> Result<(), RecordTransmitterError<TxE>> {
-        let r = self.tx_endpoint
+        let r = self
+            .tx_endpoint
             .send(&self.encoding_buffer)
             .await
             .map_err(|e| RecordTransmitterError::Send(e));
