@@ -56,10 +56,7 @@ where
 }
 
 /// State that is shared between the RX and TX worker.
-struct SharedState<KeySchedule>
-where
-    KeySchedule: GenericKeySchedule,
-{
+struct SharedState<KeySchedule> {
     key_schedule: Mutex<KeySchedule>,
 }
 
@@ -621,5 +618,70 @@ where
                 }
             }
         }
+    }
+}
+
+pub struct RecordTransmitter<'a, TxE, KeySchedule> {
+    encoding_buffer: EncodingBuffer<'a>,
+    tx_endpoint: TxE,
+    shared_state: &'a SharedState<KeySchedule>,
+}
+
+#[derive_format_or_debug]
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum RecordTransmitterError<TxE: TxEndpoint> {
+    OutOfMemory,
+    Send(TxE::SendError),
+}
+
+impl<'a, TxE, KeySchedule> RecordTransmitter<'a, TxE, KeySchedule> {
+    fn new(
+        buffer: &'a mut [u8],
+        tx_endpoint: TxE,
+        shared_state: &'a SharedState<KeySchedule>,
+    ) -> Self {
+        Self {
+            encoding_buffer: EncodingBuffer::new(buffer),
+            tx_endpoint,
+            shared_state,
+        }
+    }
+}
+impl<'a, TxE: TxEndpoint, KeySchedule: GenericKeySchedule> RecordTransmitter<'a, TxE, KeySchedule> {
+    async fn enqueue_heartbeat(
+        &mut self,
+        type_: HeartbeatMessageType,
+        payload: &[u8],
+    ) -> Result<(), RecordTransmitterError<TxE>> {
+        Record::encode_heartbeat(
+            &mut self.encoding_buffer,
+            self.shared_state.key_schedule.lock().await.deref_mut(),
+            payload,
+            type_,
+        )
+        .await
+        .map_err(|_: crate::buffer::OutOfMemory| RecordTransmitterError::OutOfMemory)
+    }
+
+    async fn enqueue_application_data(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<(), RecordTransmitterError<TxE>> {
+        Record::encode_application_data(
+            &mut self.encoding_buffer,
+            self.shared_state.key_schedule.lock().await.deref_mut(),
+            payload,
+        )
+        .await
+        .map_err(|_: crate::buffer::OutOfMemory| RecordTransmitterError::OutOfMemory)
+    }
+
+    async fn flush(&mut self) -> Result<(), RecordTransmitterError<TxE>> {
+        let r = self.tx_endpoint
+            .send(&self.encoding_buffer)
+            .await
+            .map_err(|e| RecordTransmitterError::Send(e));
+        self.encoding_buffer.reset();
+        r
     }
 }

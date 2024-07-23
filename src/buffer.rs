@@ -235,6 +235,11 @@ mod encoding_buffer {
             }
         }
 
+        /// Reset the state of the buffer
+        pub fn reset(&mut self) {
+            self.idx = 0;
+        }
+
         /// Current length of the buffer.
         pub fn len(&self) -> usize {
             self.idx
