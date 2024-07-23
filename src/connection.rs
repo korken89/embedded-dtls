@@ -219,22 +219,38 @@ mod heartbeat {
         /// Buffer for our heartbeats requests and their heartbeat responses.
         /// We generate the payload and thus we cap it at some small upper limit
         /// Only one heartbeat can be "in flight" so it can be shared
-        mutex: Mutex<([u8; 64], DomesticHeartbeatState)>,
+        inner: Mutex<DomesticHeartbeatInner>,
         delay: D,
+    }
+
+    /// Inner, protected part of the [`DomesticHeartbeat`]
+    struct DomesticHeartbeatInner {
+        /// Buffer dedicated to incoming data
+        buffer: [u8; 64],
+        state: DomesticHeartbeatState,
+    }
+
+    impl DomesticHeartbeatInner {
+        fn new() -> Self {
+            Self {
+                buffer: [0_u8; 64],
+                state: DomesticHeartbeatState::Empty,
+            }
+        }
     }
 
     impl<D: crate::Delay> DomesticHeartbeat<D> {
         pub(crate) fn new(delay: D) -> Self {
             Self {
                 response_arrived: Signal::new(),
-                mutex: Mutex::new(([0_u8; 64], DomesticHeartbeatState::Empty)),
+                inner: Mutex::new(DomesticHeartbeatInner::new()),
                 delay,
             }
         }
 
         pub async fn new_response_payload(&self, payload: &[u8]) -> Result<(), OutOfMemory> {
-            let mut guard = self.mutex.lock().await;
-            let (buffer, state) = &mut *guard;
+            let mut guard = self.inner.lock().await;
+            let DomesticHeartbeatInner { buffer, state } = &mut *guard;
             match *state {
                 DomesticHeartbeatState::InFlight => {
                     let payload_len = payload.len();
@@ -276,8 +292,8 @@ mod heartbeat {
                 // TODO: Replace with some RNG
                 let reference_payload = [0xAB_u8; REFERENCE_PAYLOAD_LEN];
                 {
-                    let mut guard = self.mutex.lock().await;
-                    let (_, state) = &mut *guard;
+                    let mut guard = self.inner.lock().await;
+                    let DomesticHeartbeatInner { state, .. } = &mut *guard;
                     match *state {
                         DomesticHeartbeatState::Empty => {
                             let mut rt = record_transmitter.lock().await;
@@ -303,8 +319,8 @@ mod heartbeat {
                 'retransmission: loop {
                     trace!("response_arrived::recv() WAIT (with timeout)");
                     let result = select(self.response_arrived.recv(), delay.delay_ms(1000)).await;
-                    let mut guard = self.mutex.lock().await;
-                    let (buffer, state) = &mut *guard;
+                    let mut guard = self.inner.lock().await;
+                    let DomesticHeartbeatInner { buffer, state } = &mut *guard;
                     match result {
                         Either::First((response_payload_len, _response_arrived_instant)) => {
                             match *state {
