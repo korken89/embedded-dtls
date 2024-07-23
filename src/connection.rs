@@ -4,7 +4,7 @@ use crate::{
     ApplicationDataReceiver, ApplicationDataSender, Error, RxEndpoint, TxEndpoint,
 };
 use core::{convert::Infallible, ops::DerefMut, pin::pin};
-use defmt_or_log::{debug, derive_format_or_debug, error, info, trace, warn};
+use defmt_or_log::{debug, derive_format_or_debug, error, trace};
 use embassy_futures::select::{select, select3, Either, Either3};
 use select_sharing::Mutex;
 
@@ -112,12 +112,8 @@ where
                 delay.clone(),
             ),
             select(
-                heartbeat_worker::<RxE, TxE, Sender, Receiver, Delay>(
-                    &record_transmitter,
-                    delay,
-                    &hb,
-                ),
-                fhb.tx_worker::<RxE, TxE, Sender, Receiver>(&record_transmitter),
+                hb.worker::<RxE, TxE, Sender, Receiver>(&record_transmitter),
+                fhb.worker::<RxE, TxE, Sender, Receiver>(&record_transmitter),
             ),
         )
         .await
@@ -132,143 +128,17 @@ where
     }
 }
 
-async fn heartbeat_worker<'a, RxE, TxE, Sender, Receiver, Delay>(
-    record_transmitter: &Mutex<RecordTransmitter<'a, TxE, impl GenericKeySchedule>>,
-    mut delay: Delay,
-    hb: &DomesticHeartbeat<Delay>,
-) -> Result<Infallible, ErrorHelper<RxE, TxE, Sender, Receiver>>
-where
-    RxE: RxEndpoint,
-    TxE: TxEndpoint,
-    Sender: ApplicationDataSender,
-    Receiver: ApplicationDataReceiver,
-    Delay: crate::Delay,
-{
-    let hb = &hb;
-    const REFERENCE_PAYLOAD_LEN: usize = 64;
-    loop {
-        // TODO: Replace with some RNG
-        let reference_payload = [0xAB_u8; REFERENCE_PAYLOAD_LEN];
-        {
-            let mut guard = hb.out_in.lock().await;
-            let (_, state) = &mut *guard;
-            match *state {
-                heartbeat::DomesticHeartbeatState::Empty => {
-                    let mut rt = record_transmitter.lock().await;
-                    rt.enqueue_heartbeat(HeartbeatMessageType::Request, &reference_payload)
-                        .await
-                        .inspect_err(|e| {
-                            error!(
-                            "Heartbeat request enqueuing failed ({:?})! Terminating connection.",
-                            e
-                        );
-                        })?;
-                    trace!("Sending heartbeat request");
-                    rt.flush().await.inspect_err(|e| {
-                        error!(
-                            "Heartbeat request sending failed ({:?})! Terminating connection.",
-                            e
-                        );
-                    })?;
-                    *state = heartbeat::DomesticHeartbeatState::InFlight;
-                }
-                state => {
-                    error!(
-                        "Trying to setup the heartbeat but state is invalid: {:?}",
-                        state
-                    );
-                    return Err(ErrorHelper::<RxE, TxE, Sender, Receiver>::DtlsError(
-                        Error::Placeholder,
-                    ));
-                }
-            }
-        }
-        let mut retransmission_counter = 0;
-        'retransmission: loop {
-            trace!("response_arrived::recv() WAIT (with timeout)");
-            let result = select(hb.response_arrived.recv(), delay.delay_ms(1000)).await;
-            let mut guard = hb.out_in.lock().await;
-            let (buffer, state) = &mut *guard;
-            match result {
-                Either::First((response_payload_len, _response_arrived_instant)) => match *state {
-                    heartbeat::DomesticHeartbeatState::In => {
-                        trace!("response_arrived::recv() DONE");
-                        let mut is_payload_validated = true;
-                        if response_payload_len != REFERENCE_PAYLOAD_LEN {
-                            warn!("Heartbeat response payload has unexpected length: {}, expected: {}.",response_payload_len,REFERENCE_PAYLOAD_LEN, );
-                            is_payload_validated = false;
-                        }
-                        if &buffer[..response_payload_len] != &reference_payload {
-                            warn!("Heartbeat response payload has unexpected payload.");
-                            is_payload_validated = false;
-                        }
-                        if is_payload_validated {
-                            *state = heartbeat::DomesticHeartbeatState::Empty;
-                            // let latency = response_arrived_instant.sub_as_ms(&request_sent_instant);
-                            info!("Heartbeat request - response loop succeeded",);
-                            delay.delay_ms(1000).await;
-                            break 'retransmission;
-                        }
-                    }
-                    state => {
-                        trace!("response_arrived::recv() DONE");
-                        error!("Heartbeat response arrival is being signalled but state is invalid: {:?}.", state);
-                        return Err(ErrorHelper::<RxE, TxE, Sender, Receiver>::DtlsError(
-                            Error::Placeholder,
-                        ));
-                    }
-                },
-                // Timeout
-                Either::Second(_) => {
-                    trace!("response_arrived::recv() TIMED OUT");
-                    const R_CNT_MAX: u8 = 3;
-                    if retransmission_counter >= R_CNT_MAX {
-                        error!(
-                            "Retransmission counter reached {} attempts. Terminating connection.",
-                            R_CNT_MAX
-                        );
-                        return Err(ErrorHelper::<RxE, TxE, Sender, Receiver>::DtlsError(
-                            Error::Placeholder,
-                        ));
-                    } else {
-                        warn!(
-                            "Heartbeat response timed out ({}/{} retransmissions)",
-                            retransmission_counter, R_CNT_MAX
-                        );
-                    }
-                }
-            }
-            let mut rt = record_transmitter.lock().await;
-            rt.enqueue_heartbeat(HeartbeatMessageType::Request, &reference_payload)
-                .await
-                .inspect_err(|e| {
-                    error!(
-                        "Heartbeat request enqueuing failed ({:?})! Terminating connection.",
-                        e
-                    );
-                })?;
-            trace!("Sending heartbeat request");
-            rt.flush().await.inspect_err(|e| {
-                error!(
-                    "Heartbeat request sending failed ({:?})! Terminating connection.",
-                    e
-                );
-            })?;
-            *state = heartbeat::DomesticHeartbeatState::InFlight;
-            retransmission_counter += 1;
-        }
-    }
-}
-
 mod heartbeat {
     use core::convert::Infallible;
 
-    use defmt_or_log::{derive_format_or_debug, trace, warn};
+    use defmt_or_log::info;
+    use defmt_or_log::{derive_format_or_debug, error, trace, warn};
+    use embassy_futures::select::{select, Either};
 
     use crate::{
         buffer::OutOfMemory,
         record::{GenericKeySchedule, HeartbeatMessageType},
-        ApplicationDataReceiver, ApplicationDataSender, RxEndpoint, TxEndpoint,
+        ApplicationDataReceiver, ApplicationDataSender, Error, RxEndpoint, TxEndpoint,
     };
 
     use super::{
@@ -305,7 +175,7 @@ mod heartbeat {
             Ok(())
         }
 
-        pub async fn tx_worker<'b, RxE, TxE, Sender, Receiver>(
+        pub async fn worker<'b, RxE, TxE, Sender, Receiver>(
             &self,
             rt: &Mutex<RecordTransmitter<'b, TxE, impl GenericKeySchedule>>,
         ) -> Result<Infallible, ErrorHelper<RxE, TxE, Sender, Receiver>>
@@ -345,11 +215,11 @@ mod heartbeat {
     pub struct DomesticHeartbeat<D: crate::Delay> {
         // TODO: Add the configuration from the handshake
         /// Signal for heartbeat worker, response to our request arrived
-        pub response_arrived: Signal<(usize, D::Instant)>,
+        response_arrived: Signal<(usize, D::Instant)>,
         /// Buffer for our heartbeats requests and their heartbeat responses.
         /// We generate the payload and thus we cap it at some small upper limit
         /// Only one heartbeat can be "in flight" so it can be shared
-        pub out_in: Mutex<([u8; 64], DomesticHeartbeatState)>,
+        mutex: Mutex<([u8; 64], DomesticHeartbeatState)>,
         delay: D,
     }
 
@@ -357,13 +227,13 @@ mod heartbeat {
         pub(crate) fn new(delay: D) -> Self {
             Self {
                 response_arrived: Signal::new(),
-                out_in: Mutex::new(([0_u8; 64], DomesticHeartbeatState::Empty)),
+                mutex: Mutex::new(([0_u8; 64], DomesticHeartbeatState::Empty)),
                 delay,
             }
         }
 
         pub async fn new_response_payload(&self, payload: &[u8]) -> Result<(), OutOfMemory> {
-            let mut guard = self.out_in.lock().await;
+            let mut guard = self.mutex.lock().await;
             let (buffer, state) = &mut *guard;
             match *state {
                 DomesticHeartbeatState::InFlight => {
@@ -388,6 +258,114 @@ mod heartbeat {
                 }
             }
             Ok(())
+        }
+
+        pub async fn worker<'a, RxE, TxE, Sender, Receiver>(
+            &self,
+            record_transmitter: &Mutex<RecordTransmitter<'a, TxE, impl GenericKeySchedule>>,
+        ) -> Result<Infallible, ErrorHelper<RxE, TxE, Sender, Receiver>>
+        where
+            RxE: RxEndpoint,
+            TxE: TxEndpoint,
+            Sender: ApplicationDataSender,
+            Receiver: ApplicationDataReceiver,
+        {
+            let mut delay = self.delay.clone();
+            const REFERENCE_PAYLOAD_LEN: usize = 64;
+            loop {
+                // TODO: Replace with some RNG
+                let reference_payload = [0xAB_u8; REFERENCE_PAYLOAD_LEN];
+                {
+                    let mut guard = self.mutex.lock().await;
+                    let (_, state) = &mut *guard;
+                    match *state {
+                        DomesticHeartbeatState::Empty => {
+                            let mut rt = record_transmitter.lock().await;
+                            trace!("Enqueuing a heartbeat request");
+                            rt.enqueue_heartbeat(HeartbeatMessageType::Request, &reference_payload)
+                                .await?;
+                            trace!("Sending a heartbeat request");
+                            rt.flush().await?;
+                            *state = DomesticHeartbeatState::InFlight;
+                        }
+                        state => {
+                            error!(
+                                "Trying to setup the heartbeat but state is invalid: {:?}",
+                                state
+                            );
+                            return Err(ErrorHelper::<RxE, TxE, Sender, Receiver>::DtlsError(
+                                Error::Placeholder,
+                            ));
+                        }
+                    }
+                }
+                let mut retransmission_counter = 0;
+                'retransmission: loop {
+                    trace!("response_arrived::recv() WAIT (with timeout)");
+                    let result = select(self.response_arrived.recv(), delay.delay_ms(1000)).await;
+                    let mut guard = self.mutex.lock().await;
+                    let (buffer, state) = &mut *guard;
+                    match result {
+                        Either::First((response_payload_len, _response_arrived_instant)) => {
+                            match *state {
+                                DomesticHeartbeatState::In => {
+                                    trace!("response_arrived::recv() DONE");
+                                    let mut is_payload_validated = true;
+                                    if response_payload_len != REFERENCE_PAYLOAD_LEN {
+                                        warn!("Heartbeat response payload has unexpected length: {}, expected: {}.",response_payload_len,REFERENCE_PAYLOAD_LEN, );
+                                        is_payload_validated = false;
+                                    }
+                                    if &buffer[..response_payload_len] != &reference_payload {
+                                        warn!("Heartbeat response payload has unexpected payload.");
+                                        is_payload_validated = false;
+                                    }
+                                    if is_payload_validated {
+                                        *state = DomesticHeartbeatState::Empty;
+                                        // let latency = response_arrived_instant.sub_as_ms(&request_sent_instant);
+                                        info!("Heartbeat request - response loop succeeded",);
+                                        delay.delay_ms(1000).await;
+                                        break 'retransmission;
+                                    }
+                                }
+                                state => {
+                                    trace!("response_arrived::recv() DONE");
+                                    error!("Heartbeat response arrival is being signalled but state is invalid: {:?}.", state);
+                                    return Err(
+                                        ErrorHelper::<RxE, TxE, Sender, Receiver>::DtlsError(
+                                            Error::Placeholder,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        // Timeout
+                        Either::Second(_) => {
+                            trace!("response_arrived::recv() TIMED OUT");
+                            const R_CNT_MAX: u8 = 3;
+                            if retransmission_counter >= R_CNT_MAX {
+                                error!(
+                            "Retransmission counter reached {} attempts. Terminating connection.",
+                            R_CNT_MAX
+                        );
+                                return Err(ErrorHelper::<RxE, TxE, Sender, Receiver>::DtlsError(
+                                    Error::Placeholder,
+                                ));
+                            } else {
+                                warn!(
+                                    "Heartbeat response timed out ({}/{} retransmissions)",
+                                    retransmission_counter, R_CNT_MAX
+                                );
+                            }
+                        }
+                    }
+                    let mut rt = record_transmitter.lock().await;
+                    rt.enqueue_heartbeat(HeartbeatMessageType::Request, &reference_payload)
+                        .await?;
+                    rt.flush().await?;
+                    *state = DomesticHeartbeatState::InFlight;
+                    retransmission_counter += 1;
+                }
+            }
         }
     }
 }
