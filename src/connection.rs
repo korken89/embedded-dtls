@@ -249,7 +249,9 @@ mod heartbeat {
         }
 
         pub async fn new_response_payload(&self, payload: &[u8]) -> Result<(), OutOfMemory> {
+            trace!("self.inner.lock() WAIT");
             let mut guard = self.inner.lock().await;
+            trace!("self.inner.lock() DONE");
             let DomesticHeartbeatInner { buffer, state } = &mut *guard;
             match *state {
                 DomesticHeartbeatState::InFlight => {
