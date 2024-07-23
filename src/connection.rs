@@ -138,7 +138,7 @@ mod heartbeat {
     use crate::{
         buffer::OutOfMemory,
         record::{GenericKeySchedule, HeartbeatMessageType},
-        ApplicationDataReceiver, ApplicationDataSender, Error, RxEndpoint, TxEndpoint,
+        ApplicationDataReceiver, ApplicationDataSender, Error, Instant, RxEndpoint, TxEndpoint,
     };
 
     use super::{
@@ -291,6 +291,7 @@ mod heartbeat {
             loop {
                 // TODO: Replace with some RNG
                 let reference_payload = [0xAB_u8; REFERENCE_PAYLOAD_LEN];
+                let mut request_sent_instant;
                 {
                     let mut guard = self.inner.lock().await;
                     let DomesticHeartbeatInner { state, .. } = &mut *guard;
@@ -302,6 +303,7 @@ mod heartbeat {
                                 .await?;
                             trace!("Sending a heartbeat request");
                             rt.flush().await?;
+                            request_sent_instant = delay.now();
                             *state = DomesticHeartbeatState::InFlight;
                         }
                         state => {
@@ -322,7 +324,7 @@ mod heartbeat {
                     let mut guard = self.inner.lock().await;
                     let DomesticHeartbeatInner { buffer, state } = &mut *guard;
                     match result {
-                        Either::First((response_payload_len, _response_arrived_instant)) => {
+                        Either::First((response_payload_len, response_arrived_instant)) => {
                             match *state {
                                 DomesticHeartbeatState::In => {
                                     trace!("response_arrived::recv() DONE");
@@ -337,8 +339,9 @@ mod heartbeat {
                                     }
                                     if is_payload_validated {
                                         *state = DomesticHeartbeatState::Empty;
-                                        // let latency = response_arrived_instant.sub_as_ms(&request_sent_instant);
-                                        info!("Heartbeat request - response loop succeeded",);
+                                        let latency = response_arrived_instant
+                                            .sub_as_ms(&request_sent_instant);
+                                        info!("Heartbeat request - response loop succeeded. Latency: {} ms", latency);
                                         delay.delay_ms(1000).await;
                                         break 'retransmission;
                                     }
@@ -378,6 +381,7 @@ mod heartbeat {
                     rt.enqueue_heartbeat(HeartbeatMessageType::Request, &reference_payload)
                         .await?;
                     rt.flush().await?;
+                    request_sent_instant = delay.now();
                     *state = DomesticHeartbeatState::InFlight;
                     retransmission_counter += 1;
                 }
