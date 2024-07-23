@@ -52,6 +52,26 @@ impl<T> Mutex<T> {
         })
         .await
     }
+
+    /// Try to lock the shared resource.
+    pub async fn try_lock(&self) -> Option<MutexGuard<T>> {
+        poll_fn(|cx| {
+            // Try lock.
+            if self
+                .locked
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                Poll::Ready(Some(MutexGuard {
+                    parent: self,
+                    to_wake: cx.waker().clone(),
+                }))
+            } else {
+                Poll::Ready(None)
+            }
+        })
+        .await
+    }
 }
 
 /// This type signifies exclusive access to the object protected by `Mutex`.
