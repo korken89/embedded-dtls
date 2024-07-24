@@ -20,7 +20,7 @@ use handshake::{ClientHelloError, ServerHelloError};
 pub use delay::Delay;
 pub use delay::Instant;
 mod delay {
-    pub trait Instant {
+    pub trait Instant: Copy {
         /// Add `s` amount of seconds to an instant
         fn add_s(&self, s: u32) -> Self;
         /// Calculate a duration between two instants in milliseconds

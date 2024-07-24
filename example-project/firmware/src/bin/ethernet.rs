@@ -154,6 +154,8 @@ pub mod edtls {
     };
 
     type Instant = fugit::Instant<u64, 1, 1000>;
+
+    #[derive(Copy, Clone)]
     pub struct InstantWrapper(Instant);
 
     impl From<Instant> for InstantWrapper {

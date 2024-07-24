@@ -4,6 +4,7 @@ use embedded_dtls;
 use tokio::sync::mpsc::Receiver;
 
 type Instant = tokio::time::Instant;
+#[derive(Copy, Clone)]
 pub struct InstantWrapper(Instant);
 
 impl From<Instant> for InstantWrapper {
