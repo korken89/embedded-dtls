@@ -105,7 +105,7 @@ where
                 &fhb,
                 &hb,
             ),
-            tx_worker::<RxE, TxE, Sender, Receiver, Delay>(
+            application_data_tx_worker::<RxE, TxE, Sender, Receiver, Delay>(
                 &record_transmitter,
                 tx_receiver,
                 shared_state,
@@ -132,7 +132,7 @@ mod heartbeat {
     use core::convert::Infallible;
 
     use defmt_or_log::info;
-    use defmt_or_log::{derive_format_or_debug, error, trace, warn};
+    use defmt_or_log::{error, trace, warn};
     use embassy_futures::select::{select, Either};
 
     use crate::{
@@ -163,7 +163,9 @@ mod heartbeat {
 
         pub async fn new_request_payload(&self, payload: &[u8]) -> Result<(), OutOfMemory> {
             let Some(mut buffer) = self.buffer.try_lock().await else {
-                warn!("Previous request is still being processed, other party is too fast? Dropping.");
+                warn!(
+                    "Previous request is still being processed, other party is too fast? Dropping."
+                );
                 return Ok(());
             };
             let payload_len = payload.len();
@@ -342,7 +344,7 @@ const MAX_PACKETS_BEFORE_KEY_UPDATE: u64 = 100;
 
 // TODO: How to indicate that TX should do something special for handling internal work?
 //       such as heartbeat request/response or send ACK ASAP?
-async fn tx_worker<'a, RxE, TxE, Sender, Receiver, Delay>(
+async fn application_data_tx_worker<'a, RxE, TxE, Sender, Receiver, Delay>(
     record_transmitter: &Mutex<RecordTransmitter<'a, TxE, impl GenericKeySchedule>>,
     tx_receiver: &mut Receiver,
     shared_state: &SharedState<impl GenericKeySchedule>,
