@@ -344,7 +344,6 @@ mod heartbeat {
                                         let latency = response_arrived_instant
                                             .sub_as_ms(&request_sent_instant);
                                         info!("Heartbeat request - response loop succeeded. Latency: {} ms", latency);
-                                        delay.delay_ms(1000).await;
                                         break 'retransmission;
                                     }
                                 }
@@ -387,6 +386,7 @@ mod heartbeat {
                     *state = DomesticHeartbeatState::InFlight;
                     retransmission_counter += 1;
                 }
+                delay.delay_ms(1000).await;
             }
         }
     }
