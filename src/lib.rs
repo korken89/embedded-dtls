@@ -54,7 +54,7 @@ pub mod server;
 #[derive(Copy, Clone)]
 pub enum Error<RxE: RxEndpoint, TxE: TxEndpoint> {
     // TODO: HeartbeatFailure(HeartbeatFailureEnum)?
-    Placeholder,
+    TooManyRetransmissions,
     /// The backing buffer ran out of space.
     InsufficientSpace,
     /// Failed to parse a message.
