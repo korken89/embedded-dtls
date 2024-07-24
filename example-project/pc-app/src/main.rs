@@ -18,7 +18,7 @@ pub mod ingress;
 // This is the app using the library
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    pretty_env_logger::init();
+    pretty_env_logger::init_timed();
 
     info!("Starting ingress");
     tokio::spawn(ingress::run_ingress());
