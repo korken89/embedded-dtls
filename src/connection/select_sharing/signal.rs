@@ -30,14 +30,15 @@ impl<T> Signal<T> {
         }
     }
 
-    // TODO: Should all `send`s be `try_send` that should be successful.
-    // Otherwise it means that a state machine is buggy
     /// Try to send a value via the signal.
-    pub fn try_send(&self, value: T) {
+    pub fn try_send(&self, value: T) -> bool {
         if !self.available.load(Ordering::Acquire) {
             unsafe { (self.inner.get() as *mut T).write(value) };
             self.available.store(true, Ordering::Release);
             self.recv_waker.wake();
+            true
+        } else {
+            false
         }
     }
 
