@@ -69,12 +69,14 @@ async fn test_sleep_api(ip: IpAddr) {
 
 /// Helper for sleep requests.
 async fn sleep_request(ip: IpAddr, sleep: Duration) -> Result<(), ()> {
+    let now = Instant::now();
     match ingress::api::sleep(ip, sleep).await {
         Ok(done) => {
-            let dur = Duration::from_micros(
+            let elapsed = now.elapsed();
+            let sleep_time = Duration::from_micros(
                 done.slept_for.seconds as u64 * 1000000 + done.slept_for.micros as u64,
             );
-            info!("{ip}: Sleep done! {dur:?}");
+            info!("{ip}: Sleep done! {sleep_time:?}. Round trip took {elapsed:?}");
             Ok(())
         }
         Err(e) => {
