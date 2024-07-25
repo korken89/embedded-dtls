@@ -148,39 +148,24 @@ pub async fn handle_stack(cx: app::handle_stack::Context<'_>) -> ! {
 pub mod edtls {
     use embassy_net::{udp::UdpSocket, IpEndpoint};
     use embedded_dtls::{Delay, Instant as EdtlsInstant};
-    use rtic_monotonics::{
-        systick::{fugit, Systick},
-        Monotonic,
-    };
+    use rtic_monotonics::{systick::Systick, Monotonic};
 
-    type Instant = fugit::Instant<u64, 1, 1000>;
+    type SystickInstant = <Systick as Monotonic>::Instant;
+    type SystickDuration = <Systick as Monotonic>::Duration;
 
     #[derive(Copy, Clone)]
-    pub struct InstantWrapper(Instant);
-
-    impl From<Instant> for InstantWrapper {
-        fn from(value: Instant) -> Self {
-            Self(value)
-        }
-    }
-
-    impl From<InstantWrapper> for Instant {
-        fn from(value: InstantWrapper) -> Self {
-            value.0
-        }
-    }
+    pub struct InstantWrapper(SystickInstant);
 
     impl EdtlsInstant for InstantWrapper {
-        // Overflow with `u64` will happen in 584 million years
         fn add_s(&self, s: u32) -> Self {
-            Self(self.0 + <Systick as Monotonic>::Duration::secs(s as u64))
+            Self(self.0 + SystickDuration::secs(s as _))
         }
 
-        fn sub_as_ms(&self, rhs: &Self) -> u32 {
+        fn sub_as_us(&self, rhs: &Self) -> u32 {
             match self.0.checked_duration_since(rhs.0) {
-                // TODO: `as` cast is probably incorrect here,
-                // IDC for now.
-                Some(diff) => diff.to_millis() as u32,
+                Some(diff) => {
+                    diff.to_micros() as _
+                }
                 None => {
                     defmt::error!("rhs > self when diffing instants");
                     0
@@ -194,16 +179,17 @@ pub mod edtls {
 
     impl Delay for CloneableSystick {
         type Instant = InstantWrapper;
+
         async fn delay_ms(&mut self, ms: u32) {
-            Systick::delay(<Systick as Monotonic>::Duration::millis(ms as u64)).await
+            Systick::delay(SystickDuration::millis(ms as u64)).await
         }
 
         async fn delay_until(&mut self, instant: Self::Instant) {
-            Systick::delay_until(instant.into()).await
+            Systick::delay_until(instant.0).await
         }
 
         fn now(&self) -> Self::Instant {
-            Systick::now().into()
+            InstantWrapper(Systick::now())
         }
     }
 

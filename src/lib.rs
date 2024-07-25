@@ -19,29 +19,13 @@ use handshake::{ClientHelloError, ServerHelloError};
 
 pub use delay::Delay;
 pub use delay::Instant;
-mod delay {
-    pub trait Instant: Copy {
-        /// Add `s` amount of seconds to an instant
-        fn add_s(&self, s: u32) -> Self;
-        /// Calculate a duration between two instants in milliseconds
-        fn sub_as_ms(&self, rhs: &Self) -> u32;
-    }
-
-    pub trait Delay: Clone {
-        type Instant: Instant;
-
-        async fn delay_ms(&mut self, ms: u32);
-
-        async fn delay_until(&mut self, instant: Self::Instant);
-
-        fn now(&self) -> Self::Instant;
-    }
-}
+pub use delay::PrettyDuration;
 
 pub(crate) mod buffer;
 pub mod cipher_suites;
 pub mod client;
 pub mod connection;
+mod delay;
 pub(crate) mod handshake;
 pub(crate) mod integers;
 pub(crate) mod key_schedule;
@@ -143,7 +127,6 @@ mod test {
         server::open_server,
     };
     use defmt_or_log::{error, trace, warn};
-    use embedded_hal_async::delay::DelayNs;
     use queue_helpers::framed_queue;
     use rand::{rngs::StdRng, SeedableRng};
     use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -174,12 +157,33 @@ mod test {
 
     impl rand::CryptoRng for FakeRandom {}
 
+    // In pratice, a wrapper type is necessary due to orphan rule.
+    impl crate::Instant for tokio::time::Instant {
+        fn add_s(&self, s: u32) -> Self {
+            self.checked_add(Duration::from_secs(s as _)).unwrap()
+        }
+
+        fn sub_as_us(&self, rhs: &Self) -> u32 {
+            (*self - *rhs).as_micros() as u32
+        }
+    }
+
     #[derive(Clone)]
     struct Delay;
 
-    impl DelayNs for Delay {
-        async fn delay_ns(&mut self, ns: u32) {
-            tokio::time::sleep(Duration::from_nanos(ns as _)).await;
+    impl crate::Delay for Delay {
+        type Instant = tokio::time::Instant;
+
+        async fn delay_ms(&mut self, ms: u32) {
+            tokio::time::sleep(Duration::from_millis(ms as _)).await;
+        }
+
+        async fn delay_until(&mut self, instant: Self::Instant) {
+            tokio::time::sleep_until(instant).await
+        }
+
+        fn now(&self) -> Self::Instant {
+            tokio::time::Instant::now().into()
         }
     }
 
@@ -294,9 +298,17 @@ mod test {
         tokio::spawn(async move {
             let rx_buf = &mut vec![0; 1536];
             let tx_buf = &mut vec![0; 1536];
+            let hb_buf = &mut [0; 64];
 
             if let Err(e) = client_connection
-                .run(rx_buf, tx_buf, &mut rx_sender, &mut tx_receiver, Delay {})
+                .run(
+                    rx_buf,
+                    tx_buf,
+                    hb_buf,
+                    &mut rx_sender,
+                    &mut tx_receiver,
+                    Delay {},
+                )
                 .await
             {
                 error!("Client connection closed with {:?}", e);
@@ -354,9 +366,17 @@ mod test {
         tokio::spawn(async move {
             let rx_buf = &mut vec![0; 1536];
             let tx_buf = &mut vec![0; 1536];
+            let hb_buf = &mut [0; 64];
 
             if let Err(e) = server_connection
-                .run(rx_buf, tx_buf, &mut rx_sender, &mut tx_receiver, Delay {})
+                .run(
+                    rx_buf,
+                    tx_buf,
+                    hb_buf,
+                    &mut rx_sender,
+                    &mut tx_receiver,
+                    Delay {},
+                )
                 .await
             {
                 error!("Server connection closed with {:?}", e);

@@ -22,11 +22,11 @@ impl From<InstantWrapper> for Instant {
 // TODO: Overflows? IDC for now
 impl embedded_dtls::Instant for InstantWrapper {
     fn add_s(&self, s: u32) -> Self {
-        Self(self.0 + Duration::from_secs(s as _))
+        Self(self.0.checked_add(Duration::from_secs(s as _)).unwrap())
     }
 
-    fn sub_as_ms(&self, rhs: &Self) -> u32 {
-        (self.0 - rhs.0).as_secs() as _
+    fn sub_as_us(&self, rhs: &Self) -> u32 {
+        (self.0 - rhs.0).as_micros() as u32
     }
 }
 

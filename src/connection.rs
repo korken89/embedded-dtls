@@ -130,11 +130,11 @@ where
 
 mod heartbeat {
     use core::convert::Infallible;
-
     use defmt_or_log::info;
     use defmt_or_log::{error, trace, warn};
     use embassy_futures::select::{select, Either};
 
+    use crate::PrettyDuration;
     use crate::{
         buffer::OutOfMemory,
         record::{GenericKeySchedule, HeartbeatMessageType},
@@ -206,7 +206,7 @@ mod heartbeat {
         // TODO: Add the configuration from the handshake
         /// Signal indicating that a response arrived
         response_arrived: Signal<(usize, D::Instant)>,
-        // Buffer for responses hidden behind a mutex
+        /// Buffer for response payload hidden behind a mutex
         buffer: Mutex<[u8; 64]>,
         delay: D,
     }
@@ -288,10 +288,10 @@ mod heartbeat {
                                 delay.delay_ms(100).await;
                             } else {
                                 let latency =
-                                    response_arrived_instant.sub_as_ms(&request_sent_instant);
+                                    response_arrived_instant.sub_as_us(&request_sent_instant);
                                 info!(
-                                    "Heartbeat request - response loop succeeded. Latency: {} ms",
-                                    latency
+                                    "Heartbeat request - response loop succeeded. Latency: {}",
+                                    PrettyDuration::from_us(latency)
                                 );
                                 // Hold `buffer` guard here while sleeping in order to reject unsolicited heartbeat responses on RX
                                 delay.delay_ms(1000).await;
@@ -300,7 +300,7 @@ mod heartbeat {
                         }
                         Either::Second(_timeout) => {
                             trace!("response_arrived::recv() TIMED OUT");
-                            const R_CNT_MAX: u8 = 7;
+                            const R_CNT_MAX: u8 = 3;
                             if retransmission_counter >= R_CNT_MAX {
                                 error!(
                                     "Retransmission counter reached {} attempts. Terminating connection.",
@@ -324,7 +324,7 @@ mod heartbeat {
                             trace!("Sent a heartbeat request retransmission");
                             request_sent_instant = delay.now();
                             // TODO: Overflows? :|
-                            deadline = deadline.add_s(1);
+                            deadline = delay.now().add_s(1);
                         }
                     };
                 }
