@@ -222,13 +222,13 @@ where
             .map_err(|e| ConnectionError::DtlsError(Error::Recv(e)))?;
 
         while !data.is_empty() {
-            match Record::parse(
+            let record = Record::parse(
                 |_| {},
                 &mut data,
                 Some(shared_state.key_schedule.lock().await.deref_mut()),
             )
-            .await
-            {
+            .await;
+            match record {
                 Some((r, _)) => match r {
                     Record::Handshake(_, _) => {
                         debug!("Parsed a handshake");
