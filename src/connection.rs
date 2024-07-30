@@ -8,7 +8,7 @@ use defmt_or_log::{debug, derive_format_or_debug, error, info, trace, warn};
 use embassy_futures::select::{select, select3, Either, Either3};
 use select_sharing::Mutex;
 
-use self::heartbeat::{ForeignHeartbeat, Heartbeat};
+use self::heartbeat::{DomesticHeartbeat, ForeignHeartbeat};
 
 mod select_sharing;
 
@@ -94,7 +94,7 @@ where
             shared_state,
         ));
         let fhb = ForeignHeartbeat::new(hb_buffer);
-        let hb = Heartbeat::new(delay.clone());
+        let hb = DomesticHeartbeat::new(delay.clone());
 
         match select3(
             rx_worker::<RxE, TxE, Sender, Receiver, Delay>(
@@ -135,7 +135,7 @@ where
 async fn heartbeat_worker<'a, RxE, TxE, Sender, Receiver, Delay>(
     record_transmitter: &Mutex<RecordTransmitter<'a, TxE, impl GenericKeySchedule>>,
     mut delay: Delay,
-    hb: &Heartbeat<Delay>,
+    hb: &DomesticHeartbeat<Delay>,
 ) -> Result<Infallible, ErrorHelper<RxE, TxE, Sender, Receiver>>
 where
     RxE: RxEndpoint,
@@ -263,11 +263,11 @@ where
 mod heartbeat {
     use core::convert::Infallible;
 
-    use defmt_or_log::{debug, derive_format_or_debug, trace, warn};
+    use defmt_or_log::{derive_format_or_debug, trace, warn};
 
     use crate::{
         buffer::OutOfMemory,
-        record::{self, GenericKeySchedule, HeartbeatMessageType},
+        record::{GenericKeySchedule, HeartbeatMessageType},
         ApplicationDataReceiver, ApplicationDataSender, RxEndpoint, TxEndpoint,
     };
 
@@ -292,8 +292,11 @@ mod heartbeat {
         }
 
         pub async fn new_request_payload(&self, payload: &[u8]) -> Result<(), OutOfMemory> {
+            let Some(mut buffer) = self.buffer.try_lock().await else {
+                warn!("Previous request is still being processed, dropping");
+                return Ok(());
+            };
             let payload_len = payload.len();
-            let mut buffer = self.buffer.lock().await;
             if buffer.len() < payload_len {
                 return Err(OutOfMemory);
             }
@@ -315,11 +318,10 @@ mod heartbeat {
             loop {
                 let payload_len = self.transmit_response.recv().await;
                 let mut rt = rt.lock().await;
-                rt.enqueue_heartbeat(
-                    HeartbeatMessageType::Response,
-                    &self.buffer.lock().await[..payload_len],
-                )
-                .await?;
+                // Hold the lock to the buffer until we flush to uphold the invariant of the state machine.
+                let buffer = self.buffer.lock().await;
+                rt.enqueue_heartbeat(HeartbeatMessageType::Response, &buffer[..payload_len])
+                    .await?;
                 rt.flush().await?;
             }
         }
@@ -340,7 +342,7 @@ mod heartbeat {
     // TODO: Consider splitting Heartbeat into two types: one for foreign and one
     // for domestic heartbeats. Then, the whole type should be behind a Mutex and
     // not its internal fields. Mutation analysis should also become simplier
-    pub struct Heartbeat<D: crate::Delay> {
+    pub struct DomesticHeartbeat<D: crate::Delay> {
         // TODO: Add the configuration from the handshake
         /// Signal for heartbeat worker, response to our request arrived
         pub response_arrived: Signal<(usize, D::Instant)>,
@@ -351,7 +353,7 @@ mod heartbeat {
         delay: D,
     }
 
-    impl<D: crate::Delay> Heartbeat<D> {
+    impl<D: crate::Delay> DomesticHeartbeat<D> {
         pub(crate) fn new(delay: D) -> Self {
             Self {
                 response_arrived: Signal::new(),
@@ -360,39 +362,32 @@ mod heartbeat {
             }
         }
 
-        pub async fn new_record(&self, record: &record::Heartbeat<'_>) {
-            debug!("New heartbeat arrived: {:?}", record.type_);
-            match record.type_ {
-                HeartbeatMessageType::Response => {
-                    let mut guard = self.out_in.lock().await;
-                    let (buffer, state) = &mut *guard;
-                    match *state {
-                        DomesticHeartbeatState::InFlight => {
-                            let payload = record.payload;
-                            let payload_len = payload.len();
-                            if buffer.len() < payload_len {
-                                // TODO: Should not be a panic
-                                panic!("Buffer is too small");
-                            }
-                            *state = DomesticHeartbeatState::In;
-                            trace!("response_arrived::send(({}, _)) WAIT", payload_len);
-                            self.response_arrived
-                                .send((payload_len, self.delay.now()))
-                                .await;
-                            trace!("response_arrived::send(({}, _)) DONE", payload_len);
-                            (&mut buffer[..payload_len]).copy_from_slice(payload);
-                        }
-                        state => {
-                            // TODO: I assume that some alert should be sent out as well.
-                            warn!(
-                                "Heartbeat response arrived but state is: {:?}. Unsolicited response? Dropping",
-                                state
-                            );
-                        }
+        pub async fn new_response_payload(&self, payload: &[u8]) -> Result<(), OutOfMemory> {
+            let mut guard = self.out_in.lock().await;
+            let (buffer, state) = &mut *guard;
+            match *state {
+                DomesticHeartbeatState::InFlight => {
+                    let payload_len = payload.len();
+                    if buffer.len() < payload_len {
+                        return Err(OutOfMemory);
                     }
+                    *state = DomesticHeartbeatState::In;
+                    trace!("response_arrived::send(({}, _)) WAIT", payload_len);
+                    self.response_arrived
+                        .send((payload_len, self.delay.now()))
+                        .await;
+                    trace!("response_arrived::send(({}, _)) DONE", payload_len);
+                    (&mut buffer[..payload_len]).copy_from_slice(payload);
                 }
-                _ignore => {}
+                state => {
+                    // TODO: I assume that some alert should be sent out as well.
+                    warn!(
+                        "Heartbeat response arrived but state is: {:?}. Unsolicited response? Dropping",
+                        state
+                    );
+                }
             }
+            Ok(())
         }
     }
 }
@@ -487,7 +482,7 @@ async fn rx_worker<'a, RxE, TxE, Sender, Receiver, Delay>(
     rx_buffer: &mut [u8],
     shared_state: &SharedState<impl GenericKeySchedule>,
     fhb: &ForeignHeartbeat<'a>,
-    hb: &heartbeat::Heartbeat<Delay>,
+    hb: &heartbeat::DomesticHeartbeat<Delay>,
 ) -> Result<Infallible, ErrorHelper<RxE, TxE, Sender, Receiver>>
 where
     RxE: RxEndpoint,
@@ -511,51 +506,56 @@ where
             )
             .await;
             match record {
-                Some((r, _)) => match r {
-                    Record::Handshake(_, _) => {
-                        debug!("Parsed a handshake");
-                        trace!("{:?}", r);
-                        // TODO: Perform key update (if it is key update)
+                Some((r, _)) => {
+                    match r {
+                        Record::Handshake(_, _) => {
+                            debug!("Parsed a handshake");
+                            trace!("{:?}", r);
+                            // TODO: Perform key update (if it is key update)
 
-                        todo!();
-                    }
-                    Record::Alert(_, _) => {
-                        debug!("Parsed an alert");
-                        trace!("{:?}", r);
-                        // TODO: Handle alert, maybe close connection
+                            todo!();
+                        }
+                        Record::Alert(_, _) => {
+                            debug!("Parsed an alert");
+                            trace!("{:?}", r);
+                            // TODO: Handle alert, maybe close connection
 
-                        todo!();
-                    }
-                    Record::Ack(_, _) => {
-                        debug!("Parsed an ack");
-                        trace!("{:?}", r);
-                        // TODO: Check if it's ACK for the key update
+                            todo!();
+                        }
+                        Record::Ack(_, _) => {
+                            debug!("Parsed an ack");
+                            trace!("{:?}", r);
+                            // TODO: Check if it's ACK for the key update
 
-                        todo!();
-                    }
-                    Record::Heartbeat(ref heartbeat) => {
-                        debug!("Parsed a heartbeat");
-                        trace!("{:?}", r);
-                        match heartbeat.type_ {
-                            HeartbeatMessageType::Request => fhb
-                                .new_request_payload(heartbeat.payload)
+                            todo!();
+                        }
+                        Record::Heartbeat(ref heartbeat) => {
+                            debug!("Parsed a heartbeat");
+                            trace!("{:?}", r);
+                            match heartbeat.type_ {
+                                HeartbeatMessageType::Request => {
+                                    fhb.new_request_payload(heartbeat.payload).await.map_err(
+                                        |_| ConnectionError::DtlsError(Error::InsufficientSpace),
+                                    )?
+                                }
+                                HeartbeatMessageType::Response => {
+                                    hb.new_response_payload(heartbeat.payload).await.map_err(
+                                        |_| ConnectionError::DtlsError(Error::InsufficientSpace),
+                                    )?
+                                }
+                            };
+                        }
+                        Record::ApplicationData(data) => {
+                            debug!("Parsed application data");
+                            trace!("{:?}", data);
+
+                            rx_sender
+                                .send(data)
                                 .await
-                                .map_err(|_| {
-                                    ConnectionError::DtlsError(Error::InsufficientSpace)
-                                })?,
-                            HeartbeatMessageType::Response => hb.new_record(heartbeat).await,
-                        };
+                                .map_err(ConnectionError::SendError)?;
+                        }
                     }
-                    Record::ApplicationData(data) => {
-                        debug!("Parsed application data");
-                        trace!("{:?}", data);
-
-                        rx_sender
-                            .send(data)
-                            .await
-                            .map_err(ConnectionError::SendError)?;
-                    }
-                },
+                }
                 None => {
                     debug!("Parsing of record failed");
                 }
